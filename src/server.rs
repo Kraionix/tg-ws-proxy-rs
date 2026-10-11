@@ -17,11 +17,16 @@ use tracing::{error, info, warn};
 use crate::check;
 use crate::config::{Config, UpstreamTier};
 use crate::default_domains;
-use crate::limits::{auto_max_connections, soft_nofile_limit};
+use crate::limits::{auto_max_connections, open_fds, soft_nofile_limit};
+use crate::log::schema::{Category, DcIp, ErrorCode, Level};
 use crate::log::{self, LogHandle};
+use crate::log_event;
 use crate::pool::WsPool;
 use crate::proxy;
 use crate::runtime::Runtime;
+
+/// How often the descriptor budget is recorded, when the sink is on.
+const FD_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Past this, `--log-retention` stops being a retention policy and becomes a
 /// wish — the sweep is by file name and simply finds nothing to delete. Warned
@@ -158,6 +163,27 @@ fn log_start_error(error: log::LogError, dir: &Path) -> RunError {
         log::LogError::Io(error) => RunError::InvalidLogDir(format!("{}: {error}", dir.display())),
         error => RunError::InvalidLogDir(error.to_string()),
     }
+}
+
+/// The upstream ladder this configuration can route through, in the order the
+/// fallback tries it: `ws` and `tcp` are always there, the Cloudflare and
+/// upstream-proxy rungs only when something configures them.
+///
+/// Names come from [`UpstreamTier`] rather than being spelled out again, so a
+/// record says exactly what the flag help does.
+fn configured_tiers(config: &Config, cf_worker_domains: &[String]) -> Vec<String> {
+    let mut tiers = vec![UpstreamTier::Ws];
+    if !cf_worker_domains.is_empty() {
+        tiers.push(UpstreamTier::Cfworker);
+    }
+    if !config.cf_domains.is_empty() {
+        tiers.push(UpstreamTier::Cfproxy);
+    }
+    if !config.mtproto_proxies.is_empty() {
+        tiers.push(UpstreamTier::Mtproto);
+    }
+    tiers.push(UpstreamTier::Tcp);
+    tiers.iter().map(ToString::to_string).collect()
 }
 
 /// The server itself: everything [`run_with_listen`] does once the sink is up.
@@ -461,6 +487,46 @@ async fn serve(
     }
     info!("{}", "=".repeat(60));
 
+    // ── The banner as one record ──────────────────────────────────────────
+    // Written once, and only when the sink is on: it is how a segment says
+    // which configuration produced the sessions in it, months later, on a
+    // device whose console output nobody kept.
+    if let Some(handle) = &log {
+        let mut dc_ips: Vec<DcIp> = dc_redirects
+            .iter()
+            .map(|(dc, ip)| DcIp {
+                dc: *dc,
+                ip: ip.clone(),
+            })
+            .collect();
+        dc_ips.sort_by_key(|entry| entry.dc);
+
+        let levels = config.log_settings().levels;
+        let categories: Vec<String> = Category::ALL
+            .iter()
+            .map(|category| format!("{}={}", category.name(), levels[*category as usize].name()))
+            .collect();
+
+        let version = env!("CARGO_PKG_VERSION").to_string();
+        let listen = format!("{bind_host}:{listen_port}");
+        let tiers = configured_tiers(&config, cf_worker_domains);
+
+        log::scope_global(Arc::clone(handle), async {
+            log_event!(
+                Category::Config,
+                Level::Info,
+                Event::StartupSummary {
+                    version,
+                    listen,
+                    dc_ips,
+                    tiers,
+                    categories,
+                }
+            );
+        })
+        .await;
+    }
+
     on_listen(ListenInfo {
         addr: bound_addr,
         tg_link,
@@ -518,6 +584,36 @@ async fn serve(
     // One clone for the loop: each accepted connection needs its own handle to
     // plant in its task, and the option itself is borrowed from the caller.
     let log = log.cloned();
+
+    // ── Descriptor snapshot (EVT:fd_snapshot) ─────────────────────────────
+    // A task of its own rather than a branch in the selects below: the first
+    // select blocks when the process is at its connection limit, which is the
+    // one moment a descriptor count is interesting. Aborted with the loop, so
+    // an embedder that starts and stops servers does not accumulate timers.
+    let snapshot = log.as_ref().map(|handle| {
+        let handle = Arc::clone(handle);
+        let semaphore = Arc::clone(&semaphore);
+        let soft_limit = fd_limit.min(u32::MAX as usize) as u32;
+        tokio::spawn(log::scope_global(handle, async move {
+            let mut ticker = tokio::time::interval(FD_SNAPSHOT_INTERVAL);
+            // The first tick of an interval is immediate; this record is about
+            // a steady state, not a startup.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                log_event!(
+                    Category::Accept,
+                    Level::Debug,
+                    Event::FdSnapshot {
+                        open: open_fds(),
+                        soft_limit,
+                        sem_avail: semaphore.available_permits().min(u32::MAX as usize) as u32,
+                    }
+                );
+            }
+        }))
+    });
+
     loop {
         // Block here when we are already at the connection limit.  Pending
         // TCP connections queue in the kernel backlog until capacity frees up.
@@ -569,17 +665,39 @@ async fn serve(
                         // (e.g. from pool connections).  Back off longer to let
                         // existing connections close, and log at warn-level to avoid
                         // flooding the log with repeated identical messages.
+                        let (backoff_ms, code) = if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
+                            (500, ErrorCode::Resource)
+                        } else {
+                            // Not a class of its own: the errno is the answer, and
+                            // `Resource` would claim a budget problem that is not there.
+                            (50, ErrorCode::Unspecified)
+                        };
+                        if let Some(handle) = &log {
+                            let errno = e.raw_os_error().unwrap_or(0);
+                            log::scope_global(Arc::clone(handle), async {
+                                log_event!(Category::Accept, Level::Warn, Event::AcceptError {
+                                    errno,
+                                    backoff_ms,
+                                    err: code as i32,
+                                });
+                            })
+                            .await;
+                        }
                         if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
                             warn!("accept error: {} — backing off to allow FDs to free", e);
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            tokio::time::sleep(Duration::from_millis(u64::from(backoff_ms))).await;
                         } else {
                             error!("accept error: {}", e);
-                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            tokio::time::sleep(Duration::from_millis(u64::from(backoff_ms))).await;
                         }
                     }
                 }
             }
         }
+    }
+
+    if let Some(task) = snapshot {
+        task.abort();
     }
 
     if let Some(all_ok) = check_ok {

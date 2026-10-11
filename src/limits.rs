@@ -47,6 +47,29 @@ pub fn soft_nofile_limit() -> usize {
     DEFAULT_NOFILE_LIMIT
 }
 
+/// Number of file descriptors this process currently holds.
+///
+/// Counted by listing the descriptor directory, which is what `lsof` does the
+/// long way round; the listing itself holds one descriptor, so the figure is
+/// one high. That is a diagnostic's margin, and the alternative — parsing
+/// `/proc/self/fdinfo` — is a syscall per descriptor. Platforms without the
+/// directory report zero rather than guessing.
+pub fn open_fds() -> u32 {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let dir = if cfg!(target_os = "linux") {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            return entries.count() as u32;
+        }
+    }
+
+    0
+}
+
 /// Compute a safe default for the maximum number of concurrent connections
 /// given the system FD limit and pool configuration.
 ///

@@ -255,6 +255,37 @@ fn every_field_survives_the_round_trip_individually() {
 }
 
 #[test]
+fn category_names_round_trip_and_cover_every_category() {
+    // The names are read back by `--log-category` and printed by the startup
+    // record, so one direction drifting from the other is a filter the operator
+    // cannot use and a record they cannot read.
+    for category in Category::ALL {
+        assert_eq!(
+            Category::from_name(category.name()),
+            Some(category),
+            "{} does not parse back",
+            category.name()
+        );
+    }
+
+    // `Unspecified` is the schema's zero, not a category: nothing emits it.
+    assert_eq!(Category::ALL.len(), super::CATEGORY_COUNT - 1);
+    assert_eq!(Category::from_name("unspecified"), None);
+    assert_eq!(Category::from_name("nonsense"), None);
+}
+
+#[test]
+fn level_names_are_the_ones_the_flags_spell() {
+    assert_eq!(Level::Debug.name(), "debug");
+    assert_eq!(Level::Info.name(), "info");
+    assert_eq!(Level::Warn.name(), "warn");
+    assert_eq!(Level::Error.name(), "error");
+    // Present in the enum because proto3 needs a zero, and named so that a
+    // record carrying it is readable rather than blank.
+    assert_eq!(Level::Unspecified.name(), "unspecified");
+}
+
+#[test]
 fn dc_bit_maps_the_documented_table() {
     assert_eq!(dc_bit(1), Some(0));
     assert_eq!(dc_bit(2), Some(1));

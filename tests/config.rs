@@ -941,3 +941,20 @@ fn the_zstd_mode_is_refused_when_it_is_not_compiled_in() {
         "the error should list what does work: {err}"
     );
 }
+
+/// The schema spells the level names and so do the flags; a record that says
+/// `info` has to be the same level as `--log-level info`.
+#[test]
+fn every_level_name_the_schema_prints_is_one_the_flag_parses() {
+    for level in [Level::Debug, Level::Info, Level::Warn, Level::Error] {
+        let cfg = log_config(&["--log-level", level.name()]);
+        assert!(
+            cfg.log_settings()
+                .levels
+                .iter()
+                .all(|threshold| *threshold == level),
+            "{} did not parse to itself",
+            level.name()
+        );
+    }
+}

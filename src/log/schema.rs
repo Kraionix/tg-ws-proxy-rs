@@ -153,6 +153,23 @@ pub enum Level {
     Error = 4,
 }
 
+impl Level {
+    /// Lower-case name, the way `--log-level` and the docs spell it.
+    ///
+    /// The `Enumeration` derive generates no `as_str_name`, and a startup
+    /// record that says `2` where the operator reads `info` in the banner is
+    /// worse than a match that the compiler keeps exhaustive.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum Category {
@@ -167,6 +184,51 @@ pub enum Category {
     Check = 8,
     Config = 9,
     Overflow = 10,
+}
+
+impl Category {
+    /// Every category an event can carry, in enum order.
+    ///
+    /// `Unspecified` is the schema's zero value, not a category: nothing emits
+    /// it, so a list that offered it would advertise a filter nothing matches.
+    pub const ALL: [Self; 10] = [
+        Self::Session,
+        Self::Routing,
+        Self::Pool,
+        Self::Cooldown,
+        Self::Tls,
+        Self::Crypto,
+        Self::Accept,
+        Self::Check,
+        Self::Config,
+        Self::Overflow,
+    ];
+
+    /// Lower-case name, as `--log-category` spells it and the startup record
+    /// prints it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Session => "session",
+            Self::Routing => "routing",
+            Self::Pool => "pool",
+            Self::Cooldown => "cooldown",
+            Self::Tls => "tls",
+            Self::Crypto => "crypto",
+            Self::Accept => "accept",
+            Self::Check => "check",
+            Self::Config => "config",
+            Self::Overflow => "overflow",
+        }
+    }
+
+    /// The inverse of [`Self::name`], for the one caller that reads a category
+    /// out of a command line.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|category| category.name() == name)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
