@@ -28,6 +28,14 @@ default-members = ["."]
 name = "tg-ws-proxy"
 path = "src/main.rs"
 
+[features]
+# The structured log is always compiled in — it is only started when
+# `--log-dir` is given. Compression is the one part behind a feature, because
+# it is the one part that costs real weight for a mode that is off by default:
+# see the `zstd` dependency below.
+default = []
+log-zstd = ["dep:zstd"]
+
 [dependencies]
 # Async runtime
 # Only the features actually reached from src/ and tests/. `full` additionally
@@ -99,7 +107,11 @@ prost = "0.14"
 # each one.
 redb = "4.3"
 # Optional per-batch compression of stored batches (`--log-compress=zstd-l1`).
-zstd = "0.14"
+# Off by default: the codec is ~500 KB of the release binary and the default
+# mode stores batches as they are, so a build that never compresses should not
+# carry it. `cargo build --features log-zstd` puts the mode back; a segment
+# written with it is readable only by a build that has it.
+zstd = { version = "0.14", optional = true }
 
 # Async stream utilities (SinkExt, StreamExt)
 futures-util = "0.3"

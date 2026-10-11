@@ -136,6 +136,14 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      # `--log-compress=zstd-l1` is behind the `log-zstd` feature, and the
+      # default runs above compile none of it — the dependency is optional, so
+      # without this leg the mode would rot untested until someone built it.
+      - name: Clippy and test with log-zstd
+        run: |
+          cargo clippy --all-targets --locked --features log-zstd
+          cargo test --locked --features log-zstd
+
       - name: Release build
         run: cargo build --release --locked
 

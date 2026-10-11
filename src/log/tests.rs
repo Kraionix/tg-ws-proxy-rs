@@ -1049,7 +1049,9 @@ fn emit_does_not_wait_for_the_writer() {
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::storage::{self, Compression, DurabilityMode, FileSink, Options};
+#[cfg(feature = "log-zstd")]
+use super::storage::Compression;
+use super::storage::{self, DurabilityMode, FileSink, Options};
 
 /// A directory under the system temp dir, removed when the test ends.
 struct TempDir(PathBuf);
@@ -1112,6 +1114,7 @@ fn batch_of(conn_ids: &[u64]) -> LogBatch {
 /// A batch with the variety real traffic has: mixed event kinds, different
 /// sessions, counters that move. A fixture of 256 identical records would
 /// compress to almost nothing and flatter the ratio this test exists to report.
+#[cfg(feature = "log-zstd")]
 fn rich_batch() -> LogBatch {
     let (ts_ns, seq) = next_stamp();
     // xorshift64: deterministic across runs, which a random generator would not
@@ -1279,6 +1282,18 @@ fn both_durability_modes_survive_a_clean_close() {
     }
 }
 
+#[cfg(not(feature = "log-zstd"))]
+#[test]
+fn a_build_without_zstd_names_the_build_that_could_read_a_compressed_batch() {
+    // The framing byte is part of the on-disk format whatever this build can
+    // do, so a compressed batch is recognised and explained: reporting it as
+    // corruption would send the operator looking for damage that is not there.
+    let error = storage::decode(&[1, 0x28, 0xb5, 0x2f, 0xfd, 0x00]).expect_err("no zstd here");
+    let message = error.to_string();
+    assert!(message.contains("log-zstd"), "{message}");
+}
+
+#[cfg(feature = "log-zstd")]
 #[test]
 fn zstd_shrinks_a_rich_batch_and_round_trips_it() {
     let batch = rich_batch();
@@ -1305,6 +1320,7 @@ fn zstd_shrinks_a_rich_batch_and_round_trips_it() {
     );
 }
 
+#[cfg(feature = "log-zstd")]
 #[test]
 fn a_compressed_segment_reads_back_as_written() {
     let dir = TempDir::new("compressed");

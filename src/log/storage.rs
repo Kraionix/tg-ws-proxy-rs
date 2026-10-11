@@ -81,6 +81,7 @@ pub const DEFAULT_RETENTION_DAYS: u32 = 7;
 
 /// zstd level 1 — the artifact's `CONST:ZSTD_LEVEL_L1`, chosen for a router's
 /// CPU rather than for the last few percent of ratio.
+#[cfg(feature = "log-zstd")]
 const ZSTD_LEVEL: i32 = 1;
 
 /// redb defaults to a 1 GiB cache. This ships on devices with 64 MB of RAM.
@@ -107,11 +108,14 @@ const NANOS_PER_DAY: u64 = 86_400_000_000_000;
 
 /// Whether a batch is compressed before it is stored.
 ///
-/// Applied per batch, so a segment can hold both; see the module docs.
+/// Applied per batch, so a segment can hold both; see the module docs. `ZstdL1`
+/// exists only in a build with the `log-zstd` feature: without it the mode is
+/// not offered at all rather than offered and silently ignored.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Compression {
     #[default]
     None,
+    #[cfg(feature = "log-zstd")]
     ZstdL1,
 }
 
@@ -554,6 +558,7 @@ pub(super) fn encode(batch: &LogBatch, compress: Compression) -> Result<Vec<u8>,
     let mut encoded = batch.encode_to_vec();
     match compress {
         Compression::None => encoded.insert(0, VALUE_RAW),
+        #[cfg(feature = "log-zstd")]
         Compression::ZstdL1 => {
             let compressed = zstd::encode_all(encoded.as_slice(), ZSTD_LEVEL)
                 .map_err(|error| WriterError::Segment(format!("cannot compress: {error}")))?;
@@ -575,8 +580,20 @@ pub(super) fn decode(value: &[u8]) -> Result<LogBatch, LogError> {
 
     let encoded = match *framing {
         VALUE_RAW => payload.to_vec(),
+        #[cfg(feature = "log-zstd")]
         VALUE_ZSTD => zstd::decode_all(payload)
             .map_err(|error| LogError::Segment(format!("cannot decompress: {error}")))?,
+        // A compressed batch and a framing byte from the future are different
+        // problems with different answers: one needs a different build, the
+        // other a newer one.
+        #[cfg(not(feature = "log-zstd"))]
+        VALUE_ZSTD => {
+            return Err(LogError::Segment(format!(
+                "this segment holds compressed batches; rebuild with --features log-zstd \
+                 to read it ({} was built without zstd)",
+                env!("CARGO_PKG_NAME")
+            )));
+        }
         other => {
             return Err(LogError::Segment(format!(
                 "unknown value framing {other}; this segment was written by a newer {}",

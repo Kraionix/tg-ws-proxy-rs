@@ -902,10 +902,8 @@ fn the_bounds_themselves_are_accepted() {
 }
 
 #[test]
-fn compression_durability_and_retention_reach_the_storage_options() {
+fn durability_and_retention_reach_the_storage_options() {
     let cfg = log_config(&[
-        "--log-compress",
-        "zstd-l1",
         "--log-durability",
         "immediate",
         "--log-retention",
@@ -914,8 +912,32 @@ fn compression_durability_and_retention_reach_the_storage_options() {
     ]);
 
     let options = cfg.log_options();
-    assert_eq!(options.compress, Compression::ZstdL1);
+    assert_eq!(options.compress, Compression::None, "the default mode");
     assert_eq!(options.durability, DurabilityMode::Immediate);
     assert_eq!(options.retention_days, 0, "0 keeps every segment");
     assert!(cfg.log_settings().flush_on_warn);
+}
+
+/// The compressed mode is a build-time feature, and the flag has to offer
+/// exactly what the binary can do: with the feature it parses, without it the
+/// value is not among the possible ones rather than accepted and ignored.
+#[cfg(feature = "log-zstd")]
+#[test]
+fn the_zstd_mode_is_offered_when_it_is_compiled_in() {
+    let cfg = log_config(&["--log-compress", "zstd-l1"]);
+    assert_eq!(cfg.log_options().compress, Compression::ZstdL1);
+}
+
+#[cfg(not(feature = "log-zstd"))]
+#[test]
+fn the_zstd_mode_is_refused_when_it_is_not_compiled_in() {
+    let err = Config::try_parse_from(["tg-ws-proxy", "--log-compress", "zstd-l1"])
+        .expect_err("the mode is not in this build")
+        .to_string();
+
+    assert!(err.contains("log-compress"), "{err}");
+    assert!(
+        err.contains("none"),
+        "the error should list what does work: {err}"
+    );
 }

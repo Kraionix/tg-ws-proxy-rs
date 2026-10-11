@@ -23,6 +23,11 @@ use crate::pool::WsPool;
 use crate::proxy;
 use crate::runtime::Runtime;
 
+/// Past this, `--log-retention` stops being a retention policy and becomes a
+/// wish — the sweep is by file name and simply finds nothing to delete. Warned
+/// about at startup rather than refused.
+const RETENTION_WARN_DAYS: u32 = 3650;
+
 /// Why [`run`] / [`run_with_listen`] stopped before serving, or failed to start.
 #[derive(Debug)]
 pub enum RunError {
@@ -417,6 +422,14 @@ async fn serve(
             config.log_compress,
             config.log_durability
         );
+        // Retention is a sweep by file name, so an absurd value deletes nothing
+        // rather than failing — worth saying out loud, not worth refusing.
+        if options.retention_days > RETENTION_WARN_DAYS {
+            warn!(
+                "  ⚠  --log-retention {} days keeps every segment in practice",
+                options.retention_days
+            );
+        }
     }
     info!("{}", "=".repeat(60));
     info!("  Telegram proxy link (use this on all devices):");

@@ -198,11 +198,16 @@ impl LogLevel {
 }
 
 /// `--log-compress`: whether a batch is stored as a zstd frame.
+///
+/// The compressed mode is a build-time feature, so the flag offers exactly what
+/// this binary can do: asking for a codec that is not compiled in is a clap
+/// error naming the possible values, not a mode that quietly stores raw bytes.
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum LogCompress {
     /// Store batches as they are encoded — the CPU stays with the proxy.
     None,
     /// zstd level 1, the cheapest level: measured at 2.2× on a mixed batch.
+    #[cfg(feature = "log-zstd")]
     ZstdL1,
 }
 
@@ -210,6 +215,7 @@ impl LogCompress {
     fn to_storage(self) -> log::storage::Compression {
         match self {
             Self::None => log::storage::Compression::None,
+            #[cfg(feature = "log-zstd")]
             Self::ZstdL1 => log::storage::Compression::ZstdL1,
         }
     }
@@ -507,6 +513,11 @@ pub struct Config {
     ///
     /// Measured at 2.2× smaller segments on a mixed batch. Off by default: the
     /// CPU is a router's, and the storage is the operator's choice.
+    ///
+    /// `zstd-l1` is compiled in only with the `log-zstd` feature — the codec is
+    /// half a megabyte of the binary, so a build for a flash-constrained device
+    /// leaves it out and this flag then offers `none` alone. A segment written
+    /// with compression needs a build that has it to be read.
     #[arg(
         long = "log-compress",
         value_name = "MODE",
@@ -528,6 +539,10 @@ pub struct Config {
     pub log_durability: LogDurability,
 
     /// Days of segments to keep, counting today. `0` keeps every segment.
+    ///
+    /// Retention is enforced by file name on rotation, so a value larger than
+    /// the storage can hold deletes nothing — it is accepted with a warning
+    /// rather than refused.
     #[arg(
         long = "log-retention",
         value_name = "DAYS",
