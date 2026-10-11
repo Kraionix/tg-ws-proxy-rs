@@ -39,7 +39,7 @@ use tracing::{debug, info, warn};
 use tungstenite::Message;
 
 use crate::log::schema::{
-    Category, ClosedBy as LogClosedBy, ErrorCode, Level, Peer, Tier as LogTier,
+    Category, ClosedBy as LogClosedBy, ErrorCode, Level, Peer, Reason as LogReason, Tier as LogTier,
 };
 use crate::log_event;
 
@@ -682,14 +682,21 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
     let Some(target_ip) = target_ip else {
         // Every log line already carries the DC, so the reason only has to say
         // what is missing.
-        let reason = "not in --dc-ip config";
+        let reason = LogReason::NotInDcIp;
         let Some(fallback) = route.runtime.fallback_ip(route.dc) else {
             warn!(
                 "[{}] DC{}{} {} — no fallback IP available",
-                route.label, route.dc, route.media, reason
+                route.label,
+                route.dc,
+                route.media,
+                reason.as_str()
             );
             return None;
         };
+
+        // The direct WebSocket rung is not reachable without a `--dc-ip`
+        // target, so the ladder starts below it.
+        route.log_fallback(UpstreamTier::Ws, reason);
 
         return Some(
             route
@@ -708,11 +715,16 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
     // path we have.
     let ip_cooling = IP_FAIL.active(target_ip) && route.has_fallback();
     if ip_cooling {
-        let reason = "IP in cooldown";
+        let reason = LogReason::IpCooldown;
         info!(
             "[{}] DC{}{} {} → skipping direct WS to {}",
-            route.label, route.dc, route.media, reason, target_ip
+            route.label,
+            route.dc,
+            route.media,
+            reason.as_str(),
+            target_ip
         );
+        route.log_fallback(UpstreamTier::Ws, reason);
 
         // Stepped over, not written off: if every fallback is also gone the
         // address gets its chance back rather than leaving the client on the
@@ -735,13 +747,18 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
     }
 
     // WS failed (and is now in cooldown) — walk the rest of the ladder.
-    let reason = "WS failed";
+    let reason = LogReason::WsFail;
     if ip_cooling {
         // The re-probe above was the last thing left to try: every other tier
         // already failed on the way in, and nothing since then can have
-        // revived them.
+        // revived them. So this fall is straight to the floor, whatever the
+        // ladder's own order would have offered.
+        log_tier_fallback(UpstreamTier::Ws, UpstreamTier::Tcp, LogReason::NoFallback);
+
         return Some(route.tcp_last_resort(target_ip, reason));
     }
+
+    route.log_fallback(UpstreamTier::Ws, reason);
 
     Some(
         route
@@ -808,6 +825,13 @@ impl Route<'_> {
         target_ip: Option<&str>,
     ) -> Option<Upstream> {
         for (index, tier) in tiers.iter().enumerate() {
+            // The pin is a ladder of its own: each step here is the previous
+            // one having failed or been skipped, and the reason is the same
+            // whichever it was — the user asked for this order.
+            if let Some(previous) = index.checked_sub(1).map(|prior| tiers[prior]) {
+                log_tier_fallback(previous, *tier, LogReason::Pinned);
+            }
+
             let last_resort = !self.tier_attemptable_after(tiers, index + 1, target_ip);
             match tier {
                 UpstreamTier::Ws => {
@@ -830,7 +854,7 @@ impl Route<'_> {
                         );
                         continue;
                     };
-                    if let Some(ws) = self.cf_worker(dst, "pinned", last_resort).await {
+                    if let Some(ws) = self.cf_worker(dst, LogReason::Pinned, last_resort).await {
                         return Some(Upstream::Ws {
                             ws,
                             framing: WsFraming::Tunnel,
@@ -839,7 +863,7 @@ impl Route<'_> {
                     }
                 }
                 UpstreamTier::Cfproxy => {
-                    if let Some(ws) = self.cf_proxy("pinned").await {
+                    if let Some(ws) = self.cf_proxy(LogReason::Pinned).await {
                         return Some(Upstream::Ws {
                             ws,
                             framing: WsFraming::Packets,
@@ -848,7 +872,8 @@ impl Route<'_> {
                     }
                 }
                 UpstreamTier::Mtproto => {
-                    if let Some(conn) = self.upstream_proxies("pinned", last_resort).await {
+                    if let Some(conn) = self.upstream_proxies(LogReason::Pinned, last_resort).await
+                    {
                         return Some(Upstream::Mtproto(conn));
                     }
                 }
@@ -860,7 +885,7 @@ impl Route<'_> {
                         );
                         continue;
                     };
-                    return Some(self.tcp_fallback(dst, "pinned"));
+                    return Some(self.tcp_fallback(dst, LogReason::Pinned));
                 }
             }
         }
@@ -870,6 +895,45 @@ impl Route<'_> {
             self.label, self.dc, self.media
         );
         None
+    }
+
+    /// `EVT:tier_fallback` for a rung the ladder is leaving: names the next rung
+    /// it can actually reach, and the reason it is leaving.
+    fn log_fallback(&self, from: UpstreamTier, reason: LogReason) {
+        log_tier_fallback(from, self.next_tier_after(from), reason);
+    }
+
+    /// The rung the ladder falls to when `from` fails or is skipped.
+    ///
+    /// TCP is the floor: it needs nothing but a destination, which every path
+    /// that gets this far has, so there is always somewhere for the ladder to
+    /// land. Asking this rather than assuming the next tier in the order keeps
+    /// the record matching the walk — a step over an unconfigured rung is not
+    /// a step the ladder took.
+    fn next_tier_after(&self, from: UpstreamTier) -> UpstreamTier {
+        const ORDER: [UpstreamTier; 5] = [
+            UpstreamTier::Ws,
+            UpstreamTier::Cfworker,
+            UpstreamTier::Cfproxy,
+            UpstreamTier::Mtproto,
+            UpstreamTier::Tcp,
+        ];
+
+        let start = ORDER
+            .iter()
+            .position(|tier| *tier == from)
+            .map_or(0, |index| index + 1);
+
+        ORDER[start..]
+            .iter()
+            .copied()
+            .find(|tier| match tier {
+                UpstreamTier::Cfworker => !self.config.cf_worker_domains().is_empty(),
+                UpstreamTier::Cfproxy => !self.config.cf_domains.is_empty(),
+                UpstreamTier::Mtproto => !self.config.mtproto_proxies.is_empty(),
+                UpstreamTier::Ws | UpstreamTier::Tcp => true,
+            })
+            .unwrap_or(UpstreamTier::Tcp)
     }
 
     /// Whether any pinned tier after `from` can produce a connection at all.
@@ -898,14 +962,24 @@ impl Route<'_> {
     ///
     /// `dst` is the Telegram DC IP the Worker should open its TCP tunnel to.
     /// Returns `None` when every configured tier failed or was skipped.
-    async fn fallback_chain(&self, dst: &str, reason: &str) -> Option<Upstream> {
+    async fn fallback_chain(&self, dst: &str, reason: LogReason) -> Option<Upstream> {
         if let Some(upstream) = self.cf_tiers(dst, reason).await {
             return Some(upstream);
         }
 
-        self.upstream_proxies(reason, false)
-            .await
-            .map(Upstream::Mtproto)
+        self.log_fallback(UpstreamTier::Cfproxy, LogReason::CfProxyFail);
+
+        if let Some(conn) = self.upstream_proxies(reason, false).await {
+            return Some(Upstream::Mtproto(conn));
+        }
+
+        // Only a rung that was tried can hand over: with no upstream proxies
+        // configured the fall to TCP was already recorded above.
+        if !self.config.mtproto_proxies.is_empty() {
+            self.log_fallback(UpstreamTier::Mtproto, LogReason::UpstreamFail);
+        }
+
+        None
     }
 
     /// Both Cloudflare tiers in upstream's order: Worker tunnel first, then
@@ -915,13 +989,17 @@ impl Route<'_> {
     /// the identical ladder — a Worker-only setup used to sit out
     /// `--cf-priority` entirely and pay the full direct-WS timeout on every
     /// connection before reaching its only working path.
-    async fn cf_tiers(&self, dst: &str, reason: &str) -> Option<Upstream> {
-        if let Some(ws) = self.cf_worker(dst, reason, false).await {
-            return Some(Upstream::Ws {
-                ws,
-                framing: WsFraming::Tunnel,
-                tier: UpstreamTier::Cfworker,
-            });
+    async fn cf_tiers(&self, dst: &str, reason: LogReason) -> Option<Upstream> {
+        if !self.config.cf_worker_domains().is_empty() {
+            if let Some(ws) = self.cf_worker(dst, reason, false).await {
+                return Some(Upstream::Ws {
+                    ws,
+                    framing: WsFraming::Tunnel,
+                    tier: UpstreamTier::Cfworker,
+                });
+            }
+
+            self.log_fallback(UpstreamTier::Cfworker, LogReason::CfWorkerFail);
         }
 
         self.cf_proxy(reason).await.map(|ws| Upstream::Ws {
@@ -987,7 +1065,7 @@ impl Route<'_> {
     /// `force` dials through the per-domain failure cooldown — the pinned
     /// ladder's last resort, where a skip would drop the connection rather
     /// than reach a next rung.  The default ladder always passes `false`.
-    async fn cf_worker(&self, dst: &str, reason: &str, force: bool) -> Option<TgWsStream> {
+    async fn cf_worker(&self, dst: &str, reason: LogReason, force: bool) -> Option<TgWsStream> {
         let worker_domains = self.config.cf_worker_domains();
         if worker_domains.is_empty() {
             return None;
@@ -1007,7 +1085,11 @@ impl Route<'_> {
         {
             info!(
                 "[{}] DC{}{} {} → CF Worker pool hit ({})",
-                self.label, self.dc, self.media, reason, domain
+                self.label,
+                self.dc,
+                self.media,
+                reason.as_str(),
+                domain
             );
 
             return Some(ws);
@@ -1030,7 +1112,12 @@ impl Route<'_> {
 
             debug!(
                 "[{}] DC{}{} {} → trying CF Worker {} for {}",
-                self.label, self.dc, self.media, reason, worker_domain, dst
+                self.label,
+                self.dc,
+                self.media,
+                reason.as_str(),
+                worker_domain,
+                dst
             );
 
             let started = Instant::now();
@@ -1063,7 +1150,11 @@ impl Route<'_> {
                     CF_WORKER_FAIL.clear(worker_domain);
                     info!(
                         "[{}] DC{}{} {} → CF Worker connected ({})",
-                        self.label, self.dc, self.media, reason, worker_domain
+                        self.label,
+                        self.dc,
+                        self.media,
+                        reason.as_str(),
+                        worker_domain
                     );
                     // This Worker answers, so it is worth holding a spare
                     // tunnel open for the client's next connection — Telegram
@@ -1106,7 +1197,7 @@ impl Route<'_> {
     /// `--cf-balance`/`--default-domains`) blocked *all* of them for the whole
     /// cooldown window, forcing every connection in that window down into the
     /// fronting/TCP fallback instead.
-    async fn cf_proxy(&self, reason: &str) -> Option<TgWsStream> {
+    async fn cf_proxy(&self, reason: LogReason) -> Option<TgWsStream> {
         if self.config.cf_domains.is_empty() {
             return None;
         }
@@ -1124,7 +1215,11 @@ impl Route<'_> {
         {
             info!(
                 "[{}] DC{}{} {} → CF proxy pool hit ({})",
-                self.label, self.dc, self.media, reason, domain
+                self.label,
+                self.dc,
+                self.media,
+                reason.as_str(),
+                domain
             );
 
             return Some(ws);
@@ -1132,7 +1227,11 @@ impl Route<'_> {
 
         debug!(
             "[{}] DC{}{} {} → trying CF proxy via {:?}",
-            self.label, self.dc, self.media, reason, self.config.cf_domains
+            self.label,
+            self.dc,
+            self.media,
+            reason.as_str(),
+            self.config.cf_domains
         );
 
         let started = Instant::now();
@@ -1165,7 +1264,10 @@ impl Route<'_> {
         if ws.is_some() {
             info!(
                 "[{}] DC{}{} {} → CF proxy connected",
-                self.label, self.dc, self.media, reason
+                self.label,
+                self.dc,
+                self.media,
+                reason.as_str()
             );
             if let Some(domain) = domain {
                 self.pool.cf_prefetch(self.cf_target(
@@ -1189,7 +1291,7 @@ impl Route<'_> {
     /// Try each configured upstream MTProto proxy in order.
     ///
     /// `force` dials through the failure cooldown — see [`Self::cf_worker`].
-    async fn upstream_proxies(&self, reason: &str, force: bool) -> Option<UpstreamConnection> {
+    async fn upstream_proxies(&self, reason: LogReason, force: bool) -> Option<UpstreamConnection> {
         for upstream in &self.config.mtproto_proxies {
             let key = upstream_key(&upstream.host, upstream.port);
             if !force && UPSTREAM_FAIL.active(key.as_str()) {
@@ -1223,7 +1325,7 @@ impl Route<'_> {
                         self.label,
                         self.dc,
                         self.media,
-                        reason,
+                        reason.as_str(),
                         if conn.faketls { "FakeTLS" } else { "plain" },
                         key
                     );
@@ -1378,16 +1480,20 @@ impl Route<'_> {
     /// only reached after that override failed, and on the paths that get here
     /// it failed by timing out — the one signal that says the address itself
     /// is unreachable.
-    fn tcp_last_resort(&self, target_ip: &str, reason: &str) -> Upstream {
+    fn tcp_last_resort(&self, target_ip: &str, reason: LogReason) -> Upstream {
         let dst = self.runtime.fallback_ip(self.dc).unwrap_or(target_ip);
 
         self.tcp_fallback(dst, reason)
     }
 
-    fn tcp_fallback(&self, dst: &str, reason: &str) -> Upstream {
+    fn tcp_fallback(&self, dst: &str, reason: LogReason) -> Upstream {
         info!(
             "[{}] DC{}{} {} → TCP fallback {}:443",
-            self.label, self.dc, self.media, reason, dst
+            self.label,
+            self.dc,
+            self.media,
+            reason.as_str(),
+            dst
         );
 
         Upstream::Tcp(dst.to_string())
@@ -2095,6 +2201,25 @@ fn log_tier_attempt(
             dur_ns: dur.as_nanos().min(u64::MAX as u128) as u64,
             err,
             err_code,
+        }
+    );
+}
+
+/// `EVT:tier_fallback` — the ladder leaving one rung for the next one it can
+/// actually reach.
+///
+/// One record per step down, in order, so the walk reads as the sequence it
+/// was: `tier_attempt` says what each rung's dial cost, and these say why the
+/// ladder moved on. A rung that a cooldown skipped is a step too — it is named
+/// by the reason rather than by a failed attempt.
+fn log_tier_fallback(from: UpstreamTier, to: UpstreamTier, reason: LogReason) {
+    log_event!(
+        Category::Routing,
+        Level::Info,
+        Event::TierFallback {
+            from_tier: LogTier::from(from) as i32,
+            to_tier: LogTier::from(to) as i32,
+            reason: reason as i32,
         }
     );
 }

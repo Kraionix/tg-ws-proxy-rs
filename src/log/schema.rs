@@ -294,6 +294,29 @@ pub enum Reason {
     NoFallback = 8,
 }
 
+impl Reason {
+    /// The name the routing code prints in its `tracing` lines.
+    ///
+    /// These are the strings that were threaded down the ladder as free text
+    /// before the record existed, verbatim — the console output is part of the
+    /// shipped interface, so moving the vocabulary onto the wire must not move
+    /// a byte of it. The three that have no console line are named for the
+    /// record's sake and read like the others.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::WsFail => "WS failed",
+            Self::IpCooldown => "IP in cooldown",
+            Self::CfWorkerFail => "CF Worker failed",
+            Self::CfProxyFail => "CF proxy failed",
+            Self::UpstreamFail => "upstream failed",
+            Self::NotInDcIp => "not in --dc-ip config",
+            Self::Pinned => "pinned",
+            Self::NoFallback => "no fallback",
+        }
+    }
+}
+
 /// Why an attempt failed, at the granularity of the code that handles it.
 ///
 /// Deliberately not one value per `std::io::Error` variant: these are the

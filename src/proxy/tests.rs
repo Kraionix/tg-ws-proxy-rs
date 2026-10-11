@@ -311,15 +311,15 @@ async fn a_worker_tunnel_never_emits_an_oversized_frame() {
     );
 }
 
-/// `EVT:tier_attempt` reaches a segment, attributed to the connection that
-/// dialled and carrying the class of the failure.
+/// A ladder walk reaches a segment: the dial that failed, and the step down
+/// the ladder took because of it.
 ///
 /// The dial target is `127.0.0.1`, where nothing listens on 443: a refused
 /// connect, which is the fast and deterministic failure this classification
 /// exists to name. The read-back is the point — a record that never leaves the
 /// writer's channel looks identical to one that was never emitted.
 #[tokio::test]
-async fn a_failed_ws_dial_lands_in_the_segment_as_a_tier_attempt() {
+async fn a_ladder_walk_lands_in_the_segment_as_attempts_and_fallbacks() {
     let dir = std::env::temp_dir().join(format!("tgws-tier-attempt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -369,6 +369,19 @@ async fn a_failed_ws_dial_lands_in_the_segment_as_a_tier_attempt() {
     .await;
 
     assert!(ws.is_none(), "nothing is listening on 127.0.0.1:443");
+
+    // Then a whole walk with no `--dc-ip` target: the direct WebSocket rung is
+    // unreachable, nothing else is configured, so the ladder falls to TCP —
+    // which dials nothing here, so the attempt count must stay at one.
+    let upstream = crate::log::scope(CONN, Arc::clone(&handle), async {
+        select_upstream(&route, None).await
+    })
+    .await;
+
+    assert!(
+        matches!(upstream, Some(Upstream::Tcp(_))),
+        "with no other tier configured the ladder lands on TCP"
+    );
     handle.shutdown().await;
 
     let day = std::fs::read_dir(&dir)
@@ -406,6 +419,42 @@ async fn a_failed_ws_dial_lands_in_the_segment_as_a_tier_attempt() {
     assert!(!attempt.1.ok);
     assert_eq!(attempt.1.err, ErrorCode::TcpConnect as i32);
     assert_eq!(attempt.1.err_code, 0);
+
+    let attempts = records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.event,
+                Some(crate::log::schema::Event::TierAttempt(_))
+            )
+        })
+        .count();
+    assert_eq!(
+        attempts, 1,
+        "only the rung that dialled is an attempt; TCP connects inside its bridge"
+    );
+
+    let fallback = records
+        .iter()
+        .find_map(|record| match &record.event {
+            Some(crate::log::schema::Event::TierFallback(fallback)) => Some((record, fallback)),
+            _ => None,
+        })
+        .expect("the skipped WebSocket rung recorded the step down");
+
+    assert_eq!(fallback.0.conn_id, CONN);
+    assert_eq!(fallback.0.category, crate::log::schema::Category::Routing as i32);
+    assert_eq!(fallback.0.level, crate::log::schema::Level::Info as i32);
+    assert_eq!(fallback.1.from_tier, LogTier::Ws as i32);
+    assert_eq!(
+        fallback.1.to_tier,
+        LogTier::Tcp as i32,
+        "nothing else is configured, so TCP is where the ladder falls"
+    );
+    assert_eq!(
+        fallback.1.reason,
+        crate::log::schema::Reason::NotInDcIp as i32
+    );
 
     std::fs::remove_dir_all(&dir).expect("the temp dir is ours");
 }
