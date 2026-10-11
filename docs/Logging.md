@@ -83,7 +83,7 @@ TG_DUMP_DIR=/tmp/tgws-logs TG_DUMP_DATE=2026-10-11 \
 
 ```
 batch ts=1791735882145978319 records=33 conns=[0, 1, 2, …]
-  seq=1 conn=0 level=2 category=9 Some(StartupSummary(StartupSummary { version: "2.6.0", …
+  seq=1 conn=0 level=2 category=9 Some(StartupSummary(StartupSummary { version: "2.5.4-struct-logging", …
   seq=2 conn=2 level=1 category=1 Some(SessionOpened(SessionOpened { dc: 4, is_media: false, …
 ```
 
@@ -115,7 +115,7 @@ Practical choices, from cheap to durable:
 
 ## What it costs
 
-Binary size, measured on the 2.6.0 release profile:
+Binary size, measured on this build's release profile:
 
 | Target | default | `--features log-zstd` |
 |---|---|---|
@@ -192,10 +192,10 @@ Two details that cost time to learn:
    there: a wrapper that calls `cat`, `grep` or `sed` dies with exit 127, and procd turns that into
    a crash loop. Read files with shell builtins (`read -r var < file`).
 2. **`ujail` does not forward the stop signal to the jailed child**, so a stop that only signals the
-   jail leaves the proxy holding its port. Signal the child too — and on 2.6.0 the child then exits
+   jail leaves the proxy holding its port. Signal the child too — and with this build the child then exits
    by itself (`SIGTERM` is handled, the sink is drained), where 2.5.0 was killed by it. Measured on
    the reference router: a stop took **4 s** with 2.5.0 (three of them waiting before `kill -9`) and
-   **1 s** with 2.6.0.
+   **1 s** with this build.
 
 A missing or failed stick should cost the log, not the service: resolve the directory in the init
 script, fall back to `tmpfs` when the mount is absent, and hand the decision to the wrapper (for

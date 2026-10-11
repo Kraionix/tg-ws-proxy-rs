@@ -168,7 +168,7 @@ fn samples() -> Vec<(&'static str, LogRecord)> {
         (
             "startup_summary",
             record(Event::StartupSummary(StartupSummary {
-                version: "2.6.0".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
                 listen: "127.0.0.1:17443".to_string(),
                 dc_ips: (1..=5)
                     .map(|dc| DcIp {
