@@ -974,7 +974,12 @@ impl Route<'_> {
             return Some(upstream);
         }
 
-        self.log_fallback(UpstreamTier::Cfproxy, LogReason::CfProxyFail);
+        // Only a rung that was tried can hand over. Without `--cf-domain` the
+        // ladder never reached the CF proxy, and naming it here would invent a
+        // step it did not take.
+        if !self.config.cf_domains.is_empty() {
+            self.log_fallback(UpstreamTier::Cfproxy, LogReason::CfProxyFail);
+        }
 
         if let Some(conn) = self.upstream_proxies(reason, false).await {
             return Some(Upstream::Mtproto(conn));

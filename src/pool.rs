@@ -398,8 +398,13 @@ impl WsPool {
 
             // Warm-up is the same work as a refill and reports as one: the
             // question both answer is how many connections the pool ended up
-            // holding, and each bucket's dial time is its own.
-            self.log_refill(Tier::Ws, dc, is_media, added, elapsed);
+            // holding, and each bucket's dial time is its own. With
+            // `--pool-size 0` there is nothing to warm and nothing to report —
+            // the run still happens, and a record saying it added none of the
+            // none it was asked for is noise.
+            if self.pool_size > 0 {
+                self.log_refill(Tier::Ws, dc, is_media, added, elapsed);
+            }
         }
 
         debug!("WS pool warmup complete");
@@ -548,6 +553,16 @@ impl WsPool {
         }
 
         let Some(ws) = self.cf_connect_one(&target).await else {
+            // A refill that was asked for something and produced nothing is
+            // worth a record: it is what a dead Worker or a broken CF route
+            // looks like from the pool's side.
+            self.log_refill(
+                target.tier.to_schema(),
+                target.dc,
+                target.is_media,
+                0,
+                started.elapsed(),
+            );
             return;
         };
 
