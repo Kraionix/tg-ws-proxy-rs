@@ -84,9 +84,14 @@ async-http-proxy = { version = "1.2", features = [
 ] }
 tokio-socks = "0.5"
 
-# Structured logging
+# Human-facing logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Structured event log. The record schema is hand-written against the `.proto`
+# in artifacts/logging/10_SCHEMA.md, so the derive is all that is needed —
+# there is no protoc and no build.rs in this crate.
+prost = "0.14"
 
 # Async stream utilities (SinkExt, StreamExt)
 futures-util = "0.3"

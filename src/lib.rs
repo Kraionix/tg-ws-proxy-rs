@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod default_domains;
 pub mod faketls;
 pub mod limits;
+pub mod log;
 pub mod outbound;
 pub mod pool;
 pub mod proxy;
