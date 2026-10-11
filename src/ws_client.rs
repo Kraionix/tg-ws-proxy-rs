@@ -108,6 +108,29 @@ impl<K: Eq + Hash> CooldownMap<K> {
 static CF_EDGE_TLS_FAIL: CooldownMap<IpAddr> = CooldownMap::new();
 static CF_EDGE_PLAINTEXT_FAIL: CooldownMap<IpAddr> = CooldownMap::new();
 
+/// What a walk over the preferred edge IPs did to their cooldowns.
+///
+/// The walk knows which edge timed out, which was stepped over and for how
+/// long — and must not know how to write that down: this module is
+/// session-free by design (C11), while the records belong to the connection
+/// that triggered the walk. So it reports, and the caller decides.
+pub(crate) trait EdgeReporter: Send {
+    /// An edge whose TCP connect timed out is out for `cooldown`.
+    fn armed(&mut self, ip: IpAddr, plaintext: bool, cooldown: Duration, failure: RungFailure);
+    /// An edge that was not dialled at all, because it is still out.
+    fn skipped(&mut self, ip: IpAddr, plaintext: bool);
+}
+
+/// The reporter for callers that record nothing: the public entry points, and
+/// the pool, whose own records say what it did with the result.
+pub(crate) struct NoEdgeReport;
+
+impl EdgeReporter for NoEdgeReport {
+    fn armed(&mut self, _ip: IpAddr, _plaintext: bool, _cooldown: Duration, _failure: RungFailure) {
+    }
+    fn skipped(&mut self, _ip: IpAddr, _plaintext: bool) {}
+}
+
 /// Cloudflare-specific dial settings shared by proxy, Worker, and pool paths.
 #[derive(Clone, Copy)]
 pub struct CfDialOpts<'a> {
@@ -134,12 +157,18 @@ fn cf_ip_start(ips: &[IpAddr]) -> usize {
     CF_IP_ROTATION.fetch_add(1, AtomicOrdering::Relaxed) % ips.len()
 }
 
+/// The edges to dial, and the ones the cooldown stepped over — in the order
+/// each list would have been walked.
+///
+/// The skipped half is returned rather than only logged because the record is
+/// written where the session is known: a step over an edge is a decision about
+/// this connection's route, and `EVT:cooldown_skipped` is where it belongs.
 fn cf_ip_attempts<F>(
     ips: &[IpAddr],
     first: usize,
     cooldowns: &CooldownMap<IpAddr>,
     uses_cooldown: F,
-) -> Vec<IpAddr>
+) -> (Vec<IpAddr>, Vec<IpAddr>)
 where
     F: Fn(IpAddr) -> bool,
 {
@@ -152,13 +181,16 @@ where
                 .and_then(|entries| entries.get(ip))
                 .is_some_and(|&until| now < until)
     };
+    // With every edge cooling there is nothing to skip *to*: the walk probes
+    // one rather than refusing to dial at all, and reports no skips.
     let all_cooling = ips.iter().all(is_cooling);
     let limit = if all_cooling { 1 } else { ips.len() };
-    (0..ips.len())
-        .map(move |offset| ips[(first + offset) % ips.len()])
-        .filter(|ip| all_cooling || !is_cooling(ip))
+    let ordered = (0..ips.len()).map(move |offset| ips[(first + offset) % ips.len()]);
+    let (attempted, skipped): (Vec<IpAddr>, Vec<IpAddr>) = ordered
         .take(limit)
-        .collect()
+        .partition(|ip| all_cooling || !is_cooling(ip));
+
+    (attempted, skipped)
 }
 
 /// WebSocket domains for a given DC.
@@ -518,8 +550,10 @@ async fn connect_cf_with_path(
     timeout: Duration,
     outbound: &OutboundConnector,
     opts: CfDialOpts<'_>,
+    edges: &mut dyn EdgeReporter,
 ) -> WsConnectResult {
     if opts.cf_ips.is_empty() {
+        // No preferred edges, so no edge cooldowns to report on.
         return connect_ws_with_path(
             domain,
             domain,
@@ -544,9 +578,14 @@ async fn connect_cf_with_path(
     let mut last_non_redirect = None;
     let mut last_redirect = None;
 
-    for ip in cf_ip_attempts(opts.cf_ips, first, cooldowns, |ip| {
+    let (attempted, skipped) = cf_ip_attempts(opts.cf_ips, first, cooldowns, |ip| {
         outbound.connects_directly(&ip.to_string(), port)
-    }) {
+    });
+    for ip in skipped {
+        edges.skipped(ip, opts.disable_tls);
+    }
+
+    for ip in attempted {
         let target = ip.to_string();
         let direct = outbound.connects_directly(&target, port);
         debug!("CF edge trying {} for {}", ip, domain);
@@ -582,6 +621,12 @@ async fn connect_cf_with_path(
             WsConnectResult::ConnectTimedOut(reason) => {
                 if direct {
                     cooldowns.set(ip, opts.fail_cooldown);
+                    edges.armed(
+                        ip,
+                        opts.disable_tls,
+                        opts.fail_cooldown,
+                        RungFailure::from(&WsConnectResult::ConnectTimedOut(reason.clone())),
+                    );
                 }
                 last_non_redirect = Some(WsConnectResult::ConnectTimedOut(reason));
             }
@@ -979,6 +1024,7 @@ pub async fn connect_cf_ws_for_dc_with_outbound_opts(
         outbound,
         0,
         opts,
+        &mut NoEdgeReport,
     )
     .await;
 
@@ -1009,6 +1055,7 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
     outbound: &OutboundConnector,
     first_domain: usize,
     opts: CfDialOpts<'_>,
+    edges: &mut dyn EdgeReporter,
 ) -> CfWalk {
     let media = media_tag(is_media);
     let mut all_redirects = true;
@@ -1026,6 +1073,7 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
             timeout,
             outbound,
             opts,
+            edges,
         )
         .await;
         let classed = RungFailure::from(&outcome);
@@ -1126,6 +1174,7 @@ pub async fn connect_cf_record_with_outbound_opts(
         timeout,
         outbound,
         opts,
+        &mut NoEdgeReport,
     )
     .await
     {
@@ -1236,6 +1285,7 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound_opts(
         timeout,
         outbound,
         opts,
+        &mut NoEdgeReport,
     )
     .await;
 
@@ -1254,6 +1304,7 @@ pub(crate) async fn connect_cf_worker_ws_for_dc_with_outbound_classified(
     timeout: Duration,
     outbound: &OutboundConnector,
     opts: CfDialOpts<'_>,
+    edges: &mut dyn EdgeReporter,
 ) -> (Option<TgWsStream>, Option<RungFailure>) {
     let path = cf_worker_path(dst, dc, is_media);
     let media = media_tag(is_media);
@@ -1270,6 +1321,7 @@ pub(crate) async fn connect_cf_worker_ws_for_dc_with_outbound_classified(
         timeout,
         outbound,
         opts,
+        edges,
     )
     .await;
     let classed = RungFailure::from(&outcome);

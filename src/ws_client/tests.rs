@@ -45,7 +45,12 @@ fn cf_ip_attempts_skip_edges_in_cooldown() {
     let ips = ["192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap()];
     cooldowns.set(ips[0], Duration::from_secs(60));
 
-    assert_eq!(cf_ip_attempts(&ips, 0, &cooldowns, |_| true), [ips[1]]);
+    let (attempted, skipped) = cf_ip_attempts(&ips, 0, &cooldowns, |_| true);
+
+    assert_eq!(attempted, [ips[1]]);
+    // The skipped half is what the connection's log records, so it has to name
+    // the edge that was stepped over, not just count it.
+    assert_eq!(skipped, [ips[0]]);
 }
 
 #[test]
@@ -56,7 +61,13 @@ fn cf_ip_attempts_try_one_edge_when_every_edge_is_cooling() {
         cooldowns.set(ip, Duration::from_secs(60));
     }
 
-    assert_eq!(cf_ip_attempts(&ips, 1, &cooldowns, |_| true), [ips[1]]);
+    let (attempted, skipped) = cf_ip_attempts(&ips, 1, &cooldowns, |_| true);
+
+    assert_eq!(attempted, [ips[1]]);
+    assert!(
+        skipped.is_empty(),
+        "probing the one edge anyway is not a skip: {skipped:?}"
+    );
 }
 
 #[test]
@@ -67,9 +78,66 @@ fn cf_ip_attempts_ignore_direct_cooldowns_for_proxied_edges() {
         cooldowns.set(ip, Duration::from_secs(60));
     }
 
+    let (attempted, skipped) = cf_ip_attempts(&ips, 0, &cooldowns, |_| false);
+
+    assert_eq!(attempted, [ips[0], ips[1]]);
+    assert!(skipped.is_empty());
+}
+
+/// A spy for the edge-cooldown reporter: what the walk said about each edge.
+#[derive(Default)]
+struct EdgeSpy {
+    armed: Vec<(IpAddr, bool)>,
+    skipped: Vec<(IpAddr, bool)>,
+}
+
+impl EdgeReporter for EdgeSpy {
+    fn armed(&mut self, ip: IpAddr, plaintext: bool, _cooldown: Duration, _failure: RungFailure) {
+        self.armed.push((ip, plaintext));
+    }
+
+    fn skipped(&mut self, ip: IpAddr, plaintext: bool) {
+        self.skipped.push((ip, plaintext));
+    }
+}
+
+/// The walk reports what it did to the edge cooldowns, so the connection that
+/// triggered it can record it (C28) — and it reports the skip *before* dialling
+/// anything, because a skipped edge costs nothing and a record that arrived
+/// after the dial would not say that.
+#[tokio::test]
+async fn the_edge_walk_reports_a_skipped_edge_and_an_armed_one() {
+    let cooling: IpAddr = "192.0.2.1".parse().unwrap();
+    let dialled: IpAddr = "192.0.2.2".parse().unwrap();
+    CF_EDGE_TLS_FAIL.set(cooling, Duration::from_secs(60));
+
+    let mut spy = EdgeSpy::default();
+    let outcome = connect_cf_with_path(
+        "kws2.example.net",
+        "/apiws",
+        true,
+        false,
+        Duration::from_millis(1),
+        &OutboundConnector::direct(),
+        CfDialOpts {
+            cf_ips: &[cooling, dialled],
+            disable_tls: false,
+            fail_cooldown: Duration::ZERO,
+        },
+        &mut spy,
+    )
+    .await;
+
+    assert!(matches!(outcome, WsConnectResult::ConnectTimedOut(_)));
     assert_eq!(
-        cf_ip_attempts(&ips, 0, &cooldowns, |_| false),
-        [ips[0], ips[1]]
+        spy.skipped,
+        [(cooling, false)],
+        "the cooling edge was stepped over, and only it"
+    );
+    assert_eq!(
+        spy.armed,
+        [(dialled, false)],
+        "the edge that ran out its clock is the one put away"
     );
 }
 

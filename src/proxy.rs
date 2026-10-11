@@ -22,7 +22,7 @@
 //! bridge call.
 
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -59,7 +59,7 @@ use crate::pool::{CfTarget, CfTier, WsPool};
 use crate::runtime::Runtime;
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{
-    CfDialOpts, CooldownMap, RungFailure, TgWsStream, WsAttempt,
+    CfDialOpts, CooldownMap, EdgeReporter, RungFailure, TgWsStream, WsAttempt,
     connect_cf_worker_ws_for_dc_with_outbound_classified,
     connect_cf_ws_for_dc_with_outbound_ordered, connect_ws_for_dc_with_outbound, media_tag,
 };
@@ -1147,6 +1147,7 @@ impl Route<'_> {
                     disable_tls: self.config.cf_disable_tls,
                     fail_cooldown: self.timeouts.cf_fail_cooldown,
                 },
+                &mut EdgeCooldowns,
             )
             .await;
             log_tier_attempt(
@@ -1270,6 +1271,7 @@ impl Route<'_> {
                 disable_tls: self.config.cf_disable_tls,
                 fail_cooldown: self.timeouts.cf_fail_cooldown,
             },
+            &mut EdgeCooldowns,
         )
         .await;
         log_tier_attempt(
@@ -2325,6 +2327,41 @@ fn log_cooldown_skipped(kind: CooldownKind, key_display: &str) {
             key_display: key_display.to_string(),
         }
     );
+}
+
+/// The two Cloudflare-edge cooldowns in the schema's vocabulary.
+///
+/// Two kinds, not one: an edge that failed over TLS and an edge that failed
+/// over the plaintext port are out for the same reason but are different
+/// routes, and the kind is what says which.
+fn edge_cooldown_kind(plaintext: bool) -> CooldownKind {
+    if plaintext {
+        CooldownKind::CfEdgePlaintext
+    } else {
+        CooldownKind::CfEdgeTlsFail
+    }
+}
+
+/// Writes a Cloudflare edge walk's cooldown decisions into the log.
+///
+/// The walk itself is in `ws_client.rs`, which is session-free by design
+/// (C11); this is the session-side half of C28, and it is a unit struct
+/// because the walk hands over everything the record needs.
+struct EdgeCooldowns;
+
+impl EdgeReporter for EdgeCooldowns {
+    fn armed(&mut self, ip: IpAddr, plaintext: bool, cooldown: Duration, failure: RungFailure) {
+        log_cooldown_armed(
+            edge_cooldown_kind(plaintext),
+            &ip.to_string(),
+            cooldown,
+            Some(failure),
+        );
+    }
+
+    fn skipped(&mut self, ip: IpAddr, plaintext: bool) {
+        log_cooldown_skipped(edge_cooldown_kind(plaintext), &ip.to_string());
+    }
 }
 
 /// The class an outbound connect failure belongs to.
