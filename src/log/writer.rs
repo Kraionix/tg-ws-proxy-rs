@@ -185,7 +185,14 @@ impl<S: BatchSink> Task<S> {
 /// session that was already past that point emits its close record a moment
 /// later. "A clean stop loses nothing" has to cover that moment, not only the
 /// records that were queued when the signal arrived.
-const DRAIN_QUIET: Duration = Duration::from_millis(25);
+///
+/// A hundred milliseconds, not twenty-five: the margin has to survive a host
+/// that schedules the emitting task late, and stage 6 measured one. Running the
+/// suite under `qemu-aarch64` — a slow host by any measure — the test that
+/// emits 5 ms after the stop failed three times out of three at 25 ms, and
+/// passes at 100. A router is slower than this container and faster than qemu,
+/// which is exactly the range where 25 ms is not enough and 100 is.
+const DRAIN_QUIET: Duration = Duration::from_millis(100);
 
 /// The longest the drain may run, however busy the producers still are.
 ///
