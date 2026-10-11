@@ -383,8 +383,11 @@ pub struct TierAttempt {
     pub is_media: bool,
     #[prost(bool, tag = "4")]
     pub ok: bool,
-    #[prost(uint32, tag = "5")]
-    pub dur_ns: u32,
+    /// Nanoseconds, as a `u64` because a rung's dial is bounded by
+    /// `--ws-connect-timeout` / `--cf-connect-timeout` — ten seconds by
+    /// default, and a `u32` of nanoseconds saturates at 4.29.
+    #[prost(uint64, tag = "5")]
+    pub dur_ns: u64,
     /// [`ErrorCode`] discriminant; meaningful when `ok` is false, and not
     /// written at all when it is zero.
     #[prost(enumeration = "ErrorCode", tag = "6")]
@@ -479,8 +482,9 @@ pub struct PoolRefill {
 pub struct TlsHandshake {
     #[prost(enumeration = "HandshakeKind", tag = "1")]
     pub kind: i32,
-    #[prost(uint32, tag = "2")]
-    pub dur_ns: u32,
+    /// Nanoseconds; `u64` for the same reason as [`TierAttempt::dur_ns`].
+    #[prost(uint64, tag = "2")]
+    pub dur_ns: u64,
 }
 
 /// `EVT:relay_init_retries` — reserved-prefix rejections while generating the
@@ -526,8 +530,10 @@ pub struct ProbeResult {
     pub target: String,
     #[prost(bool, tag = "3")]
     pub ok: bool,
-    #[prost(uint32, tag = "4")]
-    pub dur_ns: u32,
+    /// Nanoseconds; `u64` — a probe that runs out its connect timeout is ten
+    /// seconds, which a `u32` of nanoseconds cannot hold.
+    #[prost(uint64, tag = "4")]
+    pub dur_ns: u64,
     #[prost(enumeration = "ErrorCode", tag = "5")]
     pub err: i32,
     #[prost(uint32, tag = "6")]
@@ -610,13 +616,20 @@ pub fn dc_bit(dc: u32) -> Option<u8> {
 /// "this file predates a renumbering" apart from "this file is damaged". It is
 /// computed by encoding one synthetic record per event variant with every field
 /// set, plus each enum's discriminants, and hashing the lot — so any change to
-/// a field number, a field type, a oneof tag or an enum value moves it without
-/// anyone having to remember to update a version number.
+/// a field number, a oneof tag or an enum value moves it without anyone having
+/// to remember to update a version number.
 ///
 /// It is a tripwire, not a proof: a field added to a message whose synthetic
 /// record below is not updated, or an enum value added to an enum without being
 /// added to [`enum_values`], moves nothing. Both are visible in the diff that
 /// adds them, which is the property that was actually wanted.
+///
+/// One class of change is invisible to it, and it is the class the wire format
+/// does not distinguish either: protobuf's varint carries no width, so widening
+/// a field between integer sizes that encode the same way (`u32` → `u64`, say)
+/// leaves every byte below identical. That is safe for the *readers* the
+/// fingerprint exists to protect — an old reader truncates, it does not
+/// misparse — so it is recorded here rather than defended against.
 ///
 /// The design set specifies `SHA-256(FileDescriptorSet)` here, with the
 /// descriptor itself deferred until a reader needs it. Hashing the records

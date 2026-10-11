@@ -1176,7 +1176,7 @@ fn rich_batch() -> LogBatch {
                     dc: 1 + (r % 5) as u32,
                     is_media: r % 2 == 0,
                     ok: r % 3 == 0,
-                    dur_ns: (r % 4_000_000_000) as u32,
+                    dur_ns: r % 40_000_000_000,
                     err: ErrorCode::TlsTimeout as i32,
                     err_code: (r % 600) as u32,
                 }),
@@ -1193,7 +1193,7 @@ fn rich_batch() -> LogBatch {
                 }),
                 _ => Event::TlsHandshake(TlsHandshake {
                     kind: HandshakeKind::Full as i32,
-                    dur_ns: (r % 400_000_000) as u32,
+                    dur_ns: r % 400_000_000,
                 }),
             };
 
