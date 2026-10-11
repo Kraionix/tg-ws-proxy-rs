@@ -476,6 +476,11 @@ pub struct PoolHit {
     pub dc: u32,
     #[prost(bool, tag = "2")]
     pub is_media: bool,
+    /// Which bucket was hit. The plain WebSocket pool and the Cloudflare ones
+    /// are keyed separately, so without this the record cannot say which path
+    /// the pre-warmed connection was for.
+    #[prost(enumeration = "Tier", tag = "3")]
+    pub tier: i32,
 }
 
 /// `EVT:pool_miss` — no idle connection in the bucket.
@@ -485,6 +490,9 @@ pub struct PoolMiss {
     pub dc: u32,
     #[prost(bool, tag = "2")]
     pub is_media: bool,
+    /// See [`PoolHit::tier`].
+    #[prost(enumeration = "Tier", tag = "3")]
+    pub tier: i32,
 }
 
 /// `EVT:pool_refill` — background refill finished, with what it produced.
@@ -498,6 +506,9 @@ pub struct PoolRefill {
     pub added: u32,
     #[prost(uint32, tag = "4")]
     pub dur_ms: u32,
+    /// See [`PoolHit::tier`].
+    #[prost(enumeration = "Tier", tag = "5")]
+    pub tier: i32,
 }
 
 /// `EVT:tls_handshake` — the TLS cost of one upstream WebSocket connect.
@@ -835,16 +846,19 @@ fn canonical_records() -> [LogRecord; 17] {
         record(Event::PoolHit(PoolHit {
             dc: 1,
             is_media: true,
+            tier: Tier::Ws as i32,
         })),
         record(Event::PoolMiss(PoolMiss {
             dc: 1,
             is_media: true,
+            tier: Tier::Ws as i32,
         })),
         record(Event::PoolRefill(PoolRefill {
             dc: 1,
             is_media: true,
             added: 1,
             dur_ms: 1,
+            tier: Tier::Ws as i32,
         })),
         record(Event::TlsHandshake(TlsHandshake {
             kind: HandshakeKind::Full as i32,

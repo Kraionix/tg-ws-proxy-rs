@@ -99,6 +99,7 @@ fn samples() -> Vec<(&'static str, LogRecord)> {
             record(Event::PoolHit(PoolHit {
                 dc: 2,
                 is_media: false,
+                tier: Tier::Ws as i32,
             })),
         ),
         (
@@ -106,6 +107,7 @@ fn samples() -> Vec<(&'static str, LogRecord)> {
             record(Event::PoolMiss(PoolMiss {
                 dc: 2,
                 is_media: true,
+                tier: Tier::Cfworker as i32,
             })),
         ),
         (
@@ -115,6 +117,7 @@ fn samples() -> Vec<(&'static str, LogRecord)> {
                 is_media: false,
                 added: 4,
                 dur_ms: 850,
+                tier: Tier::Cfproxy as i32,
             })),
         ),
         (
@@ -346,11 +349,13 @@ fn header_masks_follow_the_records() {
             ..record(Event::PoolHit(PoolHit {
                 dc: 1,
                 is_media: false,
+                tier: Tier::Ws as i32,
             }))
         },
         record(Event::PoolHit(PoolHit {
             dc: 1,
             is_media: false,
+            tier: Tier::Ws as i32,
         })),
     ];
 
@@ -391,6 +396,7 @@ fn split_respects_the_unique_conn_bound() {
                     Event::PoolMiss(PoolMiss {
                         dc: 2,
                         is_media: false,
+                        tier: Tier::Ws as i32,
                     }),
                 )
             })
@@ -407,6 +413,7 @@ fn split_respects_the_unique_conn_bound() {
             Event::PoolHit(PoolHit {
                 dc: 2,
                 is_media: false,
+                tier: Tier::Ws as i32,
             }),
         ),
     );
@@ -579,6 +586,7 @@ fn pool_hit(dc: u32) -> Event {
     Event::PoolHit(PoolHit {
         dc,
         is_media: false,
+        tier: Tier::Ws as i32,
     })
 }
 
@@ -940,7 +948,11 @@ async fn the_macro_builds_the_payload_and_skips_what_the_filter_drops() {
         crate::log_event!(
             Category::Routing,
             Level::Info,
-            Event::PoolHit { dc, is_media }
+            Event::PoolHit {
+                dc,
+                is_media,
+                tier: Tier::Ws as i32,
+            }
         );
         crate::log_event!(
             Category::Routing,
@@ -948,6 +960,7 @@ async fn the_macro_builds_the_payload_and_skips_what_the_filter_drops() {
             Event::PoolMiss {
                 dc: 2,
                 is_media: false,
+                tier: Tier::Ws as i32,
             },
         );
     })
@@ -974,7 +987,8 @@ async fn a_category_can_be_quieter_than_the_global_level() {
             Level::Info,
             Event::PoolHit {
                 dc: 2,
-                is_media: false
+                is_media: false,
+                tier: Tier::Ws as i32,
             }
         );
         crate::log_event!(
@@ -982,7 +996,8 @@ async fn a_category_can_be_quieter_than_the_global_level() {
             Level::Info,
             Event::PoolHit {
                 dc: 2,
-                is_media: false
+                is_media: false,
+                tier: Tier::Ws as i32,
             }
         );
         crate::log_event!(
@@ -990,7 +1005,8 @@ async fn a_category_can_be_quieter_than_the_global_level() {
             Level::Warn,
             Event::PoolHit {
                 dc: 2,
-                is_media: false
+                is_media: false,
+                tier: Tier::Ws as i32,
             }
         );
     })
@@ -1190,6 +1206,7 @@ fn rich_batch() -> LogBatch {
                 3 => Event::PoolHit(PoolHit {
                     dc: 1 + (r % 5) as u32,
                     is_media: r % 2 == 0,
+                    tier: Tier::Ws as i32,
                 }),
                 _ => Event::TlsHandshake(TlsHandshake {
                     kind: HandshakeKind::Full as i32,
@@ -1496,7 +1513,7 @@ fn the_fingerprint_follows_the_schema() {
     // land without someone noticing that it moved.
     assert_eq!(
         fingerprint(),
-        0x7c01_8afe_f62d_5520_u64,
+        0xaac1_cfc3_54b8_926b_u64,
         "the wire format changed"
     );
 }

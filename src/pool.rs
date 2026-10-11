@@ -28,6 +28,8 @@ use tracing::{debug, warn};
 use futures_util::{FutureExt, StreamExt, stream};
 
 use crate::config::{Config, UpstreamTier};
+use crate::log::LogHandle;
+use crate::log::schema::{Category, Event, Level, PoolHit, PoolMiss, PoolRefill, Tier};
 use crate::outbound::OutboundConnector;
 use crate::runtime::Runtime;
 use crate::ws_client::{
@@ -64,6 +66,15 @@ impl CfTier {
         match self {
             Self::Worker => "CF Worker",
             Self::Proxy => "CF proxy",
+        }
+    }
+
+    /// The same two buckets in the schema's vocabulary, so a pool record can
+    /// say which path the connection in it was for.
+    fn to_schema(self) -> Tier {
+        match self {
+            Self::Worker => Tier::Cfworker,
+            Self::Proxy => Tier::Cfproxy,
         }
     }
 }
@@ -121,6 +132,13 @@ pub struct WsPool {
     /// discarded on next use rather than handed to a client.
     max_age: Duration,
     runtime: Arc<Runtime>,
+    /// Where this pool's own records go, if logging is on.
+    ///
+    /// The pool reports with `conn_id = 0` whatever task it is running in: a
+    /// pool event belongs to the pool rather than to the connection that
+    /// happened to trigger it, and a refill spawned from one connection has no
+    /// business being attributed to it (S7).
+    log: Option<Arc<LogHandle>>,
     idle: Mutex<PoolMap>,
     cf_idle: Mutex<HashMap<CfKey, Vec<CfEntry>>>,
     cf_refilling: StdMutex<HashSet<CfKey>>,
@@ -165,6 +183,7 @@ impl WsPool {
             pool_size,
             max_age,
             runtime,
+            log: None,
             idle: Mutex::new(HashMap::new()),
             cf_idle: Mutex::new(HashMap::new()),
             cf_refilling: StdMutex::new(HashSet::new()),
@@ -174,6 +193,15 @@ impl WsPool {
             #[cfg(test)]
             cf_refill_task_spawns: AtomicUsize::new(0),
         }
+    }
+
+    /// Attach the sink this pool reports through.
+    ///
+    /// Off by default: the pool is built by tests and by embedders that have no
+    /// sink, and a pool without one reports nothing rather than failing.
+    pub fn with_log(mut self, log: Option<Arc<LogHandle>>) -> Self {
+        self.log = log;
+        self
     }
 
     /// Take a pre-warmed connection from the pool, if available and fresh.
@@ -227,6 +255,7 @@ impl WsPool {
                 media_tag(is_media),
                 remaining
             );
+            self.log_hit(Tier::Ws, dc, is_media);
 
             // Schedule a background task to refill the bucket.
             if allow_refill {
@@ -242,6 +271,8 @@ impl WsPool {
         if allow_refill {
             self.schedule_refill(dc, is_media, target_ip, skip_tls_verify);
         }
+
+        self.log_miss(Tier::Ws, dc, is_media);
 
         None
     }
@@ -276,6 +307,7 @@ impl WsPool {
             }
 
             drop(lock);
+            self.log_hit(tier.to_schema(), dc, is_media);
             self.cf_prefetch(CfTarget {
                 tier,
                 dc,
@@ -289,6 +321,8 @@ impl WsPool {
 
             return Some((entry.ws, entry.domain));
         }
+
+        self.log_miss(tier.to_schema(), dc, is_media);
 
         None
     }
@@ -341,29 +375,91 @@ impl WsPool {
         });
         let mut batches = stream::iter(jobs)
             .map(|(dc, ip, is_media)| async move {
+                let started = Instant::now();
                 let connections = self
                     .connect_batch(&ip, dc, is_media, skip_tls, pool_size)
                     .await;
-                (dc, is_media, connections)
+                (dc, is_media, connections, started.elapsed())
             })
             .buffer_unordered(WARMUP_BUCKET_CONCURRENCY);
 
-        while let Some((dc, is_media, new_conns)) = batches.next().await {
+        while let Some((dc, is_media, new_conns, elapsed)) = batches.next().await {
             let mut lock = self.idle.lock().await;
             let bucket = lock.entry((dc, is_media)).or_default();
 
+            let mut added = 0;
             for ws in new_conns {
                 bucket.push(PoolEntry {
                     ws,
                     created: Instant::now(),
                 });
+                added += 1;
             }
+
+            // Warm-up is the same work as a refill and reports as one: the
+            // question both answer is how many connections the pool ended up
+            // holding, and each bucket's dial time is its own.
+            self.log_refill(Tier::Ws, dc, is_media, added, elapsed);
         }
 
         debug!("WS pool warmup complete");
     }
 
     // ── Internal ─────────────────────────────────────────────────────────
+
+    /// Whether this pool has a sink that keeps the event at all.
+    fn logging(&self, level: Level) -> Option<&Arc<LogHandle>> {
+        self.log
+            .as_ref()
+            .filter(|handle| handle.enabled(Category::Pool, level))
+    }
+
+    fn log_hit(&self, tier: Tier, dc: u32, is_media: bool) {
+        if let Some(handle) = self.logging(Level::Debug) {
+            handle.emit(
+                0,
+                Category::Pool,
+                Level::Debug,
+                Event::PoolHit(PoolHit {
+                    dc,
+                    is_media,
+                    tier: tier as i32,
+                }),
+            );
+        }
+    }
+
+    fn log_miss(&self, tier: Tier, dc: u32, is_media: bool) {
+        if let Some(handle) = self.logging(Level::Debug) {
+            handle.emit(
+                0,
+                Category::Pool,
+                Level::Debug,
+                Event::PoolMiss(PoolMiss {
+                    dc,
+                    is_media,
+                    tier: tier as i32,
+                }),
+            );
+        }
+    }
+
+    fn log_refill(&self, tier: Tier, dc: u32, is_media: bool, added: u32, dur: Duration) {
+        if let Some(handle) = self.logging(Level::Debug) {
+            handle.emit(
+                0,
+                Category::Pool,
+                Level::Debug,
+                Event::PoolRefill(PoolRefill {
+                    dc,
+                    is_media,
+                    added,
+                    dur_ms: dur.as_millis().min(u32::MAX as u128) as u32,
+                    tier: tier as i32,
+                }),
+            );
+        }
+    }
 
     fn schedule_refill(self: &Arc<Self>, dc: u32, is_media: bool, target_ip: &str, skip_tls: bool) {
         if self.pool_size == 0 || !self.reserve_refill((dc, is_media)) {
@@ -395,6 +491,7 @@ impl WsPool {
             set: &self.refilling,
             key: (dc, is_media),
         };
+        let started = Instant::now();
 
         let needed = {
             let lock = self.idle.lock().await;
@@ -418,11 +515,13 @@ impl WsPool {
             // filled the bucket while we were connecting.  Drop any surplus
             // connections so their FDs are closed immediately.
             let can_add = self.pool_size.saturating_sub(bucket.len());
+            let mut added = 0;
             for ws in new_conns.into_iter().take(can_add) {
                 bucket.push(PoolEntry {
                     ws,
                     created: Instant::now(),
                 });
+                added += 1;
             }
 
             debug!(
@@ -431,6 +530,7 @@ impl WsPool {
                 media_tag(is_media),
                 lock.get(&(dc, is_media)).map_or(0, |b| b.len())
             );
+            self.log_refill(Tier::Ws, dc, is_media, added, started.elapsed());
         }
     }
 
@@ -440,6 +540,7 @@ impl WsPool {
             set: &self.cf_refilling,
             key,
         };
+        let started = Instant::now();
 
         let budget = CF_POOL_MAX.min(self.pool_size);
         if self.cf_idle.lock().await.get(&key).map_or(0, Vec::len) >= budget {
@@ -472,6 +573,13 @@ impl WsPool {
                 connect_timeout: target.connect_timeout,
                 disable_tls: target.disable_tls,
             });
+            self.log_refill(
+                target.tier.to_schema(),
+                target.dc,
+                target.is_media,
+                1,
+                started.elapsed(),
+            );
         }
     }
 

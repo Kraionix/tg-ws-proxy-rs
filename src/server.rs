@@ -533,11 +533,14 @@ async fn serve(
     });
 
     // ── Connection pool warm-up ───────────────────────────────────────────
-    let pool = Arc::new(WsPool::with_runtime(
-        config.pool_size,
-        Duration::from_secs(config.pool_max_age),
-        Arc::clone(&runtime),
-    ));
+    let pool = Arc::new(
+        WsPool::with_runtime(
+            config.pool_size,
+            Duration::from_secs(config.pool_max_age),
+            Arc::clone(&runtime),
+        )
+        .with_log(log.cloned()),
+    );
     // Shared for the rest of the process: every connection reads the same
     // settings, so they are behind one `Arc` instead of a per-connection clone.
     let config = Arc::new(config);
