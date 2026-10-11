@@ -40,6 +40,8 @@ use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, http::HeaderValue},
 };
 use tracing::{debug, warn};
+
+use crate::log::schema::ErrorCode;
 use tungstenite::Error as WsError;
 use tungstenite::Message;
 use tungstenite::protocol::WebSocketConfig;
@@ -213,6 +215,41 @@ pub enum WsConnectResult {
     /// SNI-based DPI looks like — so this is the one that triggers domain
     /// fronting.
     TimedOut,
+}
+
+impl WsConnectResult {
+    /// The error class and numeric detail this outcome belongs to, for
+    /// `EVT:tier_attempt`.
+    ///
+    /// The classification lives here because this is where it is made: two
+    /// variants carry it, and the three that do not were built with a message
+    /// this file wrote — so the two shapes that carry an HTTP status are
+    /// parsed here and pinned by a test, rather than guessed at by a caller
+    /// that can only see the string.
+    pub fn error_code(&self) -> (ErrorCode, u32) {
+        match self {
+            // Nothing failed; the ladder reports `ok` and never reads these.
+            Self::Connected(_) => (ErrorCode::Unspecified, 0),
+            Self::Redirect(status) => (ErrorCode::HttpRedirect, u32::from(*status)),
+            Self::ConnectTimedOut(_) => (ErrorCode::TcpConnectTimeout, 0),
+            Self::TimedOut => (ErrorCode::TlsTimeout, 0),
+            Self::Failed(message) => match http_status_in(message) {
+                Some(status) => (ErrorCode::HttpStatus, u32::from(status)),
+                // Everything else `Failed` carries is an upgrade that did not
+                // happen: a transport error, or a URL that would not parse.
+                None => (ErrorCode::Upgrade, 0),
+            },
+        }
+    }
+}
+
+/// The status out of the two messages that carry one, and `None` for the rest.
+fn http_status_in(message: &str) -> Option<u16> {
+    let rest = message
+        .strip_prefix("HTTP ")
+        .or_else(|| message.strip_prefix("unexpected HTTP status "))?;
+
+    rest.split_whitespace().next()?.parse().ok()
 }
 
 /// The outcome of walking one DC's WebSocket hostnames.

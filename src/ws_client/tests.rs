@@ -378,3 +378,36 @@ fn no_domains_means_no_attempts() {
 
     assert_eq!(attempts.next_domain(), None);
 }
+
+/// `EVT:tier_attempt` reports the class and the number behind it, and the
+/// ladder has only `WsConnectResult` to derive them from — so the two variants
+/// that do not carry a status are told apart by the messages this file builds.
+/// If the wording moves, this fails rather than the log quietly reporting the
+/// wrong class.
+#[test]
+fn connect_results_map_to_the_error_classes_the_ladder_reports() {
+    assert_eq!(
+        WsConnectResult::Redirect(302).error_code(),
+        (ErrorCode::HttpRedirect, 302)
+    );
+    assert_eq!(
+        WsConnectResult::ConnectTimedOut("no route".to_string()).error_code(),
+        (ErrorCode::TcpConnectTimeout, 0)
+    );
+    assert_eq!(
+        WsConnectResult::TimedOut.error_code(),
+        (ErrorCode::TlsTimeout, 0)
+    );
+    assert_eq!(
+        WsConnectResult::Failed("HTTP 403 from server".to_string()).error_code(),
+        (ErrorCode::HttpStatus, 403)
+    );
+    assert_eq!(
+        WsConnectResult::Failed("unexpected HTTP status 451".to_string()).error_code(),
+        (ErrorCode::HttpStatus, 451)
+    );
+    assert_eq!(
+        WsConnectResult::Failed("connection reset by peer".to_string()).error_code(),
+        (ErrorCode::Upgrade, 0)
+    );
+}
