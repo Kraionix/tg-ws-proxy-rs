@@ -541,6 +541,253 @@ pub fn dc_bit(dc: u32) -> Option<u8> {
     }
 }
 
+/// A 64-bit fingerprint of the wire format, written into every segment's
+/// `STOR:meta.schema_hash`.
+///
+/// A reader compares it against its own to tell "this file predates a field" or
+/// "this file predates a renumbering" apart from "this file is damaged". It is
+/// computed by encoding one synthetic record per event variant with every field
+/// set, plus each enum's discriminants, and hashing the lot — so any change to
+/// a field number, a field type, a oneof tag or an enum value moves it without
+/// anyone having to remember to update a version number.
+///
+/// It is a tripwire, not a proof: a field added to a message whose synthetic
+/// record below is not updated, or an enum value added to an enum without being
+/// added to [`enum_values`], moves nothing. Both are visible in the diff that
+/// adds them, which is the property that was actually wanted.
+///
+/// The design set specifies `SHA-256(FileDescriptorSet)` here, with the
+/// descriptor itself deferred until a reader needs it. Hashing the records
+/// instead covers the same ground without shipping a descriptor — and a hash
+/// that does not change when the descriptor is back-filled later is the one a
+/// reader can keep comparing against.
+pub fn fingerprint() -> u64 {
+    use prost::Message as _;
+    use sha2::{Digest as _, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(SCHEMA_VERSION.to_le_bytes());
+    hasher.update((BATCH_MAX_UNIQUE_CONNS as u32).to_le_bytes());
+    for values in enum_values() {
+        for value in values {
+            hasher.update(value.to_le_bytes());
+        }
+    }
+    for record in canonical_records() {
+        hasher.update(record.encode_to_vec());
+    }
+
+    let digest = hasher.finalize();
+    let mut first_eight = [0u8; 8];
+    first_eight.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(first_eight)
+}
+
+/// Every enum's discriminants, in declaration order.
+fn enum_values() -> [&'static [i32]; 9] {
+    [
+        &[
+            Level::Unspecified as i32,
+            Level::Debug as i32,
+            Level::Info as i32,
+            Level::Warn as i32,
+            Level::Error as i32,
+        ],
+        &[
+            Category::Unspecified as i32,
+            Category::Session as i32,
+            Category::Routing as i32,
+            Category::Pool as i32,
+            Category::Cooldown as i32,
+            Category::Tls as i32,
+            Category::Crypto as i32,
+            Category::Accept as i32,
+            Category::Check as i32,
+            Category::Config as i32,
+            Category::Overflow as i32,
+        ],
+        &[
+            Tier::Unspecified as i32,
+            Tier::Ws as i32,
+            Tier::Cfworker as i32,
+            Tier::Cfproxy as i32,
+            Tier::Mtproto as i32,
+            Tier::Tcp as i32,
+        ],
+        &[
+            ClosedBy::Unspecified as i32,
+            ClosedBy::Client as i32,
+            ClosedBy::Upstream as i32,
+        ],
+        &[
+            HandshakeKind::Unspecified as i32,
+            HandshakeKind::Full as i32,
+            HandshakeKind::Resumed as i32,
+        ],
+        &[
+            CooldownKind::Unspecified as i32,
+            CooldownKind::WsFail as i32,
+            CooldownKind::IpFail as i32,
+            CooldownKind::UpstreamFail as i32,
+            CooldownKind::CfWorkerFail as i32,
+            CooldownKind::CfEdgeTlsFail as i32,
+            CooldownKind::CfEdgePlaintext as i32,
+        ],
+        &[
+            ProbeKind::Unspecified as i32,
+            ProbeKind::CfDomain as i32,
+            ProbeKind::CfWorker as i32,
+            ProbeKind::MtprotoProxy as i32,
+            ProbeKind::Listener as i32,
+        ],
+        &[
+            Reason::Unspecified as i32,
+            Reason::WsFail as i32,
+            Reason::IpCooldown as i32,
+            Reason::CfWorkerFail as i32,
+            Reason::CfProxyFail as i32,
+            Reason::UpstreamFail as i32,
+            Reason::NotInDcIp as i32,
+            Reason::Pinned as i32,
+            Reason::NoFallback as i32,
+        ],
+        &[
+            ErrorCode::Unspecified as i32,
+            ErrorCode::Dns as i32,
+            ErrorCode::TcpConnect as i32,
+            ErrorCode::TcpConnectTimeout as i32,
+            ErrorCode::Tls as i32,
+            ErrorCode::TlsTimeout as i32,
+            ErrorCode::HttpStatus as i32,
+            ErrorCode::HttpRedirect as i32,
+            ErrorCode::Upgrade as i32,
+            ErrorCode::Protocol as i32,
+            ErrorCode::Read as i32,
+            ErrorCode::Resource as i32,
+            ErrorCode::LocalIo as i32,
+            ErrorCode::FsUnsupported as i32,
+            ErrorCode::WriterConflict as i32,
+        ],
+    ]
+}
+
+/// One record per event variant with every field set, so that the encoding
+/// depends on every field number and type the format declares. Synthetic
+/// values, never written to a segment — including a `Peer` with both `hashed`
+/// and `encrypted` set, which a real record may not be.
+fn canonical_records() -> [LogRecord; 17] {
+    let record = |event: Event| LogRecord {
+        ts_ns: 1,
+        conn_id: 1,
+        seq: 1,
+        level: Level::Debug as i32,
+        category: Category::Session as i32,
+        event: Some(event),
+    };
+
+    [
+        record(Event::SessionOpened(SessionOpened {
+            dc: 1,
+            is_media: true,
+            peer: Some(Peer {
+                addr: vec![1],
+                port: 1,
+                hashed: true,
+                encrypted: true,
+            }),
+        })),
+        record(Event::SessionClosed(SessionClosed {
+            dc: 1,
+            is_media: true,
+            tier: Tier::Ws as i32,
+            closed_by: ClosedBy::Client as i32,
+            bytes_up: 1,
+            bytes_down: 1,
+            dur_ms: 1,
+        })),
+        record(Event::TierAttempt(TierAttempt {
+            tier: Tier::Ws as i32,
+            dc: 1,
+            is_media: true,
+            ok: true,
+            dur_ns: 1,
+            err: ErrorCode::Dns as i32,
+            err_code: 1,
+        })),
+        record(Event::TierFallback(TierFallback {
+            from_tier: Tier::Ws as i32,
+            to_tier: Tier::Tcp as i32,
+            reason: Reason::WsFail as i32,
+        })),
+        record(Event::CooldownArmed(CooldownArmed {
+            kind: CooldownKind::WsFail as i32,
+            key_display: "k".to_string(),
+            dur_s: 1,
+            err: ErrorCode::Dns as i32,
+            err_code: 1,
+        })),
+        record(Event::CooldownCleared(CooldownCleared {
+            kind: CooldownKind::IpFail as i32,
+            key_display: "k".to_string(),
+        })),
+        record(Event::CooldownSkipped(CooldownSkipped {
+            kind: CooldownKind::UpstreamFail as i32,
+            key_display: "k".to_string(),
+        })),
+        record(Event::PoolHit(PoolHit {
+            dc: 1,
+            is_media: true,
+        })),
+        record(Event::PoolMiss(PoolMiss {
+            dc: 1,
+            is_media: true,
+        })),
+        record(Event::PoolRefill(PoolRefill {
+            dc: 1,
+            is_media: true,
+            added: 1,
+            dur_ms: 1,
+        })),
+        record(Event::TlsHandshake(TlsHandshake {
+            kind: HandshakeKind::Full as i32,
+            dur_ns: 1,
+        })),
+        record(Event::RelayInitRetries(RelayInitRetries { n: 1 })),
+        record(Event::AcceptError(AcceptError {
+            errno: 1,
+            backoff_ms: 1,
+            err: ErrorCode::Resource as i32,
+        })),
+        record(Event::FdSnapshot(FdSnapshot {
+            open: 1,
+            soft_limit: 1,
+            sem_avail: 1,
+        })),
+        record(Event::ProbeResult(ProbeResult {
+            kind: ProbeKind::CfDomain as i32,
+            target: "t".to_string(),
+            ok: true,
+            dur_ns: 1,
+            err: ErrorCode::Dns as i32,
+            err_code: 1,
+        })),
+        record(Event::LogOverflow(LogOverflow {
+            dropped: 1,
+            window_ns: 1,
+        })),
+        record(Event::StartupSummary(StartupSummary {
+            version: "v".to_string(),
+            listen: "l".to_string(),
+            dc_ips: vec![DcIp {
+                dc: 1,
+                ip: "i".to_string(),
+            }],
+            tiers: vec!["t".to_string()],
+            categories: vec!["c".to_string()],
+        })),
+    ]
+}
+
 /// Splits `records` into batches of at most [`BATCH_MAX_UNIQUE_CONNS`] distinct
 /// connections and computes each batch's header. Records keep their order and
 /// are never dropped or reordered; a batch boundary falls where the next record

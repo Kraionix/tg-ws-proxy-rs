@@ -43,18 +43,34 @@ pub(crate) trait BatchSink: Send {
 /// that knows whether waiting would help.
 #[derive(Debug)]
 pub(crate) enum WriterError {
+    /// Sink-side I/O: a directory that cannot be created, a volume that is gone.
     Io(std::io::Error),
+    /// The segment file is held by another process.
+    Conflict,
+    /// The storage backend refused the batch. The message is the backend's own,
+    /// because nothing above this layer matches on it — it is written to the
+    /// operator and backed off on.
+    Segment(String),
 }
 
 impl std::fmt::Display for WriterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(f, "sink write failed: {error}"),
+            Self::Conflict => f.write_str("the segment is locked by another process"),
+            Self::Segment(reason) => f.write_str(reason),
         }
     }
 }
 
-impl std::error::Error for WriterError {}
+impl std::error::Error for WriterError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// The batching buffer, separate from the task so that the parts worth testing
 /// — batch boundaries, buffer reuse, sink failures — need no runtime.

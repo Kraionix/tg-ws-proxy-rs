@@ -93,6 +93,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # there is no protoc and no build.rs in this crate.
 prost = "0.14"
 
+# Day-segment storage: an embedded key-value store with typed keys and
+# per-transaction durability. Pure Rust, which is the point — every release
+# target cross-compiles, and a C storage engine would need a C toolchain for
+# each one.
+redb = "4.3"
+# Optional per-batch compression of stored batches (`--log-compress=zstd-l1`).
+zstd = "0.14"
+
 # Async stream utilities (SinkExt, StreamExt)
 futures-util = "0.3"
 

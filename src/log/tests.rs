@@ -1043,3 +1043,564 @@ fn emit_does_not_wait_for_the_writer() {
         "emit took {per_record:.0} ns/record, three orders of magnitude off"
     );
 }
+
+// ── Storage ────────────────────────────────────────────────────────────────
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use super::storage::{self, Compression, DurabilityMode, FileSink, Options};
+
+/// A directory under the system temp dir, removed when the test ends.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("tgws-log-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("a writable temp dir");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn entries(&self) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(&self.0)
+            .expect("the directory exists")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `(ts_first_ns, seq)` is the `STOR:main` key, so every synthetic batch needs
+/// its own: a fixture that reused one would silently overwrite batches and make
+/// half these tests pass for the wrong reason.
+fn next_stamp() -> (u64, u32) {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Relaxed);
+    (1_700_000_000_000_000_000 + n, n as u32)
+}
+
+/// A batch of `conn_id`s, one record each, the way the writer would build it.
+fn batch_of(conn_ids: &[u64]) -> LogBatch {
+    let (ts_ns, seq) = next_stamp();
+    let records: Vec<LogRecord> = conn_ids
+        .iter()
+        .map(|conn| {
+            let mut record = event_for(*conn, pool_hit(2));
+            record.ts_ns = ts_ns;
+            record.seq = seq;
+            record
+        })
+        .collect();
+    let mut batches = build_batch(&records);
+    assert_eq!(batches.len(), 1, "the fixture fits in one batch");
+    batches.remove(0)
+}
+
+/// A batch with the variety real traffic has: mixed event kinds, different
+/// sessions, counters that move. A fixture of 256 identical records would
+/// compress to almost nothing and flatter the ratio this test exists to report.
+fn rich_batch() -> LogBatch {
+    let (ts_ns, seq) = next_stamp();
+    // xorshift64: deterministic across runs, which a random generator would not
+    // be, and varied enough that zstd sees more than one record shape.
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+
+    let records: Vec<LogRecord> = (0..DEFAULT_BATCH_MAX)
+        .map(|i| {
+            let r = next();
+            let event = match r % 5 {
+                0 => Event::SessionClosed(SessionClosed {
+                    dc: 1 + (r % 5) as u32,
+                    is_media: r % 2 == 0,
+                    tier: Tier::Ws as i32,
+                    closed_by: ClosedBy::Client as i32,
+                    bytes_up: r % 1_000_000,
+                    bytes_down: r % 4_000_000,
+                    dur_ms: (r % 600_000) as u32,
+                }),
+                1 => Event::TierAttempt(TierAttempt {
+                    tier: Tier::Cfproxy as i32,
+                    dc: 1 + (r % 5) as u32,
+                    is_media: r % 2 == 0,
+                    ok: r % 3 == 0,
+                    dur_ns: (r % 4_000_000_000) as u32,
+                    err: ErrorCode::TlsTimeout as i32,
+                    err_code: (r % 600) as u32,
+                }),
+                2 => Event::CooldownArmed(CooldownArmed {
+                    kind: CooldownKind::WsFail as i32,
+                    key_display: format!("kws{}.web.telegram.org:443", 1 + r % 5),
+                    dur_s: 300,
+                    err: ErrorCode::TlsTimeout as i32,
+                    err_code: 0,
+                }),
+                3 => Event::PoolHit(PoolHit {
+                    dc: 1 + (r % 5) as u32,
+                    is_media: r % 2 == 0,
+                }),
+                _ => Event::TlsHandshake(TlsHandshake {
+                    kind: HandshakeKind::Full as i32,
+                    dur_ns: (r % 400_000_000) as u32,
+                }),
+            };
+
+            let mut record = event_for(1 + r % 16, event);
+            record.ts_ns = ts_ns + i as u64 * 1_000_000;
+            record.seq = seq + i as u32;
+            record
+        })
+        .collect();
+
+    build_batch(&records).remove(0)
+}
+
+fn open_sink(dir: &Path, options: Options) -> FileSink {
+    FileSink::open(dir, options).expect("the sink opens")
+}
+
+#[test]
+fn a_segment_round_trips_every_batch() {
+    let dir = TempDir::new("roundtrip");
+    let day = storage::today();
+    let mut sink = open_sink(dir.path(), Options::default());
+
+    let first = batch_of(&[1, 2, 3]);
+    let second = batch_of(&[4]);
+    sink.write(&first).expect("the batch is written");
+    sink.write(&second).expect("the batch is written");
+    drop(sink);
+
+    let read_back = storage::iter_batches(dir.path(), &storage::day_name(day)).expect("readable");
+    assert_eq!(read_back, vec![first, second]);
+}
+
+#[test]
+fn the_by_conn_index_returns_exactly_one_session() {
+    let dir = TempDir::new("byconn");
+    let day = storage::today();
+    let mut sink = open_sink(dir.path(), Options::default());
+
+    let mine = batch_of(&[7]);
+    sink.write(&mine).expect("written");
+    sink.write(&batch_of(&[8, 9])).expect("written");
+    sink.write(&batch_of(&[7, 10])).expect("written");
+    drop(sink);
+
+    let date = storage::day_name(day);
+    let mine_back = storage::iter_conn_batches(dir.path(), &date, 7).expect("readable");
+    assert_eq!(mine_back.len(), 2, "two batches mention connection 7");
+    assert_eq!(mine_back[0], mine);
+    assert!(
+        mine_back
+            .iter()
+            .all(|batch| batch.header.as_ref().expect("header").conn_ids.contains(&7))
+    );
+
+    assert_eq!(
+        storage::iter_conn_batches(dir.path(), &date, 8)
+            .expect("readable")
+            .len(),
+        1
+    );
+    assert!(
+        storage::iter_conn_batches(dir.path(), &date, 99)
+            .expect("readable")
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_restart_inside_the_same_day_appends_to_the_same_segment() {
+    let dir = TempDir::new("restart");
+    let day = storage::today();
+
+    let first = batch_of(&[1]);
+    let mut sink = open_sink(dir.path(), Options::default());
+    sink.write(&first).expect("written");
+    drop(sink);
+
+    let second = batch_of(&[2]);
+    let mut sink = open_sink(dir.path(), Options::default());
+    sink.write(&second).expect("written");
+    drop(sink);
+
+    assert_eq!(
+        dir.entries(),
+        vec![format!("{}.redb", storage::day_name(day))],
+        "one segment for the day, not one per run"
+    );
+    assert_eq!(
+        storage::iter_batches(dir.path(), &storage::day_name(day)).expect("readable"),
+        vec![first, second]
+    );
+}
+
+#[test]
+fn both_durability_modes_survive_a_clean_close() {
+    for mode in [DurabilityMode::Eventual, DurabilityMode::Immediate] {
+        let dir = TempDir::new("durability");
+        let day = storage::today();
+        let batch = batch_of(&[1]);
+
+        let mut sink = open_sink(
+            dir.path(),
+            Options {
+                durability: mode,
+                ..Options::default()
+            },
+        );
+        sink.write(&batch).expect("written");
+        drop(sink);
+
+        assert_eq!(
+            storage::iter_batches(dir.path(), &storage::day_name(day)).expect("readable"),
+            vec![batch],
+            "{mode:?} lost a batch on a clean close"
+        );
+    }
+}
+
+#[test]
+fn zstd_shrinks_a_rich_batch_and_round_trips_it() {
+    let batch = rich_batch();
+
+    let raw = storage::encode(&batch, Compression::None).expect("encoded");
+    let compressed = storage::encode(&batch, Compression::ZstdL1).expect("encoded");
+
+    assert_eq!(storage::decode(&raw).expect("decoded"), batch);
+    assert_eq!(storage::decode(&compressed).expect("decoded"), batch);
+    assert_eq!(raw[0], 0, "the framing byte says raw");
+    assert_eq!(compressed[0], 1, "the framing byte says zstd");
+    assert!(
+        compressed.len() < raw.len(),
+        "zstd grew the batch: {} vs {} bytes",
+        compressed.len(),
+        raw.len()
+    );
+
+    println!(
+        "batch: {} B raw, {} B zstd ({}%)",
+        raw.len(),
+        compressed.len(),
+        compressed.len() * 100 / raw.len()
+    );
+}
+
+#[test]
+fn a_compressed_segment_reads_back_as_written() {
+    let dir = TempDir::new("compressed");
+    let day = storage::today();
+    let batch = rich_batch();
+
+    let mut sink = open_sink(
+        dir.path(),
+        Options {
+            compress: Compression::ZstdL1,
+            ..Options::default()
+        },
+    );
+    sink.write(&batch).expect("written");
+    drop(sink);
+
+    assert_eq!(
+        storage::iter_batches(dir.path(), &storage::day_name(day)).expect("readable"),
+        vec![batch]
+    );
+}
+
+#[test]
+fn the_filesystem_gate_refuses_the_fat_family() {
+    for refused in [
+        "vfat", "msdos", "umsdos", "exfat", "ntfs", "ntfs3", "fuseblk", "hpfs",
+    ] {
+        assert!(
+            !storage::carries_locks(refused),
+            "{refused} must be refused"
+        );
+    }
+    // Including the filesystems this container and its users actually run on:
+    // overlayfs is Docker, tmpfs is /tmp, and the rest are what a USB stick
+    // would be formatted with if it were formatted sensibly.
+    for accepted in [
+        "ext2",
+        "ext3",
+        "ext4",
+        "xfs",
+        "btrfs",
+        "f2fs",
+        "tmpfs",
+        "overlay",
+        "apfs",
+        "hfs",
+        "zfs",
+        "some-future-fs",
+    ] {
+        assert!(
+            storage::carries_locks(accepted),
+            "{accepted} must be accepted"
+        );
+    }
+}
+
+#[test]
+fn the_filesystem_gate_accepts_the_directory_this_test_runs_on() {
+    let dir = TempDir::new("fsgate");
+    storage::check_filesystem(dir.path()).expect("the temp dir is usable for logs");
+    // And the gate is on the path the sink actually creates, not on the
+    // directory name: a directory that does not exist yet still resolves to its
+    // parent's filesystem.
+    storage::check_filesystem(&dir.path().join("nested/then/deeper"))
+        .expect("a directory that does not exist yet resolves to its parent");
+}
+
+#[test]
+fn a_second_sink_on_the_same_directory_is_refused() {
+    let dir = TempDir::new("conflict");
+    let _first = open_sink(dir.path(), Options::default());
+
+    let second = FileSink::open(dir.path(), Options::default());
+    match second {
+        Err(LogError::WriterConflict(path)) => {
+            assert!(path.ends_with(format!("{}.redb", storage::day_name(storage::today()))));
+        }
+        Err(other) => panic!("expected a writer conflict, got {other}"),
+        Ok(_) => panic!("a second writer took the segment"),
+    }
+}
+
+#[test]
+fn the_segment_records_its_provenance() {
+    let dir = TempDir::new("meta");
+    let date = storage::day_name(storage::today());
+    drop(open_sink(dir.path(), Options::default()));
+
+    let version = storage::meta(dir.path(), &date, "app_version")
+        .expect("readable")
+        .expect("app_version is written");
+    assert_eq!(version, env!("CARGO_PKG_VERSION").as_bytes());
+
+    assert_eq!(
+        storage::meta(dir.path(), &date, "writer_protocol")
+            .expect("readable")
+            .expect("writer_protocol is written"),
+        storage::WRITER_PROTOCOL.to_le_bytes()
+    );
+    assert_eq!(
+        storage::meta(dir.path(), &date, "schema_hash")
+            .expect("readable")
+            .expect("schema_hash is written"),
+        fingerprint().to_le_bytes()
+    );
+    assert!(
+        storage::meta(dir.path(), &date, "created_ns")
+            .expect("readable")
+            .is_some()
+    );
+}
+
+#[test]
+fn the_fingerprint_follows_the_schema() {
+    // Pinned so that a change to a field number, a tag or an enum value cannot
+    // land without someone noticing that it moved.
+    assert_eq!(
+        fingerprint(),
+        0x7c01_8afe_f62d_5520_u64,
+        "the wire format changed"
+    );
+}
+
+#[test]
+fn retention_deletes_expired_segments_and_nothing_else() {
+    let dir = TempDir::new("retention");
+    let today = storage::today();
+    let mut expected = Vec::new();
+
+    for age in 0..12 {
+        let name = format!("{}.redb", storage::day_name(today - age));
+        fs::write(dir.path().join(&name), b"").expect("a placeholder segment");
+        if age < 7 {
+            expected.push(name);
+        }
+    }
+    fs::write(dir.path().join("notes.txt"), b"keep me").expect("a file that is not ours");
+
+    drop(open_sink(
+        dir.path(),
+        Options {
+            retention_days: 7,
+            ..Options::default()
+        },
+    ));
+
+    expected.push("notes.txt".to_string());
+    expected.sort();
+    assert_eq!(dir.entries(), expected, "seven days kept, the rest swept");
+}
+
+#[test]
+fn retention_zero_keeps_everything() {
+    let dir = TempDir::new("keepall");
+    let today = storage::today();
+    let ancient = format!("{}.redb", storage::day_name(today - 400));
+    fs::write(dir.path().join(&ancient), b"").expect("a placeholder segment");
+
+    drop(open_sink(
+        dir.path(),
+        Options {
+            retention_days: 0,
+            ..Options::default()
+        },
+    ));
+
+    assert!(dir.entries().contains(&ancient));
+}
+
+#[test]
+fn rotation_moves_to_the_next_day_without_losing_the_previous_one() {
+    let dir = TempDir::new("rotation");
+    let today = storage::today();
+    let mut sink = open_sink(dir.path(), Options::default());
+
+    let first = batch_of(&[1]);
+    sink.write(&first).expect("written");
+    sink.rotate(today + 1).expect("rotation opens the next day");
+    let second = batch_of(&[2]);
+    sink.write(&second).expect("written");
+    drop(sink);
+
+    assert_eq!(
+        dir.entries(),
+        vec![
+            format!("{}.redb", storage::day_name(today)),
+            format!("{}.redb", storage::day_name(today + 1)),
+        ]
+    );
+    assert_eq!(
+        storage::iter_batches(dir.path(), &storage::day_name(today)).expect("readable"),
+        vec![first]
+    );
+    assert_eq!(
+        storage::iter_batches(dir.path(), &storage::day_name(today + 1)).expect("readable"),
+        vec![second]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_segment_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = TempDir::new("mode");
+    let date = storage::day_name(storage::today());
+    drop(open_sink(dir.path(), Options::default()));
+
+    let mode = fs::metadata(dir.path().join(format!("{date}.redb")))
+        .expect("the segment exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "the segment holds every session's metadata");
+}
+
+#[test]
+fn records_written_through_the_pipeline_are_readable_back() {
+    let runtime = unpolled_runtime();
+    let dir = TempDir::new("pipeline");
+    let day = storage::today();
+    let sink = open_sink(dir.path(), Options::default());
+    let handle = runtime.block_on(async { start(sink, Settings::default()) });
+
+    for conn in 1..=3 {
+        for _ in 0..(DEFAULT_BATCH_MAX / 3) {
+            handle.emit(conn, Category::Session, Level::Info, pool_hit(2));
+        }
+    }
+    runtime.block_on(handle.shutdown());
+
+    let batches = storage::iter_batches(dir.path(), &storage::day_name(day)).expect("readable");
+    let records: usize = batches.iter().map(|batch| batch.records.len()).sum();
+    assert_eq!(records, 3 * (DEFAULT_BATCH_MAX / 3));
+    let conns: Vec<u64> = batches
+        .iter()
+        .flat_map(|batch| batch.records.iter().map(|record| record.conn_id))
+        .collect();
+    assert!(conns.contains(&1) && conns.contains(&2) && conns.contains(&3));
+}
+
+#[test]
+fn a_truncated_segment_is_refused_rather_than_half_read() {
+    let dir = TempDir::new("truncated");
+    let date = storage::day_name(storage::today());
+    let mut sink = open_sink(dir.path(), Options::default());
+    for conn in 1..=4 {
+        sink.write(&batch_of(&[conn])).expect("written");
+    }
+    drop(sink);
+
+    let path = dir.path().join(format!("{date}.redb"));
+    let segment = fs::read(&path).expect("the segment exists");
+    assert_eq!(
+        storage::iter_batches(dir.path(), &date)
+            .expect("the intact segment reads")
+            .len(),
+        4
+    );
+
+    // redb keeps its commit slots at the head of the file and the pages they
+    // point at after them, so cutting the tail off does not leave the earlier
+    // commits readable: the file stops being a database at all. That is the
+    // behaviour worth pinning — the alternative is a repair that accepts the
+    // damage and silently drops whatever it cannot reach.
+    for divisor in [2, 4, 8, 16] {
+        fs::write(&path, &segment[..segment.len() / divisor]).expect("truncated");
+        let outcome = storage::iter_batches(dir.path(), &date);
+        assert!(
+            matches!(outcome, Err(LogError::Segment(_))),
+            "a segment truncated to 1/{divisor} read back as {outcome:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "prints a segment for a human to read; run with --ignored --nocapture"]
+fn dump_segment() {
+    let Some(dir) = std::env::var_os("TG_DUMP_DIR") else {
+        panic!("set TG_DUMP_DIR to the log directory to dump");
+    };
+    let dir = PathBuf::from(dir);
+    let date =
+        std::env::var("TG_DUMP_DATE").unwrap_or_else(|_| storage::day_name(storage::today()));
+
+    for batch in storage::iter_batches(&dir, &date).expect("readable") {
+        let header = batch.header.expect("header");
+        println!(
+            "batch ts={} records={} conns={:?}",
+            header.ts_first_ns, header.record_count, header.conn_ids
+        );
+        for record in &batch.records {
+            println!(
+                "  seq={} conn={} level={} category={} {:?}",
+                record.seq, record.conn_id, record.level, record.category, record.event
+            );
+        }
+    }
+}

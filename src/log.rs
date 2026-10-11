@@ -33,6 +33,7 @@
 //! process-wide events are emitted inside a scope with `conn_id = 0` instead.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -43,6 +44,7 @@ use tokio::task::JoinHandle;
 use schema::{Category, Event, Level, LogRecord};
 
 pub mod schema;
+pub mod storage;
 mod writer;
 
 #[cfg(test)]
@@ -75,6 +77,49 @@ pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 /// log is allowed to lose records from.
 #[allow(dead_code)] // until the wiring stage starts the subsystem
 pub(crate) const CHANNEL_CAPACITY: usize = 1024;
+
+/// Why the log subsystem could not be started.
+///
+/// Misconfiguration is fatal and runtime degradation is not: these are the
+/// failures an operator has to fix, and the only ones that stop the process. A
+/// write that fails once the proxy is running is a backoff and a warning
+/// instead, because losing logs must never cost more than the logs.
+#[derive(Debug)]
+pub enum LogError {
+    /// The log directory could not be created or opened.
+    Io(std::io::Error),
+    /// The filesystem cannot carry a segment — see [`storage::check_filesystem`].
+    FsUnsupported(String),
+    /// Another process is already writing today's segment.
+    WriterConflict(PathBuf),
+    /// The segment file is not one this build can write.
+    Segment(String),
+}
+
+impl std::fmt::Display for LogError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "{error}"),
+            Self::FsUnsupported(reason) => f.write_str(reason),
+            Self::WriterConflict(path) => write!(
+                f,
+                "another process is writing {}; use a different --log-dir for \
+                 multi-instance deployments",
+                path.display()
+            ),
+            Self::Segment(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for LogError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// What the subsystem is configured with. Every field has a CLI flag behind it
 /// in a later stage; nothing here allocates.
