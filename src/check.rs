@@ -52,6 +52,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::config::{Config, MtProtoProxy, default_dc_ip};
 use crate::crypto::{self, AesCtr256, ProtoTag, generate_client_handshake};
 use crate::faketls;
+use crate::log::schema::{Category, ErrorCode, Level, ProbeKind};
+use crate::log_event;
 use crate::outbound::OutboundConnector;
 use crate::ws_client::{
     CfDialOpts, connect_cf_worker_ws_for_dc_with_outbound_opts,
@@ -83,6 +85,32 @@ impl ProbeStatus {
     fn is_ok(&self) -> bool {
         matches!(self, Self::Ok(_))
     }
+}
+
+/// `EVT:probe_result` — one probe of one target, whether it ran or not.
+///
+/// A failed probe records `ErrorCode::Unspecified`: the probes report in prose
+/// ([`ProbeStatus::Fail`] carries a message, not a class), and recovering a
+/// class by parsing that message is the fragile guesswork this enum exists to
+/// replace. What the record adds over the console is that it outlives the
+/// terminal: which target, how long it took, and whether it passed.
+///
+/// `dur` is the wall time of the probe as its caller saw it, measured around
+/// the call rather than inside it — the probes that fail quickly return before
+/// they would have built a duration of their own.
+fn log_probe(kind: ProbeKind, target: &str, ok: bool, dur: Duration) {
+    log_event!(
+        Category::Check,
+        Level::Info,
+        Event::ProbeResult {
+            kind: kind as i32,
+            target: target.to_string(),
+            ok,
+            dur_ns: dur.as_nanos().min(u64::MAX as u128) as u64,
+            err: ErrorCode::Unspecified as i32,
+            err_code: 0,
+        }
+    );
 }
 
 // ─── Listener probe request ───────────────────────────────────────────────────
@@ -570,8 +598,15 @@ pub async fn run_check_with_outbound(
             // Flush so the user sees the label before the potentially slow probe.
             let _ = std::io::Write::flush(&mut std::io::stdout());
 
+            let started = Instant::now();
             let status = probe_cf_domain(domain, skip_tls, cf_timeout, outbound, cf_opts).await;
             println!("[{}]  {}", status.marker(), status.detail());
+            log_probe(
+                ProbeKind::CfDomain,
+                &format!("kws2.{}", domain),
+                status.is_ok(),
+                started.elapsed(),
+            );
 
             if !status.is_ok() {
                 all_ok = false;
@@ -587,8 +622,15 @@ pub async fn run_check_with_outbound(
             print!("  {:40}  ... ", domain);
             let _ = std::io::Write::flush(&mut std::io::stdout());
 
+            let started = Instant::now();
             let status = probe_cf_worker(domain, skip_tls, cf_timeout, outbound, cf_opts).await;
             println!("[{}]  {}", status.marker(), status.detail());
+            log_probe(
+                ProbeKind::CfWorker,
+                domain,
+                status.is_ok(),
+                started.elapsed(),
+            );
 
             if !status.is_ok() {
                 all_ok = false;
@@ -606,8 +648,15 @@ pub async fn run_check_with_outbound(
             print!("  {:40}  ... ", label);
             let _ = std::io::Write::flush(&mut std::io::stdout());
 
+            let started = Instant::now();
             let status = probe_mtproto_proxy(proxy, upstream_timeout, outbound).await;
             println!("[{}]  {}", status.marker(), status.detail());
+            log_probe(
+                ProbeKind::MtprotoProxy,
+                &format!("{}:{}", proxy.host, proxy.port),
+                status.is_ok(),
+                started.elapsed(),
+            );
 
             if !status.is_ok() {
                 all_ok = false;
@@ -663,8 +712,15 @@ pub async fn run_check_with_outbound(
                     );
                     // DC 2, as in the probes above: a representative data centre.
                     let secret = config.secret_bytes();
+                    let started = Instant::now();
                     let status = probe_listener(target, &secret, 2, reply_timeout).await;
                     println!("{label}[{}]  {}", status.marker(), status.detail());
+                    log_probe(
+                        ProbeKind::Listener,
+                        &target.to_string(),
+                        status.is_ok(),
+                        started.elapsed(),
+                    );
                     if !status.is_ok() {
                         all_ok = false;
                     }

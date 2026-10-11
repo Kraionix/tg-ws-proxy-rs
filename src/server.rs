@@ -21,6 +21,7 @@ use crate::limits::{auto_max_connections, open_fds, soft_nofile_limit};
 use crate::log::schema::{Category, DcIp, ErrorCode, Level};
 use crate::log::{self, LogHandle};
 use crate::log_event;
+use crate::outbound::OutboundConnector;
 use crate::pool::WsPool;
 use crate::proxy;
 use crate::runtime::Runtime;
@@ -187,6 +188,30 @@ fn configured_tiers(config: &Config, cf_worker_domains: &[String]) -> Vec<String
 }
 
 /// The server itself: everything [`run_with_listen`] does once the sink is up.
+/// Runs the probes with the pool's attribution: `conn_id = 0`, and only when a
+/// sink exists at all.
+///
+/// A probe is not a session — nothing about it belongs to a client connection —
+/// so it reports as the process does, and a probe run without `--log-dir`
+/// reports nowhere rather than needing a scope built for it.
+async fn run_check_logged(
+    config: &Config,
+    outbound: &OutboundConnector,
+    listener: Option<SocketAddr>,
+    log: Option<&Arc<LogHandle>>,
+) -> bool {
+    match log {
+        Some(handle) => {
+            log::scope_global(
+                Arc::clone(handle),
+                check::run_check_with_outbound(config, outbound, listener),
+            )
+            .await
+        }
+        None => check::run_check_with_outbound(config, outbound, listener).await,
+    }
+}
+
 async fn serve(
     mut config: Config,
     shutdown: impl Future<Output = ()> + Send,
@@ -263,7 +288,7 @@ async fn serve(
     if config.check && !config.check_listener {
         let all_ok = tokio::select! {
             _ = &mut shutdown => return Ok(()),
-            all_ok = check::run_check_with_outbound(&config, runtime.outbound(), None) => all_ok,
+            all_ok = run_check_logged(&config, runtime.outbound(), None, log) => all_ok,
         };
         return if all_ok {
             Ok(())
@@ -563,9 +588,10 @@ async fn serve(
     let _check_keep = if config.check {
         let config = Arc::clone(&config);
         let runtime = Arc::clone(&runtime);
+        let log = log.cloned();
         tokio::spawn(async move {
             let all_ok =
-                check::run_check_with_outbound(&config, runtime.outbound(), Some(bound_addr)).await;
+                run_check_logged(&config, runtime.outbound(), Some(bound_addr), log.as_ref()).await;
             let _ = check_tx.send(all_ok);
         });
         None
