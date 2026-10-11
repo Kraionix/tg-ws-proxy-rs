@@ -288,6 +288,17 @@ fn level_names_are_the_ones_the_flags_spell() {
     assert_eq!(Level::Unspecified.name(), "unspecified");
 }
 
+/// The ladder's failure vocabulary is printed as well as recorded, and these
+/// four strings are what it printed before the record existed. The rest have no
+/// `tracing` line of their own.
+#[test]
+fn reason_names_are_the_ones_the_ladder_prints() {
+    assert_eq!(Reason::NotInDcIp.as_str(), "not in --dc-ip config");
+    assert_eq!(Reason::IpCooldown.as_str(), "IP in cooldown");
+    assert_eq!(Reason::WsFail.as_str(), "WS failed");
+    assert_eq!(Reason::Pinned.as_str(), "pinned");
+}
+
 #[test]
 fn dc_bit_maps_the_documented_table() {
     assert_eq!(dc_bit(1), Some(0));
@@ -1136,8 +1147,8 @@ impl Drop for TempDir {
 /// its own: a fixture that reused one would silently overwrite batches and make
 /// half these tests pass for the wrong reason.
 fn next_stamp() -> (u64, u32) {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    let n = NEXT.fetch_add(1, Relaxed);
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    let n = NEXT.fetch_add(1, Relaxed) as u64;
     (1_700_000_000_000_000_000 + n, n as u32)
 }
 
@@ -1740,4 +1751,17 @@ fn dump_segment() {
             );
         }
     }
+}
+
+/// The connection counter is 32 bits wide, because the MIPS release targets
+/// have no 64-bit atomics, so a wrap is possible in principle and has to keep
+/// the one property the log relies on: zero means "not a session".
+#[test]
+fn a_wrapped_connection_id_is_never_zero() {
+    let counters = Counters::default();
+    counters.conn.store(u32::MAX, Relaxed);
+
+    assert_eq!(counters.next_conn(), u64::from(u32::MAX));
+    assert_eq!(counters.next_conn(), 1, "the wrap skips the reserved zero");
+    assert_eq!(counters.next_conn(), 2);
 }

@@ -34,7 +34,7 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -168,7 +168,12 @@ pub struct LogHandle {
 struct Counters {
     seq: AtomicU32,
     dropped: AtomicU32,
-    conn: AtomicU64,
+    /// `AtomicU32` rather than `AtomicU64` because the OpenWrt tier has to
+    /// build: `mips-unknown-linux-musl` and its little-endian twin are 32-bit
+    /// targets without 64-bit atomics, where `AtomicU64` does not exist at all.
+    /// Four billion connections is a thousand years of a busy home router, and
+    /// a wrap is handled rather than assumed away.
+    conn: AtomicU32,
 }
 
 impl Counters {
@@ -177,8 +182,13 @@ impl Counters {
         self.seq.fetch_add(1, Relaxed).wrapping_add(1)
     }
 
+    /// The next session id, never zero — which is what makes `conn_id == 0`
+    /// readable as "not a session" for the life of the process, wrap included.
     fn next_conn(&self) -> u64 {
-        self.conn.fetch_add(1, Relaxed) + 1
+        match self.conn.fetch_add(1, Relaxed) {
+            0 => u64::from(self.conn.fetch_add(1, Relaxed)),
+            id => u64::from(id),
+        }
     }
 }
 
