@@ -689,18 +689,7 @@ fn create_dir(dir: &Path) -> Result<(), LogError> {
 /// Whatever the answer, the check runs once at startup, where it is still a
 /// configuration error with an exit code.
 pub(crate) fn check_filesystem(dir: &Path) -> Result<(), LogError> {
-    // The directory may not exist yet, so resolve the nearest ancestor that
-    // does: it is the filesystem the directory is about to be created on.
-    let mut probe = dir;
-    while !probe.exists() {
-        match probe.parent() {
-            Some(parent) => probe = parent,
-            None => return Ok(()), // nothing to inspect; creation will report it
-        }
-    }
-
-    let fstype = filesystem_of(probe);
-    match fstype.as_deref() {
+    match filesystem_name(dir).as_deref() {
         Some(name) if !carries_locks(name) => Err(LogError::FsUnsupported(format!(
             "{} is on {name}, which --log-dir does not support: format the stick as f2fs \
              (or ext4, xfs, btrfs) and mount that, or point --log-dir at tmpfs \
@@ -810,6 +799,23 @@ fn filesystem_of(_path: &Path) -> Option<String> {
 
 pub(super) fn today() -> i64 {
     (super::now_ns() / NANOS_PER_DAY) as i64
+}
+
+/// The filesystem `dir` lands on, as the kernel names it, or `None` when it
+/// cannot be determined.
+///
+/// The banner prints this because the deployment questions this file exists for
+/// are filesystem questions: a stick that came formatted as `vfat` has to be
+/// re-formatted, and `/tmp` works but is RAM.
+pub(crate) fn filesystem_name(dir: &Path) -> Option<String> {
+    // The directory may not exist yet, so resolve the nearest ancestor that
+    // does: it is the filesystem the directory is about to be created on.
+    let mut probe = dir;
+    while !probe.exists() {
+        probe = probe.parent()?;
+    }
+
+    filesystem_of(probe)
 }
 
 /// `YYYY-MM-DD` for a day number since the unix epoch — Howard Hinnant's

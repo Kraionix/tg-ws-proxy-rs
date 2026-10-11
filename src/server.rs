@@ -466,13 +466,36 @@ async fn serve(
             0 => "keep all".to_string(),
             days => format!("{days} days"),
         };
+        // The filesystem, not just the path: which one the directory landed on
+        // is the difference between a stick that works and one that has to be
+        // re-formatted, and between a log file and a slice of RAM.
+        let filesystem = log::storage::filesystem_name(dir);
         info!(
-            "  Log sink:      {} ({}, compression {}, durability {})",
+            "  Log sink:      {} ({}, compression {}, durability {}{})",
             dir.display(),
             retention,
             config.log_compress,
-            config.log_durability
+            config.log_durability,
+            filesystem
+                .as_deref()
+                .map(|name| format!(", {name}"))
+                .unwrap_or_default()
         );
+        // What it costs, from the measurement in the implementation plan's
+        // §5.1: a record is ~44 B, a client connection writes about one of them
+        // at the default level and about four with `--log-level debug`, and an
+        // idle process writes the descriptor snapshot once a minute.
+        info!("  Log volume:    ~44 B/record · ~1 record per client connection (~4 at debug)");
+        info!(
+            "                 1 000 connections/day ≈ 0.3 MB/week (debug 1.2 MB) · \
+             idle ≈ 1 MB/week · zstd-l1 ≈ 2× smaller"
+        );
+        if filesystem.as_deref() == Some("tmpfs") {
+            warn!(
+                "  ⚠  --log-dir is on tmpfs: the log lives in RAM, and --log-retention is the \
+                 only thing bounding it"
+            );
+        }
         // Retention is a sweep by file name, so an absurd value deletes nothing
         // rather than failing — worth saying out loud, not worth refusing.
         if options.retention_days > RETENTION_WARN_DAYS {
