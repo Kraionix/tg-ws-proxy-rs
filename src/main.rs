@@ -27,7 +27,7 @@ async fn main() {
     let config = Config::from_args();
     init_logging(&config);
 
-    match server::run(config, std::future::pending()).await {
+    match server::run(config, shutdown_signal()).await {
         Ok(()) => {}
         Err(RunError::CheckFailed) => std::process::exit(1),
         Err(RunError::InvalidOutbound(e)) => {
@@ -41,6 +41,52 @@ async fn main() {
             eprintln!("{e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Resolves when the process is asked to stop.
+///
+/// Without this the binary runs until the kernel kills it, and `SIGTERM` — what
+/// init and systemd send — takes the log with it: the sink's default durability
+/// commits without syncing, so a killed process loses everything since the last
+/// sync. Measured in stage 6: a `SIGTERM` three seconds into a run left an empty
+/// segment. Handling the signal turns that into an ordinary stop, which flushes
+/// and syncs on the way out.
+///
+/// A *second* signal exits immediately, so a stop that hangs is still a stop.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let Ok(mut term) = signal(SignalKind::terminate()) else {
+            return std::future::pending().await;
+        };
+        let Ok(mut int) = signal(SignalKind::interrupt()) else {
+            return std::future::pending().await;
+        };
+
+        tokio::select! {
+            _ = term.recv() => tracing::info!("SIGTERM received, stopping"),
+            _ = int.recv() => tracing::info!("interrupt received, stopping"),
+        }
+
+        // Held by this task, which outlives the shutdown future: the sink's
+        // drain window is milliseconds, so anything still here is stuck.
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+            tracing::warn!("still stopping; second signal exits now");
+            std::process::exit(130);
+        });
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("interrupt received, stopping");
     }
 }
 
