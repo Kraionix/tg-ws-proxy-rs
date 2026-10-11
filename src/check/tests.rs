@@ -8,6 +8,7 @@ use tokio::net::TcpListener;
 
 use super::{FRAME_HEADER_LEN, ProbeStatus, build_req_pq_multi, probe_listener, reply_is_res_pq};
 use crate::crypto;
+use crate::log::schema::ErrorCode;
 
 /// The frame a peer reads: a 4-byte length prefix, 8 zero bytes where a session
 /// would carry `auth_key_id`, the message id, the body length, and the body
@@ -102,10 +103,17 @@ async fn a_framed_transport_error_is_reported_as_one() {
     });
 
     match probe_listener(addr, &secret, 2, Duration::from_secs(5)).await {
-        ProbeStatus::Fail(reason) => assert!(
-            reason.contains("transport error: -404"),
-            "unexpected reason: {reason}"
-        ),
+        ProbeStatus::Fail { reason, err } => {
+            assert!(
+                reason.contains("transport error: -404"),
+                "unexpected reason: {reason}"
+            );
+            assert_eq!(
+                err,
+                ErrorCode::Protocol,
+                "a peer that answers in the protocol is a protocol failure, not a transport one"
+            );
+        }
         ProbeStatus::Ok(elapsed) => panic!("expected a failure, got OK in {elapsed:?}"),
     }
 

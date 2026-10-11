@@ -54,51 +54,82 @@ use crate::crypto::{self, AesCtr256, ProtoTag, generate_client_handshake};
 use crate::faketls;
 use crate::log::schema::{Category, ErrorCode, Level, ProbeKind};
 use crate::log_event;
-use crate::outbound::OutboundConnector;
+use crate::outbound::{OutboundConnector, OutboundError};
 use crate::ws_client::{
-    CfDialOpts, connect_cf_worker_ws_for_dc_with_outbound_opts,
-    connect_cf_ws_for_dc_with_outbound_opts, ws_recv, ws_send,
+    CfDialOpts, NoEdgeReport, connect_cf_worker_ws_for_dc_with_outbound_classified,
+    connect_cf_ws_for_dc_with_outbound_ordered, ws_recv, ws_send,
 };
 
 // ─── Probe result ─────────────────────────────────────────────────────────────
 
 enum ProbeStatus {
     Ok(Duration),
-    Fail(String),
+    /// A failure, with the class `EVT:probe_result` records beside the prose.
+    ///
+    /// The two are not redundant: the reason is what the operator reads on the
+    /// console, and the class is what a reader can group by without parsing it.
+    Fail {
+        reason: String,
+        err: ErrorCode,
+    },
 }
 
 impl ProbeStatus {
+    fn fail(reason: impl Into<String>, err: ErrorCode) -> Self {
+        Self::Fail {
+            reason: reason.into(),
+            err,
+        }
+    }
+
+    /// The failure classes a connect can produce, told apart by the one flag
+    /// `OutboundError` carries.
+    fn connect_failed(error: &OutboundError) -> Self {
+        let err = if error.timed_out {
+            ErrorCode::TcpConnectTimeout
+        } else {
+            ErrorCode::TcpConnect
+        };
+
+        Self::fail(format!("TCP connect failed: {error}"), err)
+    }
+
     fn marker(&self) -> &'static str {
         match self {
             Self::Ok(_) => "OK ",
-            Self::Fail(_) => "FAIL",
+            Self::Fail { .. } => "FAIL",
         }
     }
 
     fn detail(&self) -> String {
         match self {
             Self::Ok(d) => format!("{}ms", d.as_millis()),
-            Self::Fail(reason) => reason.clone(),
+            Self::Fail { reason, .. } => reason.clone(),
         }
     }
 
     fn is_ok(&self) -> bool {
         matches!(self, Self::Ok(_))
     }
+
+    fn error_code(&self) -> ErrorCode {
+        match self {
+            Self::Ok(_) => ErrorCode::Unspecified,
+            Self::Fail { err, .. } => *err,
+        }
+    }
 }
 
 /// `EVT:probe_result` — one probe of one target, whether it ran or not.
 ///
-/// A failed probe records `ErrorCode::Unspecified`: the probes report in prose
-/// ([`ProbeStatus::Fail`] carries a message, not a class), and recovering a
-/// class by parsing that message is the fragile guesswork this enum exists to
-/// replace. What the record adds over the console is that it outlives the
-/// terminal: which target, how long it took, and whether it passed.
+/// What the record adds over the console is that it outlives the terminal:
+/// which target, how long it took, whether it passed, and — since C32 — the
+/// class of the failure rather than only its prose.
 ///
 /// `dur` is the wall time of the probe as its caller saw it, measured around
 /// the call rather than inside it — the probes that fail quickly return before
 /// they would have built a duration of their own.
-fn log_probe(kind: ProbeKind, target: &str, ok: bool, dur: Duration) {
+fn log_probe(kind: ProbeKind, target: &str, ok: bool, dur: Duration, err: ErrorCode) {
     log_event!(
         Category::Check,
         Level::Info,
@@ -107,7 +138,7 @@ fn log_probe(kind: ProbeKind, target: &str, ok: bool, dur: Duration) {
             target: target.to_string(),
             ok,
             dur_ns: dur.as_nanos().min(u64::MAX as u128) as u64,
-            err: ErrorCode::Unspecified as i32,
+            err: err as i32,
             err_code: 0,
         }
     );
@@ -210,25 +241,35 @@ async fn probe_cf_domain(
     opts: CfDialOpts<'_>,
 ) -> ProbeStatus {
     let start = Instant::now();
-    let (ws, _record, _all_redirects) = connect_cf_ws_for_dc_with_outbound_opts(
+    // The classified walk, so a failure carries the same class the routing
+    // ladder would have recorded for the same dial (`EVT:tier_attempt`).
+    let walk = connect_cf_ws_for_dc_with_outbound_ordered(
         2,
         &[domain.to_string()],
         false,
         skip_tls,
         timeout,
         outbound,
+        0,
         opts,
+        &mut NoEdgeReport,
     )
     .await;
-    if ws.is_some() {
-        ProbeStatus::Ok(start.elapsed())
-    } else {
-        ProbeStatus::Fail(if opts.cf_ips.is_empty() {
-            "WebSocket connection failed — check DNS records and Cloudflare settings".to_string()
-        } else {
-            "WebSocket connection failed through every --cf-ip — check the preferred IPs and Cloudflare settings".to_string()
-        })
+
+    if walk.ws.is_some() {
+        return ProbeStatus::Ok(start.elapsed());
     }
+
+    let reason = if opts.cf_ips.is_empty() {
+        "WebSocket connection failed — check DNS records and Cloudflare settings"
+    } else {
+        "WebSocket connection failed through every --cf-ip — check the preferred IPs and Cloudflare settings"
+    };
+
+    ProbeStatus::fail(
+        reason,
+        walk.failure.map_or(ErrorCode::Unspecified, |f| f.err),
+    )
 }
 
 /// How long the Worker probe waits for its tunnel to be torn down before
@@ -257,25 +298,40 @@ async fn probe_cf_worker(
     opts: CfDialOpts<'_>,
 ) -> ProbeStatus {
     let Some(dst) = default_dc_ip(2) else {
-        return ProbeStatus::Fail("DC 2 default IP is missing".to_string());
+        // Not a network failure: the binary has no address to dial, which is a
+        // build problem rather than a connectivity one.
+        return ProbeStatus::fail("DC 2 default IP is missing", ErrorCode::Unspecified);
     };
 
     let start = Instant::now();
-    let ws = connect_cf_worker_ws_for_dc_with_outbound_opts(
-        domain, dst, 2, false, skip_tls, timeout, outbound, opts,
+    let (ws, failure) = connect_cf_worker_ws_for_dc_with_outbound_classified(
+        domain,
+        dst,
+        2,
+        false,
+        skip_tls,
+        timeout,
+        outbound,
+        opts,
+        &mut NoEdgeReport,
     )
     .await;
     let Some(mut ws) = ws else {
-        return ProbeStatus::Fail(if opts.cf_ips.is_empty() {
-            "Worker WebSocket tunnel failed — check Worker code and domain".to_string()
+        let reason = if opts.cf_ips.is_empty() {
+            "Worker WebSocket tunnel failed — check Worker code and domain"
         } else {
-            "Worker WebSocket tunnel failed through every --cf-ip — check the preferred IPs and Worker code".to_string()
-        });
+            "Worker WebSocket tunnel failed through every --cf-ip — check the preferred IPs and Worker code"
+        };
+
+        return ProbeStatus::fail(reason, failure.map_or(ErrorCode::Unspecified, |f| f.err));
     };
 
     let relay_init = crypto::generate_relay_init(ProtoTag::Intermediate, 2);
     if let Err(e) = ws_send(&mut ws, relay_init.to_vec()).await {
-        return ProbeStatus::Fail(format!("Worker tunnel closed on send: {}", e));
+        return ProbeStatus::fail(
+            format!("Worker tunnel closed on send: {}", e),
+            ErrorCode::Read,
+        );
     }
 
     // Everything the user cares about timing has happened by now; the settle
@@ -287,17 +343,26 @@ async fn probe_cf_worker(
     // stray payload from something on `dst:443` that is not a Telegram DC.
     match tokio::time::timeout(WORKER_TUNNEL_SETTLE, ws_recv(&mut ws)).await {
         Err(_) => ProbeStatus::Ok(elapsed),
-        Ok(None) => ProbeStatus::Fail(format!(
-            "Worker tunnel to {} closed immediately — the Worker cannot reach Telegram \
-             (check its live logs in the Cloudflare dashboard)",
-            dst
-        )),
-        Ok(Some(data)) => ProbeStatus::Fail(format!(
-            "Worker tunnel to {} answered the MTProto init with {} unexpected bytes — \
-             the far end is not a Telegram DC",
-            dst,
-            data.len()
-        )),
+        // The tunnel closed instead of staying silent: the Worker's own
+        // `connect()` to Telegram never landed.
+        Ok(None) => ProbeStatus::fail(
+            format!(
+                "Worker tunnel to {} closed immediately — the Worker cannot reach Telegram \
+                 (check its live logs in the Cloudflare dashboard)",
+                dst
+            ),
+            ErrorCode::Read,
+        ),
+        // Something answered, and it was not a data centre.
+        Ok(Some(data)) => ProbeStatus::fail(
+            format!(
+                "Worker tunnel to {} answered the MTProto init with {} unexpected bytes — \
+                 the far end is not a Telegram DC",
+                dst,
+                data.len()
+            ),
+            ErrorCode::Protocol,
+        ),
     }
 }
 
@@ -324,7 +389,7 @@ async fn probe_mtproto_proxy(
     // ── TCP connect ───────────────────────────────────────────────────────
     let stream = match outbound.connect(&proxy.host, proxy.port, timeout).await {
         Ok(s) => s,
-        Err(e) => return ProbeStatus::Fail(format!("TCP connect failed: {}", e)),
+        Err(e) => return ProbeStatus::connect_failed(&e),
     };
     let _ = stream.set_nodelay(true);
 
@@ -339,7 +404,9 @@ async fn probe_mtproto_proxy(
         faketls::sign_faketls_client_hello(&mut client_hello, key_bytes);
 
         if let Err(e) = writer.write_all(&client_hello).await {
-            return ProbeStatus::Fail(format!("send FakeTLS ClientHello: {}", e));
+            // The socket was open and stopped taking writes: the peer broke it
+            // off rather than refusing the connection.
+            return ProbeStatus::fail(format!("send FakeTLS ClientHello: {}", e), ErrorCode::Read);
         }
 
         // Drain the server's fake TLS handshake (ServerHello → CCS → AppData).
@@ -349,21 +416,21 @@ async fn probe_mtproto_proxy(
                 .unwrap_or(false);
 
         if !drained {
-            return ProbeStatus::Fail(
-                "FakeTLS server handshake failed or timed out — check secret and proxy address"
-                    .to_string(),
+            return ProbeStatus::fail(
+                "FakeTLS server handshake failed or timed out — check secret and proxy address",
+                ErrorCode::Tls,
             );
         }
     } else {
         // ── Plain MTProto path ────────────────────────────────────────────
         if let Err(e) = writer.write_all(&handshake).await {
-            return ProbeStatus::Fail(format!("send MTProto handshake: {}", e));
+            return ProbeStatus::fail(format!("send MTProto handshake: {}", e), ErrorCode::Read);
         }
 
         // An accepted handshake only says the socket is open: the proxy answers
         // one before its own route to a DC works, and Telegram stays silent
         // behind it.  Ask for resPQ, as the listener probe does.
-        if let Err(e) = require_res_pq(
+        if let Err((err, reason)) = require_res_pq(
             &mut reader,
             &mut writer,
             &mut enc,
@@ -373,7 +440,7 @@ async fn probe_mtproto_proxy(
         )
         .await
         {
-            return ProbeStatus::Fail(e);
+            return ProbeStatus::fail(reason, err);
         }
     }
 
@@ -398,7 +465,7 @@ async fn require_res_pq<R, W>(
     dec: &mut AesCtr256,
     timeout: Duration,
     peer: &str,
-) -> Result<(), String>
+) -> Result<(), (ErrorCode, String)>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -408,7 +475,7 @@ where
     writer
         .write_all(&request)
         .await
-        .map_err(|e| format!("send req_pq_multi: {e}"))?;
+        .map_err(|e| (ErrorCode::Read, format!("send req_pq_multi: {e}")))?;
 
     // Read until the fixed-size header is complete.  Telegram stays silent
     // until it has the request and the proxy's pool may still be coming up, so
@@ -432,28 +499,43 @@ where
     dec.apply_keystream(&mut header[..filled]);
 
     match read {
-        Err(_) => Err(format!("no reply within {}s", timeout.as_secs())),
-        Ok(Err(e)) => Err(format!("read from {peer}: {e}")),
-        Ok(Ok(())) if filled == 0 => Err(format!(
-            "{peer} closed without answering — no tier reached the DC"
+        // The peer answered the handshake and then stalled: `TlsTimeout` is the
+        // schema's "reached, then stopped talking" class — named for the layer
+        // that coined it, not for the layer it is used on here.
+        Err(_) => Err((
+            ErrorCode::TlsTimeout,
+            format!("no reply within {}s", timeout.as_secs()),
+        )),
+        Ok(Err(e)) => Err((ErrorCode::Read, format!("read from {peer}: {e}"))),
+        Ok(Ok(())) if filled == 0 => Err((
+            ErrorCode::Read,
+            format!("{peer} closed without answering — no tier reached the DC"),
         )),
         // A transport error arrives as an ordinary packet: a 4-byte length of 4
         // followed by the negative code, so 8 bytes on the wire.  A bare
         // 4-byte prefix is not an error — it is a truncated packet.
+        // Telegram's own error frame: the peer is speaking the protocol, and
+        // saying no in it.
         Ok(Ok(())) if filled >= 8 && header[..4] == 4u32.to_le_bytes() => {
             let mut code = [0u8; 4];
             code.copy_from_slice(&header[4..8]);
-            Err(format!(
-                "{peer} reported a transport error: {}",
-                i32::from_le_bytes(code)
+            Err((
+                ErrorCode::Protocol,
+                format!(
+                    "{peer} reported a transport error: {}",
+                    i32::from_le_bytes(code)
+                ),
             ))
         }
-        Ok(Ok(())) if filled < header.len() => Err(format!(
-            "{peer} closed after {filled} of {} header bytes — no tier reached the DC",
-            header.len()
+        Ok(Ok(())) if filled < header.len() => Err((
+            ErrorCode::Read,
+            format!(
+                "{peer} closed after {filled} of {} header bytes — no tier reached the DC",
+                header.len()
+            ),
         )),
         Ok(Ok(())) if reply_is_res_pq(&header) => Ok(()),
-        Ok(Ok(())) => Err(format!("{peer}'s reply is not resPQ")),
+        Ok(Ok(())) => Err((ErrorCode::Protocol, format!("{peer}'s reply is not resPQ"))),
     }
 }
 
@@ -480,7 +562,7 @@ async fn probe_listener(
         .await
     {
         Ok(stream) => stream,
-        Err(e) => return ProbeStatus::Fail(format!("TCP connect failed: {}", e)),
+        Err(e) => return ProbeStatus::connect_failed(&e),
     };
     let _ = stream.set_nodelay(true);
     let (mut reader, mut writer) = stream.into_split();
@@ -488,7 +570,7 @@ async fn probe_listener(
     let (handshake, mut enc, mut dec) =
         generate_client_handshake(secret, dc_idx, ProtoTag::PaddedIntermediate);
     if let Err(e) = writer.write_all(&handshake).await {
-        return ProbeStatus::Fail(format!("send MTProto handshake: {}", e));
+        return ProbeStatus::fail(format!("send MTProto handshake: {}", e), ErrorCode::Read);
     }
 
     match require_res_pq(
@@ -502,7 +584,7 @@ async fn probe_listener(
     .await
     {
         Ok(()) => ProbeStatus::Ok(start.elapsed()),
-        Err(e) => ProbeStatus::Fail(e),
+        Err((err, reason)) => ProbeStatus::fail(reason, err),
     }
 }
 
@@ -606,6 +688,7 @@ pub async fn run_check_with_outbound(
                 &format!("kws2.{}", domain),
                 status.is_ok(),
                 started.elapsed(),
+                status.error_code(),
             );
 
             if !status.is_ok() {
@@ -630,6 +713,7 @@ pub async fn run_check_with_outbound(
                 domain,
                 status.is_ok(),
                 started.elapsed(),
+                status.error_code(),
             );
 
             if !status.is_ok() {
@@ -656,6 +740,7 @@ pub async fn run_check_with_outbound(
                 &format!("{}:{}", proxy.host, proxy.port),
                 status.is_ok(),
                 started.elapsed(),
+                status.error_code(),
             );
 
             if !status.is_ok() {
@@ -720,6 +805,7 @@ pub async fn run_check_with_outbound(
                         &target.to_string(),
                         status.is_ok(),
                         started.elapsed(),
+                        status.error_code(),
                     );
                     if !status.is_ok() {
                         all_ok = false;
