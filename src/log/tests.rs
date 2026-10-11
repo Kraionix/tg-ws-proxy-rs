@@ -1313,6 +1313,32 @@ fn both_durability_modes_survive_a_clean_close() {
     }
 }
 
+#[test]
+fn a_record_emitted_while_the_writer_is_stopping_still_reaches_the_sink() {
+    // The accept loop stops before a session that is still tearing down, so the
+    // moment between "stop" and "the writer exits" is exactly when the last
+    // session's close record is produced. Dropping it would make the end of a
+    // session the one thing a clean stop is allowed to lose.
+    let runtime = unpolled_runtime();
+    let (sink, _shared, mut batches) = recording();
+    let handle = Arc::new(runtime.block_on(async { start(sink, quiet(DEFAULT_BATCH_MAX)) }));
+    let late = Arc::clone(&handle);
+
+    runtime.block_on(async move {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            late.emit(9, Category::Session, Level::Info, pool_hit(2));
+        });
+        handle.shutdown().await;
+    });
+
+    let mut seen = 0;
+    while let Ok(batch) = batches.try_recv() {
+        seen += batch.records.len();
+    }
+    assert_eq!(seen, 1, "the record emitted during the stop was dropped");
+}
+
 #[cfg(not(feature = "log-zstd"))]
 #[test]
 fn a_build_without_zstd_names_the_build_that_could_read_a_compressed_batch() {

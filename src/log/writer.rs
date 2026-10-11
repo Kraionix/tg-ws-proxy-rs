@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 use tracing::warn;
@@ -179,6 +179,21 @@ impl<S: BatchSink> Task<S> {
     }
 }
 
+/// How long the drain keeps listening after the channel has gone quiet.
+///
+/// The shutdown signal reaches the writer when the accept loop stops, and a
+/// session that was already past that point emits its close record a moment
+/// later. "A clean stop loses nothing" has to cover that moment, not only the
+/// records that were queued when the signal arrived.
+const DRAIN_QUIET: Duration = Duration::from_millis(25);
+
+/// The longest the drain may run, however busy the producers still are.
+///
+/// Bounded on purpose: a stop must not be held hostage by a producer that keeps
+/// emitting, and the records it produces after this point are the ones a stop
+/// is allowed to cost.
+const DRAIN_LIMIT: Duration = Duration::from_millis(250);
+
 /// The writer task. Runs until the handle asks it to stop or the channel
 /// closes, then flushes what is left before returning.
 pub(super) async fn run<S: BatchSink + 'static>(
@@ -224,13 +239,32 @@ pub(super) async fn run<S: BatchSink + 'static>(
         }
     }
 
-    // Whatever arrived between the last flush and the signal. Producers that
-    // emit after this point are dropped, which is why shutdown happens after
-    // the accept loop has stopped rather than before.
+    // Whatever arrived between the last flush and the signal. Written before
+    // the drain window opens, so a stop that is killed during it still has
+    // everything that was already queued.
     while let Ok(record) = rx.try_recv() {
         task.writer.push(record);
         if task.writer.is_full() {
             task.flush();
+        }
+    }
+    task.flush();
+
+    // And now the tail: the sessions that were mid-teardown when the signal
+    // arrived. A record that lands exactly on the boundary is still lost — the
+    // window is a bound on how long a stop may wait, not a promise about a
+    // producer that cannot say when it is finished.
+    let started = Instant::now();
+    while started.elapsed() < DRAIN_LIMIT {
+        match tokio::time::timeout(DRAIN_QUIET, rx.recv()).await {
+            Ok(Some(record)) => {
+                task.writer.push(record);
+                if task.writer.is_full() {
+                    task.flush();
+                }
+            }
+            // Every producer is gone, or none has spoken for a whole window.
+            Ok(None) | Err(_) => break,
         }
     }
 
