@@ -77,8 +77,11 @@ jobs:
                       qemu_cpu: cortex-a9,vfp=off,vfp-d32=off,neon=off
                     - target: aarch64-unknown-linux-musl
                       qemu: qemu-aarch64-static
+                      # Rehearses the feature release.yml ships on this target.
+                      features: log-zstd
                     - target: x86_64-unknown-linux-musl
                       qemu: qemu-x86_64-static
+                      features: log-zstd
         steps:
             - uses: actions/checkout@v6
 
@@ -118,7 +121,12 @@ jobs:
 
             - name: Build
               if: ${{ !matrix.build_std }}
-              run: cross build --release --bin tg-ws-proxy --target ${{ matrix.target }}
+              env:
+                  # Empty for the targets that ship without it; `${VAR:+…}`
+                  # rather than an expression, because a bare `--features` with
+                  # an empty value is a cargo usage error.
+                  FEATURES: ${{ matrix.features }}
+              run: cross build --release --bin tg-ws-proxy --target ${{ matrix.target }} ${FEATURES:+--features $FEATURES}
 
             # UPX 4.2.4, same pin and same reason as release.yml: every 5.x stub
             # needs `memfd_create` (Linux >= 3.17) and dies with

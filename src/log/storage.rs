@@ -671,13 +671,23 @@ fn create_dir(dir: &Path) -> Result<(), LogError> {
 
 // ── Filesystem gate ────────────────────────────────────────────────────────
 
-/// Refuses a log directory on a filesystem that cannot carry a redb segment.
+/// Refuses a log directory on a filesystem this build does not support.
 ///
-/// redb's single-writer guarantee is a POSIX file lock, and the FAT family has
-/// no advisory locks at all: two writers would interleave into one file, and
-/// the failure would show up as a corrupt segment rather than as a refusal. So
-/// the check runs once, at startup, where it can still be a configuration error
-/// with an exit code.
+/// The list is a support decision, not a claim about what the kernel can do.
+/// redb takes `fcntl` open-file-description locks, and Linux implements those in
+/// the VFS for every local filesystem — a `vfat` stick would very probably
+/// work. It is refused anyway, because "very probably" is not a promise to make
+/// about the one file that holds every session's metadata, and because the fix
+/// for a stick is one `mkfs` away: `f2fs` is built for flash, keeps the file
+/// sparse, and is what the message asks for.
+///
+/// The FAT family is named rather than derived, and the network filesystems —
+/// where a lock really does depend on the server and on mount options such as
+/// `nolock` — are deliberately *not* on it: refusing the wrong names would cost
+/// a working deployment to cover a case that does not fail this way.
+///
+/// Whatever the answer, the check runs once at startup, where it is still a
+/// configuration error with an exit code.
 pub(crate) fn check_filesystem(dir: &Path) -> Result<(), LogError> {
     // The directory may not exist yet, so resolve the nearest ancestor that
     // does: it is the filesystem the directory is about to be created on.
@@ -692,8 +702,9 @@ pub(crate) fn check_filesystem(dir: &Path) -> Result<(), LogError> {
     let fstype = filesystem_of(probe);
     match fstype.as_deref() {
         Some(name) if !carries_locks(name) => Err(LogError::FsUnsupported(format!(
-            "{} is on {name}, which has no POSIX file locks; \
-             --log-dir needs ext4, xfs, btrfs, f2fs, tmpfs or overlayfs",
+            "{} is on {name}, which --log-dir does not support: format the stick as f2fs \
+             (or ext4, xfs, btrfs) and mount that, or point --log-dir at tmpfs \
+             such as /tmp to keep the log in RAM",
             dir.display()
         ))),
         Some(_) => Ok(()),
