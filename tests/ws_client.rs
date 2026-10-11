@@ -1,8 +1,9 @@
 use std::time::Duration;
 
+use tg_ws_proxy_rs::log::schema::ErrorCode;
 use tg_ws_proxy_rs::outbound::OutboundConnector;
 use tg_ws_proxy_rs::ws_client::{
-    CfDialOpts, WsConnectResult, cf_worker_path, cf_ws_domains,
+    CfDialOpts, RungFailure, WsConnectResult, cf_worker_path, cf_ws_domains,
     connect_cf_record_with_outbound_mode, connect_cf_worker_ws_for_dc_with_outbound,
     connect_cf_worker_ws_for_dc_with_outbound_mode, connect_cf_worker_ws_for_dc_with_outbound_opts,
     connect_cf_ws_for_dc_with_outbound, connect_cf_ws_for_dc_with_outbound_mode,
@@ -95,7 +96,7 @@ async fn ws_client_connects_through_outbound_proxy() {
     .await;
 
     match result {
-        WsConnectResult::Failed(reason) => {
+        WsConnectResult::ConnectFailed(reason) => {
             assert!(reason.contains("HTTP proxy"));
             assert!(reason.contains("407"));
         }
@@ -129,6 +130,16 @@ async fn telegram_ws_dc_connector_uses_outbound_proxy() {
     assert!(!attempt.all_redirects);
     assert!(!attempt.upgrade_timed_out);
     assert!(!attempt.connect_timed_out);
+    // And it happened before the upgrade was attempted, which is what the
+    // ladder's `EVT:tier_attempt` has to report: the proxy refused us, the
+    // Telegram endpoint never heard of it.
+    assert_eq!(
+        attempt.failure,
+        Some(RungFailure {
+            err: ErrorCode::TcpConnect,
+            err_code: 0
+        })
+    );
     let request = await_proxy_request(proxy_task).await;
     assert!(request.starts_with("CONNECT 203.0.113.10:443 HTTP/1.1"));
 }

@@ -38,7 +38,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use tungstenite::Message;
 
-use crate::log::schema::{Category, ClosedBy as LogClosedBy, Level, Peer, Tier as LogTier};
+use crate::log::schema::{
+    Category, ClosedBy as LogClosedBy, ErrorCode, Level, Peer, Tier as LogTier,
+};
 use crate::log_event;
 
 use crate::config::{Config, MtProtoProxy, UpstreamTier};
@@ -51,12 +53,13 @@ use crate::faketls::{
     build_faketls_server_hello, drain_faketls_server_hello, parse_faketls_client_hello,
     read_tls_appdata, read_tls_record_bytes, sign_faketls_client_hello, write_tls_appdata,
 };
-use crate::outbound::OutboundConnector;
+use crate::outbound::{OutboundConnector, OutboundError};
 use crate::pool::{CfTarget, CfTier, WsPool};
 use crate::runtime::Runtime;
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{
-    CfDialOpts, CooldownMap, TgWsStream, WsAttempt, connect_cf_worker_ws_for_dc_with_outbound_opts,
+    CfDialOpts, CooldownMap, RungFailure, TgWsStream, WsAttempt,
+    connect_cf_worker_ws_for_dc_with_outbound_classified,
     connect_cf_ws_for_dc_with_outbound_ordered, connect_ws_for_dc_with_outbound, media_tag,
 };
 
@@ -1030,7 +1033,8 @@ impl Route<'_> {
                 self.label, self.dc, self.media, reason, worker_domain, dst
             );
 
-            let ws = connect_cf_worker_ws_for_dc_with_outbound_opts(
+            let started = Instant::now();
+            let (ws, failure) = connect_cf_worker_ws_for_dc_with_outbound_classified(
                 worker_domain,
                 dst,
                 self.dc,
@@ -1045,6 +1049,14 @@ impl Route<'_> {
                 },
             )
             .await;
+            log_tier_attempt(
+                self.dc,
+                self.is_media,
+                UpstreamTier::Cfworker,
+                ws.is_some(),
+                started.elapsed(),
+                failure,
+            );
 
             match ws {
                 Some(ws) => {
@@ -1123,7 +1135,8 @@ impl Route<'_> {
             self.label, self.dc, self.media, reason, self.config.cf_domains
         );
 
-        let (ws, domain, _all_redirects) = connect_cf_ws_for_dc_with_outbound_ordered(
+        let started = Instant::now();
+        let walk = connect_cf_ws_for_dc_with_outbound_ordered(
             self.dc,
             &self.config.cf_domains,
             self.is_media,
@@ -1138,6 +1151,16 @@ impl Route<'_> {
             },
         )
         .await;
+        log_tier_attempt(
+            self.dc,
+            self.is_media,
+            UpstreamTier::Cfproxy,
+            walk.ws.is_some(),
+            started.elapsed(),
+            walk.failure,
+        );
+
+        let (ws, domain) = (walk.ws, walk.record);
 
         if ws.is_some() {
             info!(
@@ -1174,6 +1197,7 @@ impl Route<'_> {
                 continue;
             }
 
+            let started = Instant::now();
             let conn = connect_mtproto_upstream(
                 upstream,
                 self.dc_idx,
@@ -1182,9 +1206,17 @@ impl Route<'_> {
                 self.runtime.outbound(),
             )
             .await;
+            log_tier_attempt(
+                self.dc,
+                self.is_media,
+                UpstreamTier::Mtproto,
+                conn.is_ok(),
+                started.elapsed(),
+                conn.as_ref().err().copied(),
+            );
 
             match conn {
-                Some(conn) => {
+                Ok(conn) => {
                     UPSTREAM_FAIL.clear(key.as_str());
                     info!(
                         "[{}] DC{}{} {} → upstream {} MTProto {}",
@@ -1197,7 +1229,7 @@ impl Route<'_> {
                     );
                     return Some(conn);
                 }
-                None => {
+                Err(_) => {
                     UPSTREAM_FAIL.set(key.clone(), self.timeouts.upstream_fail_cooldown);
                     warn!(
                         "[{}] upstream {} failed, cooldown {}s",
@@ -1227,7 +1259,16 @@ impl Route<'_> {
         // a timeout there says far less about the address than a full-budget
         // one does — see `cool_down_ip`.
         let probing = WS_FAIL.active(&(self.dc, self.is_media));
+        let started = Instant::now();
         let attempt = self.connect_ws(target_ip, fronting).await;
+        log_tier_attempt(
+            self.dc,
+            self.is_media,
+            UpstreamTier::Ws,
+            attempt.ws.is_some(),
+            started.elapsed(),
+            attempt.failure,
+        );
 
         if let Some(ws) = attempt.ws {
             WS_FAIL.clear(&(self.dc, self.is_media));
@@ -1532,17 +1573,24 @@ async fn connect_mtproto_upstream(
     proto: ProtoTag,
     timeout: Duration,
     outbound: &OutboundConnector,
-) -> Option<UpstreamConnection> {
+) -> Result<UpstreamConnection, RungFailure> {
     let host = &proxy.host;
     let port = proxy.port;
     let key_bytes = proxy.secret_key();
+
+    // The one class this rung shares with the rest of the ladder, for a
+    // handshake the peer broke off: the socket was open and then it was not.
+    let broken_stream = RungFailure {
+        err: ErrorCode::Read,
+        err_code: 0,
+    };
 
     // ── TCP connect ───────────────────────────────────────────────────────
     let stream = match outbound.connect(host, port, timeout).await {
         Ok(s) => s,
         Err(e) => {
             warn!("[upstream] {}:{} connect error: {}", host, port, e);
-            return None;
+            return Err(connect_failure(&e));
         }
     };
     let _ = stream.set_nodelay(true);
@@ -1554,10 +1602,10 @@ async fn connect_mtproto_upstream(
         // ── Plain MTProto path ────────────────────────────────────────────
         if let Err(e) = writer.write_all(&handshake).await {
             warn!("[upstream] {}:{} send handshake error: {}", host, port, e);
-            return None;
+            return Err(broken_stream);
         }
 
-        return Some(UpstreamConnection {
+        return Ok(UpstreamConnection {
             reader,
             writer,
             enc,
@@ -1576,7 +1624,7 @@ async fn connect_mtproto_upstream(
             "[upstream] {}:{} FakeTLS send ClientHello error: {}",
             host, port, e
         );
-        return None;
+        return Err(broken_stream);
     }
 
     // Drain the server's fake TLS handshake response.
@@ -1585,7 +1633,10 @@ async fn connect_mtproto_upstream(
             "[upstream] {}:{} FakeTLS server handshake failed",
             host, port
         );
-        return None;
+        return Err(RungFailure {
+            err: ErrorCode::Tls,
+            err_code: 0,
+        });
     }
 
     // Send the 64-byte MTProto init as the first Application Data record.
@@ -1594,10 +1645,10 @@ async fn connect_mtproto_upstream(
             "[upstream] {}:{} FakeTLS send MTProto init error: {}",
             host, port, e
         );
-        return None;
+        return Err(broken_stream);
     }
 
-    Some(UpstreamConnection {
+    Ok(UpstreamConnection {
         reader,
         writer,
         enc,
@@ -1777,10 +1828,30 @@ async fn bridge_tcp(
         runtime,
     } = params;
 
+    let started = Instant::now();
     let remote = match runtime.outbound().connect(dst, 443, connect_timeout).await {
-        Ok(s) => s,
+        Ok(s) => {
+            log_tier_attempt(
+                dc,
+                is_media,
+                UpstreamTier::Tcp,
+                true,
+                started.elapsed(),
+                None,
+            );
+
+            s
+        }
         Err(e) => {
             warn!("[{}] TCP fallback connect failed: {}", label, e);
+            log_tier_attempt(
+                dc,
+                is_media,
+                UpstreamTier::Tcp,
+                false,
+                started.elapsed(),
+                Some(connect_failure(&e)),
+            );
             return;
         }
     };
@@ -1988,6 +2059,60 @@ fn log_session_closed(
             dur_ms,
         }
     );
+}
+
+/// `EVT:tier_attempt` — one rung of the ladder opening a connection, and what
+/// it cost.
+///
+/// Emitted at the dial rather than at the rung's decision point, because the
+/// two are not the same thing: the TCP rung decides nothing and connects later,
+/// inside its bridge, and a rung that a cooldown skipped connects not at all.
+/// That leaves exactly one record per connection attempt, which is what makes
+/// the durations add up to the connection's setup time.
+fn log_tier_attempt(
+    dc: u32,
+    is_media: bool,
+    tier: UpstreamTier,
+    ok: bool,
+    dur: Duration,
+    failure: Option<RungFailure>,
+) {
+    // A successful dial carries no classification, and neither does one whose
+    // rung failed without one — the enum's zero is both.
+    let (err, err_code) = match failure {
+        Some(failure) if !ok => (failure.err as i32, failure.err_code),
+        _ => (ErrorCode::Unspecified as i32, 0),
+    };
+
+    log_event!(
+        Category::Routing,
+        Level::Debug,
+        Event::TierAttempt {
+            tier: LogTier::from(tier) as i32,
+            dc,
+            is_media,
+            ok,
+            dur_ns: dur.as_nanos().min(u64::MAX as u128) as u64,
+            err,
+            err_code,
+        }
+    );
+}
+
+/// The class an outbound connect failure belongs to.
+///
+/// `OutboundError` carries the one distinction the ladder acts on — timed out
+/// versus answered-and-refused — so this is the whole mapping, not an
+/// abbreviation of one.
+fn connect_failure(error: &OutboundError) -> RungFailure {
+    RungFailure {
+        err: if error.timed_out {
+            ErrorCode::TcpConnectTimeout
+        } else {
+            ErrorCode::TcpConnect
+        },
+        err_code: 0,
+    }
 }
 
 /// The client address in the encoding the schema defines: the raw bytes, with

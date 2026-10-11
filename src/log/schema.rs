@@ -328,7 +328,7 @@ pub enum ErrorCode {
     Upgrade = 8,
     /// MTProto or FakeTLS framing violation.
     Protocol = 9,
-    /// The stream ended mid-handshake.
+    /// The stream ended mid-handshake, or would not take the write.
     Read = 10,
     /// `EMFILE`, `ENFILE`, or no connection permit available.
     Resource = 11,

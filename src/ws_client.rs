@@ -201,8 +201,15 @@ pub enum WsConnectResult {
     /// Telegram sometimes does this when WS is unavailable — the caller
     /// should fall back to direct TCP.
     Redirect(u16),
-    /// Any other non-101 status code or transport error.
+    /// Any other non-101 status code, or an error after the socket was up.
     Failed(String),
+    /// The TCP connect failed without running out the clock: refused,
+    /// unroutable, or the outbound proxy said no.
+    ///
+    /// Kept apart from [`Self::Failed`] because it happens before the upgrade
+    /// is ever attempted — nothing about the server's HTTP behaviour, or even
+    /// about the server existing, can be concluded from it.
+    ConnectFailed(String),
     /// The TCP connect ran out the clock: nothing at `ip:443` answered.
     ///
     /// Distinct from [`Self::TimedOut`] because the two call for opposite
@@ -232,6 +239,7 @@ impl WsConnectResult {
             Self::Connected(_) => (ErrorCode::Unspecified, 0),
             Self::Redirect(status) => (ErrorCode::HttpRedirect, u32::from(*status)),
             Self::ConnectTimedOut(_) => (ErrorCode::TcpConnectTimeout, 0),
+            Self::ConnectFailed(_) => (ErrorCode::TcpConnect, 0),
             Self::TimedOut => (ErrorCode::TlsTimeout, 0),
             Self::Failed(message) => match http_status_in(message) {
                 Some(status) => (ErrorCode::HttpStatus, u32::from(status)),
@@ -240,6 +248,30 @@ impl WsConnectResult {
                 None => (ErrorCode::Upgrade, 0),
             },
         }
+    }
+}
+
+/// Why the last dial of a rung failed, for `EVT:tier_attempt`.
+///
+/// One value per rung rather than per candidate hostname: a rung is one step of
+/// the ladder, and the record answers "did this step carry the connection, and
+/// what did the step cost".  The *last* failure is the one the step ended on,
+/// so it is the one the next step is being taken because of — the earlier
+/// candidates in the same walk are already in the `tracing` lines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RungFailure {
+    /// [`ErrorCode`] discriminant.
+    pub err: ErrorCode,
+    /// The number behind `err`; the HTTP status for the two status-carrying
+    /// codes, and zero where there is none.
+    pub err_code: u32,
+}
+
+impl From<&WsConnectResult> for RungFailure {
+    fn from(result: &WsConnectResult) -> Self {
+        let (err, err_code) = result.error_code();
+
+        Self { err, err_code }
     }
 }
 
@@ -268,6 +300,11 @@ pub struct WsAttempt {
     pub upgrade_timed_out: bool,
     /// A TCP connect stalled: nothing at the address answered at all.
     pub connect_timed_out: bool,
+    /// The last hostname's failure, or `None` on success.  Carried beside the
+    /// three flags rather than folded into them because the ladder's
+    /// `EVT:tier_attempt` wants the class and the status, which the flags have
+    /// already thrown away.
+    pub failure: Option<RungFailure>,
 }
 
 impl WsAttempt {
@@ -277,6 +314,7 @@ impl WsAttempt {
             all_redirects: false,
             upgrade_timed_out: false,
             connect_timed_out: false,
+            failure: None,
         }
     }
 }
@@ -388,7 +426,7 @@ async fn connect_ws_with_path(
     let tcp = match outbound.connect(ip, port, timeout).await {
         Ok(s) => s,
         Err(e) if e.timed_out => return WsConnectResult::ConnectTimedOut(e.reason),
-        Err(e) => return WsConnectResult::Failed(e.reason),
+        Err(e) => return WsConnectResult::ConnectFailed(e.reason),
     };
 
     // Disable Nagle algorithm for lower latency.
@@ -533,7 +571,7 @@ async fn connect_cf_with_path(
                 cooldowns.clear(&ip);
                 last_redirect = Some(code);
             }
-            WsConnectResult::Failed(reason) => {
+            WsConnectResult::Failed(reason) | WsConnectResult::ConnectFailed(reason) => {
                 cooldowns.clear(&ip);
                 last_non_redirect = Some(WsConnectResult::Failed(reason));
             }
@@ -679,11 +717,12 @@ pub async fn connect_ws_for_dc_with_outbound(
     let mut all_redirects = true;
     let mut any_upgrade_timed_out = false;
     let mut any_connect_timed_out = false;
+    let mut failure = None;
 
     for domain in &domains {
         debug!("WS trying DC{}{} → {} via {}", dc, media, domain, ip);
 
-        match connect_ws_with_outbound_mode(
+        let outcome = connect_ws_with_outbound_mode(
             ip,
             domain,
             skip_tls_verify,
@@ -692,8 +731,10 @@ pub async fn connect_ws_for_dc_with_outbound(
             sni_override,
             false,
         )
-        .await
-        {
+        .await;
+        let classed = RungFailure::from(&outcome);
+
+        match outcome {
             WsConnectResult::Connected(ws) => {
                 return WsAttempt::connected(ws);
             }
@@ -704,7 +745,7 @@ pub async fn connect_ws_for_dc_with_outbound(
                 );
                 // Keep trying next domain; still counts as all_redirects.
             }
-            WsConnectResult::Failed(reason) => {
+            WsConnectResult::Failed(reason) | WsConnectResult::ConnectFailed(reason) => {
                 warn!("WS DC{}{} failed on {}: {}", dc, media, domain, reason);
 
                 all_redirects = false; // a real failure, not just a redirect
@@ -722,6 +763,8 @@ pub async fn connect_ws_for_dc_with_outbound(
                 any_connect_timed_out = true;
             }
         }
+
+        failure = Some(classed);
     }
 
     WsAttempt {
@@ -729,6 +772,7 @@ pub async fn connect_ws_for_dc_with_outbound(
         all_redirects,
         upgrade_timed_out: any_upgrade_timed_out,
         connect_timed_out: any_connect_timed_out,
+        failure,
     }
 }
 
@@ -926,7 +970,7 @@ pub async fn connect_cf_ws_for_dc_with_outbound_opts(
     outbound: &OutboundConnector,
     opts: CfDialOpts<'_>,
 ) -> (Option<TgWsStream>, Option<String>, bool) {
-    connect_cf_ws_for_dc_with_outbound_ordered(
+    let walk = connect_cf_ws_for_dc_with_outbound_ordered(
         dc,
         cf_domains,
         is_media,
@@ -936,7 +980,23 @@ pub async fn connect_cf_ws_for_dc_with_outbound_opts(
         0,
         opts,
     )
-    .await
+    .await;
+
+    (walk.ws, walk.record, walk.all_redirects)
+}
+
+/// One walk over a Cloudflare-proxied domain list: what answered, and how the
+/// walk ended when nothing did.
+pub(crate) struct CfWalk {
+    pub ws: Option<TgWsStream>,
+    /// The expanded `kws{N}` hostname that answered — the caller can reconnect
+    /// straight to it with [`connect_cf_record_with_outbound`] instead of
+    /// walking the list again.
+    pub record: Option<String>,
+    /// Every domain answered with a redirect; see [`WsAttempt::all_redirects`].
+    pub all_redirects: bool,
+    /// The last domain's failure, or `None` when one answered.
+    pub failure: Option<RungFailure>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -949,15 +1009,16 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
     outbound: &OutboundConnector,
     first_domain: usize,
     opts: CfDialOpts<'_>,
-) -> (Option<TgWsStream>, Option<String>, bool) {
+) -> CfWalk {
     let media = media_tag(is_media);
     let mut all_redirects = true;
     let mut attempts = CfAttempts::with_offset(dc, cf_domains, first_domain);
+    let mut failure = None;
 
     while let Some(domain) = attempts.next_domain() {
         debug!("CF WS trying DC{}{} → {}", dc, media, domain);
 
-        match connect_cf_with_path(
+        let outcome = connect_cf_with_path(
             &domain,
             "/apiws",
             true,
@@ -966,10 +1027,17 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
             outbound,
             opts,
         )
-        .await
-        {
+        .await;
+        let classed = RungFailure::from(&outcome);
+
+        match outcome {
             WsConnectResult::Connected(ws) => {
-                return (Some(ws), Some(domain), false);
+                return CfWalk {
+                    ws: Some(ws),
+                    record: Some(domain),
+                    all_redirects: false,
+                    failure: None,
+                };
             }
             WsConnectResult::Redirect(code) => {
                 warn!(
@@ -977,7 +1045,7 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
                     dc, media, code, domain
                 );
             }
-            WsConnectResult::Failed(reason) => {
+            WsConnectResult::Failed(reason) | WsConnectResult::ConnectFailed(reason) => {
                 warn!("CF WS DC{}{} failed on {}: {}", dc, media, domain, reason);
                 all_redirects = false;
             }
@@ -987,9 +1055,16 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
                 all_redirects = false;
             }
         }
+
+        failure = Some(classed);
     }
 
-    (None, None, all_redirects)
+    CfWalk {
+        ws: None,
+        record: None,
+        all_redirects,
+        failure,
+    }
 }
 
 /// Reconnect to a single already-expanded `kws{N}` Cloudflare record.
@@ -1152,6 +1227,34 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound_opts(
     outbound: &OutboundConnector,
     opts: CfDialOpts<'_>,
 ) -> Option<TgWsStream> {
+    let (ws, _) = connect_cf_worker_ws_for_dc_with_outbound_classified(
+        worker_domain,
+        dst,
+        dc,
+        is_media,
+        skip_tls_verify,
+        timeout,
+        outbound,
+        opts,
+    )
+    .await;
+
+    ws
+}
+
+/// [`connect_cf_worker_ws_for_dc_with_outbound_opts`], also returning why the
+/// dial failed when it did — for the ladder's `EVT:tier_attempt`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn connect_cf_worker_ws_for_dc_with_outbound_classified(
+    worker_domain: &str,
+    dst: &str,
+    dc: u32,
+    is_media: bool,
+    skip_tls_verify: bool,
+    timeout: Duration,
+    outbound: &OutboundConnector,
+    opts: CfDialOpts<'_>,
+) -> (Option<TgWsStream>, Option<RungFailure>) {
     let path = cf_worker_path(dst, dc, is_media);
     let media = media_tag(is_media);
     debug!(
@@ -1159,7 +1262,7 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound_opts(
         dc, media, dst, worker_domain
     );
 
-    match connect_cf_with_path(
+    let outcome = connect_cf_with_path(
         worker_domain,
         &path,
         false,
@@ -1168,26 +1271,28 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound_opts(
         outbound,
         opts,
     )
-    .await
-    {
-        WsConnectResult::Connected(ws) => Some(ws),
+    .await;
+    let classed = RungFailure::from(&outcome);
+
+    match outcome {
+        WsConnectResult::Connected(ws) => (Some(ws), None),
         WsConnectResult::Redirect(code) => {
             warn!(
                 "CF Worker DC{}{} got {} from {} (redirect)",
                 dc, media, code, worker_domain
             );
-            None
+            (None, Some(classed))
         }
-        WsConnectResult::Failed(reason) => {
+        WsConnectResult::Failed(reason) | WsConnectResult::ConnectFailed(reason) => {
             warn!(
                 "CF Worker DC{}{} failed on {}: {}",
                 dc, media, worker_domain, reason
             );
-            None
+            (None, Some(classed))
         }
         WsConnectResult::TimedOut | WsConnectResult::ConnectTimedOut(_) => {
             warn!("CF Worker DC{}{} timed out on {}", dc, media, worker_domain);
-            None
+            (None, Some(classed))
         }
     }
 }

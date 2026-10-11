@@ -310,3 +310,102 @@ async fn a_worker_tunnel_never_emits_an_oversized_frame() {
         "every byte the client sent has to reach the upstream: {sizes:?}"
     );
 }
+
+/// `EVT:tier_attempt` reaches a segment, attributed to the connection that
+/// dialled and carrying the class of the failure.
+///
+/// The dial target is `127.0.0.1`, where nothing listens on 443: a refused
+/// connect, which is the fast and deterministic failure this classification
+/// exists to name. The read-back is the point — a record that never leaves the
+/// writer's channel looks identical to one that was never emitted.
+#[tokio::test]
+async fn a_failed_ws_dial_lands_in_the_segment_as_a_tier_attempt() {
+    let dir = std::env::temp_dir().join(format!("tgws-tier-attempt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let config = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--secret",
+        "00112233445566778899aabbccddeeff",
+        "--pool-size",
+        "0",
+        "--log-dir",
+        dir.to_str().expect("a utf-8 temp path"),
+        "--log-level",
+        "debug",
+        "--log-batch-max",
+        "16",
+        "--log-durability",
+        "immediate",
+    ])
+    .unwrap()
+    .with_defaults();
+
+    let handle = crate::log::init(&dir, config.log_settings(), config.log_options())
+        .expect("a writable temp dir accepts a segment");
+    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        std::time::Duration::from_secs(60),
+        Arc::clone(&runtime),
+    ));
+    let route = Route {
+        label: "127.0.0.1:1".parse().unwrap(),
+        config: &config,
+        runtime: &runtime,
+        pool: &pool,
+        timeouts: Timeouts::from_config(&config),
+        dc: 2,
+        is_media: false,
+        media: media_tag(false),
+        dc_idx: 2,
+        proto: ProtoTag::PaddedIntermediate,
+    };
+
+    const CONN: u64 = 7;
+    let ws = crate::log::scope(CONN, Arc::clone(&handle), async {
+        route.direct_ws("127.0.0.1").await
+    })
+    .await;
+
+    assert!(ws.is_none(), "nothing is listening on 127.0.0.1:443");
+    handle.shutdown().await;
+
+    let day = std::fs::read_dir(&dir)
+        .expect("the segment directory")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find_map(|name| name.strip_suffix(".redb").map(str::to_string))
+        .expect("one segment for today");
+
+    let records: Vec<_> = crate::log::storage::iter_batches(&dir, &day)
+        .expect("the segment it just wrote is readable")
+        .into_iter()
+        .flat_map(|batch| batch.records)
+        .collect();
+
+    let attempt = records
+        .iter()
+        .find_map(|record| match &record.event {
+            Some(crate::log::schema::Event::TierAttempt(attempt)) => Some((record, attempt)),
+            _ => None,
+        })
+        .expect("the failed dial emitted a tier_attempt");
+
+    assert_eq!(
+        attempt.0.conn_id, CONN,
+        "attributed to the dialling session"
+    );
+    assert_eq!(
+        attempt.0.category,
+        crate::log::schema::Category::Routing as i32
+    );
+    assert_eq!(attempt.0.level, crate::log::schema::Level::Debug as i32);
+    assert_eq!(attempt.1.tier, LogTier::Ws as i32);
+    assert_eq!(attempt.1.dc, 2);
+    assert!(!attempt.1.ok);
+    assert_eq!(attempt.1.err, ErrorCode::TcpConnect as i32);
+    assert_eq!(attempt.1.err_code, 0);
+
+    std::fs::remove_dir_all(&dir).expect("the temp dir is ours");
+}

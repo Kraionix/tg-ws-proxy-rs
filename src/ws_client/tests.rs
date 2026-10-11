@@ -395,6 +395,10 @@ fn connect_results_map_to_the_error_classes_the_ladder_reports() {
         (ErrorCode::TcpConnectTimeout, 0)
     );
     assert_eq!(
+        WsConnectResult::ConnectFailed("connection refused".to_string()).error_code(),
+        (ErrorCode::TcpConnect, 0)
+    );
+    assert_eq!(
         WsConnectResult::TimedOut.error_code(),
         (ErrorCode::TlsTimeout, 0)
     );
