@@ -13,12 +13,6 @@
 //! final flush drains what is left, so a clean shutdown loses nothing that was
 //! already queued.
 
-// Nothing in the binary reaches this module until the wiring stage starts the
-// subsystem from `main`; until then the only caller is the test module, whose
-// target has `cfg(test)` set. Delete this with the last `#[allow(dead_code)]`
-// in `log.rs`.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::time::Instant;
@@ -126,6 +120,7 @@ impl<S: BatchSink> Writer<S> {
 
     /// The buffer's capacity, which after the first flush is what it will be
     /// for the life of the process.
+    #[allow(dead_code)] // the reuse it documents is asserted by the tests
     pub(super) fn buffered_capacity(&self) -> usize {
         self.buf.capacity()
     }

@@ -6,6 +6,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use crate::check;
 use crate::config::{Config, UpstreamTier};
 use crate::default_domains;
 use crate::limits::{auto_max_connections, soft_nofile_limit};
+use crate::log::{self, LogHandle};
 use crate::pool::WsPool;
 use crate::proxy;
 use crate::runtime::Runtime;
@@ -31,6 +33,10 @@ pub enum RunError {
     InvalidPin(String),
     /// `{host}:{port}` is not a valid socket address.
     InvalidListenAddress(String),
+    /// `--log-dir` is on a filesystem that cannot carry a segment.
+    InvalidLogFs(String),
+    /// `--log-dir` could not be created, opened, or claimed for writing.
+    InvalidLogDir(String),
     /// The listen socket could not be bound.
     Bind {
         addr: SocketAddr,
@@ -46,6 +52,8 @@ impl std::fmt::Display for RunError {
             Self::InvalidOutbound(e) => write!(f, "invalid outbound proxy config: {e}"),
             Self::InvalidPin(e) => write!(f, "invalid pinned upstream config: {e}"),
             Self::InvalidListenAddress(addr) => write!(f, "invalid listen address: {addr}"),
+            Self::InvalidLogFs(reason) => f.write_str(reason),
+            Self::InvalidLogDir(reason) => write!(f, "invalid --log-dir: {reason}"),
             Self::Bind { addr, source } => write!(f, "cannot bind {addr}: {source}"),
             Self::CheckFailed => write!(f, "connectivity check failed"),
         }
@@ -104,10 +112,55 @@ async fn check_verdict(rx: &mut Option<tokio::sync::oneshot::Receiver<bool>>) ->
 ///
 /// `on_listen` is how an embedder learns the real port (when `--port 0`) and
 /// the `tg://proxy` link without scraping log lines.
+///
+/// The structured sink is started here rather than in the binary's `main`
+/// because this is the function that owns `config`: a handle created outside
+/// would have to be threaded through `run`, every embedder and the Android shim
+/// to be usable inside — or worse, the shim would run without logging at all.
+/// Starting it here also makes "a clean stop loses nothing" a property of the
+/// return path: every way out of [`serve`] comes back through the shutdown,
+/// including the early returns for `--check` and a failed bind.
 pub async fn run_with_listen(
+    config: Config,
+    shutdown: impl Future<Output = ()> + Send,
+    on_listen: impl FnOnce(ListenInfo) + Send,
+) -> Result<(), RunError> {
+    let log = match &config.log_dir {
+        Some(dir) => Some(
+            log::init(dir, config.log_settings(), config.log_options())
+                .map_err(|error| log_start_error(error, dir))?,
+        ),
+        None => None,
+    };
+
+    let result = serve(config, shutdown, on_listen, log.as_ref()).await;
+
+    if let Some(handle) = &log {
+        handle.shutdown().await;
+    }
+
+    result
+}
+
+/// `--log-dir` is the one startup setting whose failure has no fallback: a
+/// directory this process cannot write to is a configuration mistake the
+/// operator has to see, not a reason to run on quietly without logs.
+fn log_start_error(error: log::LogError, dir: &Path) -> RunError {
+    match error {
+        log::LogError::FsUnsupported(reason) => RunError::InvalidLogFs(reason),
+        // The io error alone ("Permission denied") does not say which directory
+        // it was about; the operator named one, so quote it back.
+        log::LogError::Io(error) => RunError::InvalidLogDir(format!("{}: {error}", dir.display())),
+        error => RunError::InvalidLogDir(error.to_string()),
+    }
+}
+
+/// The server itself: everything [`run_with_listen`] does once the sink is up.
+async fn serve(
     mut config: Config,
     shutdown: impl Future<Output = ()> + Send,
     on_listen: impl FnOnce(ListenInfo) + Send,
+    log: Option<&Arc<LogHandle>>,
 ) -> Result<(), RunError> {
     install_crypto_provider();
 
@@ -351,6 +404,20 @@ pub async fn run_with_listen(
         "  Max connections: {} (fd-limit: {})",
         max_connections, fd_limit
     );
+    if let Some(dir) = &config.log_dir {
+        let options = config.log_options();
+        let retention = match options.retention_days {
+            0 => "keep all".to_string(),
+            days => format!("{days} days"),
+        };
+        info!(
+            "  Log sink:      {} ({}, compression {}, durability {})",
+            dir.display(),
+            retention,
+            config.log_compress,
+            config.log_durability
+        );
+    }
     info!("{}", "=".repeat(60));
     info!("  Telegram proxy link (use this on all devices):");
     info!("    {}", tg_link);
@@ -435,6 +502,9 @@ pub async fn run_with_listen(
     const EMFILE: i32 = 24; // too many open files (per-process fd limit)
     const ENFILE: i32 = 23; // file table overflow (system-wide fd limit)
     let semaphore = Arc::new(Semaphore::new(max_connections));
+    // One clone for the loop: each accepted connection needs its own handle to
+    // plant in its task, and the option itself is borrowed from the caller.
+    let log = log.cloned();
     loop {
         // Block here when we are already at the connection limit.  Pending
         // TCP connections queue in the kernel backlog until capacity frees up.
@@ -461,14 +531,24 @@ pub async fn run_with_listen(
                         let cfg = Arc::clone(&config);
                         let pool = pool.clone();
                         let runtime = Arc::clone(&runtime);
+                        let log = log.clone();
                         tokio::spawn(async move {
                             // Hold the permit for the lifetime of this connection so
                             // it is released (and the slot freed) when the task ends.
                             let _permit = permit;
-                            proxy::handle_client_with_runtime(
-                                stream, peer_addr, cfg, pool, runtime,
-                            )
-                            .await;
+                            let client =
+                                proxy::handle_client_with_runtime(stream, peer_addr, cfg, pool, runtime);
+                            // The session's events are attributed by the task-local
+                            // rather than by a parameter, which is what keeps `conn_id`
+                            // off the ~110 call sites below this one.  Scoping the
+                            // whole future — including the tasks it spawns — is the
+                            // only place it has to be set up.
+                            match &log {
+                                Some(handle) => {
+                                    log::scope(handle.next_conn_id(), Arc::clone(handle), client).await
+                                }
+                                None => client.await,
+                            }
                         });
                     }
                     Err(e) => {

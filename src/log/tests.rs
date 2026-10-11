@@ -1547,6 +1547,53 @@ fn records_written_through_the_pipeline_are_readable_back() {
 }
 
 #[test]
+fn an_empty_segment_reads_back_as_an_empty_day() {
+    // redb creates a table on its first write, so a segment that never took a
+    // record has no `STOR:main` at all. Refusing to read it would turn "nothing
+    // happened today" into a corrupt-file error — and `--log-level error` over
+    // a healthy proxy is exactly a day with nothing in it.
+    let dir = TempDir::new("empty");
+    let date = storage::day_name(storage::today());
+    drop(open_sink(dir.path(), Options::default()));
+
+    assert!(
+        storage::iter_batches(dir.path(), &date)
+            .expect("an empty day is readable")
+            .is_empty()
+    );
+    assert!(
+        storage::iter_conn_batches(dir.path(), &date, 1)
+            .expect("an empty day is readable")
+            .is_empty()
+    );
+}
+
+#[test]
+fn init_starts_a_writable_segment_from_the_public_entry_point() {
+    // What the startup path calls, with none of the test's own plumbing in
+    // between: `init` opens the directory, spawns the writer, and the record
+    // comes back out of the file on the other side.
+    let runtime = unpolled_runtime();
+    let dir = TempDir::new("init");
+    let day = storage::today();
+
+    let handle = runtime
+        .block_on(async { init(dir.path(), Settings::default(), Options::default()) })
+        .expect("the sink starts");
+    handle.emit(1, Category::Accept, Level::Info, pool_hit(2));
+    runtime.block_on(handle.shutdown());
+
+    let batches = storage::iter_batches(dir.path(), &storage::day_name(day)).expect("readable");
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.records.len())
+            .sum::<usize>(),
+        1
+    );
+}
+
+#[test]
 fn a_truncated_segment_is_refused_rather_than_half_read() {
     let dir = TempDir::new("truncated");
     let date = storage::day_name(storage::today());

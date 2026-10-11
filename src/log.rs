@@ -33,7 +33,7 @@
 //! process-wide events are emitted inside a scope with `conn_id = 0` instead.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -75,7 +75,6 @@ pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 /// traffic (5 ev/s × 2 s) with two orders of magnitude of headroom for the
 /// reconnect storm that follows a network change; a longer burst is a burst the
 /// log is allowed to lose records from.
-#[allow(dead_code)] // until the wiring stage starts the subsystem
 pub(crate) const CHANNEL_CAPACITY: usize = 1024;
 
 /// Why the log subsystem could not be started.
@@ -259,7 +258,6 @@ impl LogHandle {
 /// this module can fail yet, so there is no `Result` here — a log directory
 /// that cannot be opened is a problem for the storage layer, which is the only
 /// thing that can have one.
-#[allow(dead_code)] // until the wiring stage starts the subsystem from `main`
 fn start<S: writer::BatchSink + 'static>(sink: S, settings: Settings) -> LogHandle {
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (shutdown, shutdown_rx) = watch::channel(false);
@@ -280,6 +278,26 @@ fn start<S: writer::BatchSink + 'static>(sink: S, settings: Settings) -> LogHand
         .expect("log writer join mutex cannot be poisoned by `take`") = Some(task);
 
     handle
+}
+
+/// Starts the subsystem: opens today's segment under `dir` and the writer task
+/// behind it, or reports why it could not.
+///
+/// This is the only fallible step in the module, and it is fallible for exactly
+/// one reason: the sink. A directory that cannot be created, a filesystem that
+/// cannot carry a segment, another process already writing today's file — all
+/// of them are startup errors with an exit code, which is what lets the caller
+/// refuse to run rather than run without logs. Everything after this point
+/// degrades instead: a write that fails later is a backoff and a warning.
+///
+/// Must be called from within a Tokio runtime — the writer is a spawned task.
+pub fn init(
+    dir: &Path,
+    settings: Settings,
+    options: storage::Options,
+) -> Result<Arc<LogHandle>, LogError> {
+    let sink = storage::FileSink::open(dir, options)?;
+    Ok(Arc::new(start(sink, settings)))
 }
 
 tokio::task_local! {

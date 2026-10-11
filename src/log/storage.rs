@@ -35,11 +35,6 @@
 //! of on every flush", and a clean close always syncs. The loss window under
 //! sudden power loss is therefore the sync interval, not a flush.
 
-// Nothing starts the subsystem until the wiring stage; until then the only
-// caller is the test module. Delete this with the last `#[allow(dead_code)]`
-// in `log.rs`.
-#![allow(dead_code)]
-
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -446,16 +441,30 @@ impl Drop for Segment {
     }
 }
 
+// ── Reading back ───────────────────────────────────────────────────────────
+//
+// Nothing in the binary reads a segment: `--log-dir` only writes, and the
+// reader that would consume these is a later iteration (S1). Their callers are
+// the tests that check a segment decodes record-for-record, so the allow is per
+// item — anything else that goes unused in here is still a warning.
+
 /// Reads a whole day back, in time order.
 ///
 /// Loads the day into memory, which is the right shape for a post-mortem of one
 /// segment and the wrong one for a reader that scans a month — the reading
 /// iteration is where that gets fixed.
+#[allow(dead_code)]
 pub(crate) fn iter_batches(dir: &Path, date: &str) -> Result<Vec<LogBatch>, LogError> {
     let (db, transaction) = open_for_read(dir, date)?;
-    let table = transaction
-        .open_table(MAIN)
-        .map_err(|error| LogError::Segment(error.to_string()))?;
+    let table = match transaction.open_table(MAIN) {
+        Ok(table) => table,
+        // redb creates a table on its first write, so a segment that recorded
+        // nothing has no `STOR:main` at all — a run whose every event was
+        // filtered out, which is what `--log-level error` over a healthy proxy
+        // leaves behind. An empty day, not a corrupt file.
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(error) => return Err(LogError::Segment(error.to_string())),
+    };
 
     let mut batches = Vec::new();
     for entry in table
@@ -470,15 +479,20 @@ pub(crate) fn iter_batches(dir: &Path, date: &str) -> Result<Vec<LogBatch>, LogE
 }
 
 /// Reads back the batches that mention one connection, via `STOR:by_conn`.
+#[allow(dead_code)]
 pub(crate) fn iter_conn_batches(
     dir: &Path,
     date: &str,
     conn_id: u64,
 ) -> Result<Vec<LogBatch>, LogError> {
     let (db, transaction) = open_for_read(dir, date)?;
-    let index = transaction
-        .open_table(BY_CONN)
-        .map_err(|error| LogError::Segment(error.to_string()))?;
+    let index = match transaction.open_table(BY_CONN) {
+        Ok(index) => index,
+        // No index means no batch was ever indexed, which means no records
+        // (see `iter_batches` for why the table can be absent at all).
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(error) => return Err(LogError::Segment(error.to_string())),
+    };
 
     let mut keys = Vec::new();
     for entry in index
@@ -507,6 +521,7 @@ pub(crate) fn iter_conn_batches(
 
 /// One `STOR:meta` slot. The reader stage compares `schema_hash` against its
 /// own before trusting anything else in the file.
+#[allow(dead_code)]
 pub(super) fn meta(dir: &Path, date: &str, key: &str) -> Result<Option<Vec<u8>>, LogError> {
     let (db, transaction) = open_for_read(dir, date)?;
     let table = transaction
@@ -520,6 +535,7 @@ pub(super) fn meta(dir: &Path, date: &str, key: &str) -> Result<Option<Vec<u8>>,
     Ok(value)
 }
 
+#[allow(dead_code)]
 fn open_for_read(dir: &Path, date: &str) -> Result<(Database, redb::ReadTransaction), LogError> {
     let path = dir.join(format!("{date}{SEGMENT_SUFFIX}"));
     let db = Database::builder()
@@ -549,6 +565,7 @@ pub(super) fn encode(batch: &LogBatch, compress: Compression) -> Result<Vec<u8>,
     Ok(encoded)
 }
 
+#[allow(dead_code)]
 pub(super) fn decode(value: &[u8]) -> Result<LogBatch, LogError> {
     use prost::Message as _;
 

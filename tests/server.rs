@@ -164,3 +164,98 @@ async fn check_listener_mode_stops_with_the_check_verdict() {
 
     assert!(matches!(result, Err(server::RunError::CheckFailed)));
 }
+
+/// The wiring stage's end-to-end: `--log-dir` starts the sink, the segment
+/// exists before the first record is written, and a clean stop leaves it there.
+#[tokio::test]
+async fn a_log_dir_gets_todays_segment() {
+    let dir = std::env::temp_dir().join(format!("tgws-server-log-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let config = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--quiet",
+        "--pool-size",
+        "0",
+        "--log-dir",
+        dir.to_str().expect("a utf-8 temp path"),
+    ])
+    .unwrap()
+    .with_defaults();
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (listen_tx, listen_rx) = tokio::sync::oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        server::run_with_listen(
+            config,
+            async {
+                let _ = shutdown_rx.await;
+            },
+            move |info| {
+                let _ = listen_tx.send(info);
+            },
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), listen_rx)
+        .await
+        .expect("server did not bind in time")
+        .expect("listen callback dropped");
+
+    shutdown_tx.send(()).unwrap();
+    server
+        .await
+        .expect("server task panicked")
+        .expect("server returned an error");
+
+    let mut segments: Vec<String> = std::fs::read_dir(&dir)
+        .expect("the directory was created")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    segments.sort();
+    assert_eq!(segments.len(), 1, "one segment per day: {segments:?}");
+    assert!(segments[0].ends_with(".redb"), "{segments:?}");
+
+    std::fs::remove_dir_all(&dir).expect("the temp dir is ours");
+}
+
+/// A `--log-dir` this process cannot write to is a startup error rather than a
+/// silent run without logs, and the message has to name the path it tried.
+#[tokio::test]
+async fn an_unusable_log_dir_refuses_startup() {
+    let blocker = std::env::temp_dir().join(format!("tgws-log-blocker-{}", std::process::id()));
+    std::fs::write(&blocker, b"not a directory").expect("a writable temp dir");
+    let dir = blocker.join("segments");
+
+    let config = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "0",
+        "--quiet",
+        "--log-dir",
+        dir.to_str().expect("a utf-8 temp path"),
+    ])
+    .unwrap()
+    .with_defaults();
+
+    let err = server::run(config, std::future::pending())
+        .await
+        .expect_err("a directory under a file cannot be created");
+
+    assert!(
+        matches!(err, server::RunError::InvalidLogDir(_)),
+        "expected InvalidLogDir, got {err:?}"
+    );
+    assert!(err.to_string().contains("segments"), "{err}");
+
+    std::fs::remove_file(&blocker).expect("the temp file is ours");
+}

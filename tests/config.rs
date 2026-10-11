@@ -1,5 +1,10 @@
+use std::path::Path;
+use std::time::Duration;
+
 use clap::Parser;
 use tg_ws_proxy_rs::config::{Config, UpstreamTier};
+use tg_ws_proxy_rs::log::schema::{Category, Level};
+use tg_ws_proxy_rs::log::storage::{Compression, DurabilityMode};
 
 #[test]
 fn ee_secret_supplies_inbound_faketls_domain_and_key() {
@@ -778,4 +783,139 @@ fn split_cli_args_keeps_empty_quoted_single_tokens() {
 fn split_cli_args_rejects_trailing_backslash() {
     let err = tg_ws_proxy_rs::config::split_cli_args(r"--secret abc\").unwrap_err();
     assert!(err.contains("trailing backslash"), "{err}");
+}
+
+// ── Structured log sink ─────────────────────────────────────────────────────
+
+/// A config with the sink switched on: every other flag under test is inert
+/// without `--log-dir`.
+fn log_config(extra: &[&str]) -> Config {
+    let mut args = vec!["tg-ws-proxy", "--log-dir", "/var/log/tg-ws-proxy"];
+    args.extend_from_slice(extra);
+    Config::try_parse_from(args).unwrap().with_defaults()
+}
+
+#[test]
+fn the_sink_is_disabled_until_it_is_given_a_directory() {
+    let cfg = Config::try_parse_from(["tg-ws-proxy"])
+        .unwrap()
+        .with_defaults();
+    assert_eq!(cfg.log_dir, None);
+}
+
+#[test]
+fn structured_log_defaults_are_the_documented_ones() {
+    let cfg = log_config(&[]);
+    let settings = cfg.log_settings();
+    let options = cfg.log_options();
+
+    assert_eq!(
+        cfg.log_dir.as_deref(),
+        Some(Path::new("/var/log/tg-ws-proxy"))
+    );
+    assert!(settings.levels.iter().all(|level| *level == Level::Info));
+    assert_eq!(settings.batch_max, 256);
+    assert_eq!(settings.flush_interval, Duration::from_secs(2));
+    assert!(!settings.flush_on_warn);
+    assert_eq!(options.compress, Compression::None);
+    assert_eq!(options.durability, DurabilityMode::Eventual);
+    assert_eq!(options.retention_days, 7);
+}
+
+#[test]
+fn the_global_log_level_is_the_floor_every_category_starts_from() {
+    let cfg = log_config(&["--log-level", "warn"]);
+    assert!(
+        cfg.log_settings()
+            .levels
+            .iter()
+            .all(|level| *level == Level::Warn)
+    );
+}
+
+#[test]
+fn a_log_category_override_wins_over_the_global_level() {
+    let cfg = log_config(&[
+        "--log-level",
+        "warn",
+        "--log-category",
+        "routing,debug",
+        "--log-category",
+        "pool,error",
+    ]);
+
+    let levels = cfg.log_settings().levels;
+    assert_eq!(levels[Category::Routing as usize], Level::Debug);
+    assert_eq!(levels[Category::Pool as usize], Level::Error);
+    assert_eq!(levels[Category::Session as usize], Level::Warn);
+}
+
+#[test]
+fn log_categories_can_be_joined_for_a_single_valued_env_var() {
+    // `TG_LOG_CATEGORY` can only carry one value, so pairs are joined with `+`;
+    // the same syntax works on the command line.
+    let cfg = log_config(&["--log-category", "routing,debug+tls,error"]);
+    let levels = cfg.log_settings().levels;
+    assert_eq!(levels[Category::Routing as usize], Level::Debug);
+    assert_eq!(levels[Category::Tls as usize], Level::Error);
+}
+
+#[test]
+fn an_unknown_log_category_or_level_is_refused() {
+    for value in [
+        "nonsense,debug",
+        "unspecified,debug",
+        "routing,verbose",
+        "routing",
+    ] {
+        let err = Config::try_parse_from(["tg-ws-proxy", "--log-category", value])
+            .expect_err(&format!("{value:?} should not parse"))
+            .to_string();
+        assert!(err.contains("log-category"), "{value}: {err}");
+    }
+}
+
+#[test]
+fn the_log_batch_and_flush_bounds_are_enforced_at_parse_time() {
+    // The writer clamps as well, but an explicit out-of-range value is a
+    // mistake worth a message that names the bounds rather than a silent 16.
+    for value in ["15", "4097", "many"] {
+        assert!(
+            Config::try_parse_from(["tg-ws-proxy", "--log-batch-max", value]).is_err(),
+            "--log-batch-max {value} should be refused"
+        );
+    }
+    for value in ["0", "86401", "soon"] {
+        assert!(
+            Config::try_parse_from(["tg-ws-proxy", "--log-flush-interval", value]).is_err(),
+            "--log-flush-interval {value} should be refused"
+        );
+    }
+}
+
+#[test]
+fn the_bounds_themselves_are_accepted() {
+    let cfg = log_config(&["--log-batch-max", "16", "--log-flush-interval", "86400"]);
+    let settings = cfg.log_settings();
+    assert_eq!(settings.batch_max, 16);
+    assert_eq!(settings.flush_interval, Duration::from_secs(86400));
+}
+
+#[test]
+fn compression_durability_and_retention_reach_the_storage_options() {
+    let cfg = log_config(&[
+        "--log-compress",
+        "zstd-l1",
+        "--log-durability",
+        "immediate",
+        "--log-retention",
+        "0",
+        "--log-flush-on-warn",
+    ]);
+
+    let options = cfg.log_options();
+    assert_eq!(options.compress, Compression::ZstdL1);
+    assert_eq!(options.durability, DurabilityMode::Immediate);
+    assert_eq!(options.retention_days, 0, "0 keeps every segment");
+    assert!(cfg.log_settings().flush_on_warn);
 }
