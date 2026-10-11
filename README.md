@@ -267,6 +267,8 @@ tg-ws-proxy [OPTIONS]
 | `--check` | off | Test every configured CF domain and MTProto proxy, print OK/FAIL with latency, then exit `0` if all pass and `1` otherwise |
 | `--check-listener` | off | Implies `--check`: binds and serves, probes its own listener end-to-end (obfuscation handshake, a real `req_pq_multi`, the DC's `resPQ` back), then exits with the check's code |
 | `--log-file <PATH>` | — | Write logs to a file instead of stderr (no ANSI color codes) |
+| `--log-dir <PATH>` | off | Write structured event segments (one file per UTC day) to this directory; without it the structured sink is off and nothing else changes (see [docs/Logging.md](docs/Logging.md)) |
+| `--log-level <LEVEL>` | `info` | Floor for the structured sink, adjustable per category with `--log-category`; the ladder's per-rung decisions (`session_opened`, `tier_attempt`, `pool_*`) are `debug` |
 | `-q / --quiet` | off | Suppress all log output |
 | `-v / --verbose` | off | Debug logging |
 | `--danger-accept-invalid-certs` | off | Skip TLS verification |
@@ -360,6 +362,7 @@ cooldown are all documented in [docs/Fallbacks.md](docs/Fallbacks.md).
 | Guide | Covers |
 |---|---|
 | [docs/Fallbacks.md](docs/Fallbacks.md) | Routing tiers: Cloudflare proxy/Worker, default domains, domain fronting, upstream MTProto proxies, inbound FakeTLS, outbound proxy |
+| [docs/Logging.md](docs/Logging.md) | Structured event log: what it records, which filesystem to put it on, what it costs, and how to read a segment back |
 | [docs/Building.md](docs/Building.md) | Building, cross-compiling for OpenWrt, and shrinking the binary with UPX |
 | [docs/Deployment.md](docs/Deployment.md) | Docker, router deployment, OpenWrt init script, environment variables |
 | [docs/OpenWrtPackage.md](docs/OpenWrtPackage.md) | Standalone APK/IPK builds, UCI/procd configuration, installer, upgrades and rollback |

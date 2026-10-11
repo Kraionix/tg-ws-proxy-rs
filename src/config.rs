@@ -336,7 +336,7 @@ fn parse_log_flush_interval(value: &str) -> Result<u64, String> {
         .map_err(|_| format!("expected a number of seconds, got {value:?}"))?;
 
     // A day is the ceiling because the batch size is the other flush trigger:
-    // past it the interval stops being a bound on the loss window, and an
+    // past it the interval stops being a bound on the in-memory window, and an
     // unbounded one can overflow the deadline it is added to.
     match seconds {
         0 => Err("must be at least 1 second".to_string()),
@@ -507,7 +507,10 @@ pub struct Config {
     pub log_batch_max: usize,
 
     /// How long a record may sit unwritten before the writer flushes it, in
-    /// seconds. This bounds the loss window under `eventual` durability.
+    /// seconds: this is the window a process that dies takes with it.
+    ///
+    /// It is not the power-cut window — that is `--log-durability`, whose
+    /// `eventual` mode syncs every 30 seconds whatever this is set to.
     #[arg(
         long = "log-flush-interval",
         value_name = "SEC",
@@ -542,8 +545,11 @@ pub struct Config {
 
     /// How much of a segment survives a power cut.
     ///
-    /// `eventual` syncs on a timer; `immediate` syncs before every flush
-    /// returns. A clean stop is complete either way.
+    /// `eventual` syncs every 30 seconds — up to that much can be missing after
+    /// a power cut, and it is the default because a cheap stick pays for every
+    /// fsync. `immediate` syncs before every flush returns, so nothing written
+    /// is lost; that is one fsync per `--log-flush-interval`. A clean stop is
+    /// complete either way.
     #[arg(
         long = "log-durability",
         value_name = "MODE",
