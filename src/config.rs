@@ -147,6 +147,20 @@ pub enum UpstreamTier {
     Tcp,
 }
 
+impl From<UpstreamTier> for log::schema::Tier {
+    fn from(tier: UpstreamTier) -> Self {
+        // One rung, two vocabularies: the CLI names them for pins, the wire
+        // names them for a reader. Kept here so the mapping has one home.
+        match tier {
+            UpstreamTier::Ws => Self::Ws,
+            UpstreamTier::Cfworker => Self::Cfworker,
+            UpstreamTier::Cfproxy => Self::Cfproxy,
+            UpstreamTier::Mtproto => Self::Mtproto,
+            UpstreamTier::Tcp => Self::Tcp,
+        }
+    }
+}
+
 impl fmt::Display for UpstreamTier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(

@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::UpstreamTier;
 
 use clap::Parser;
 
@@ -267,6 +268,7 @@ async fn upstream_frame_sizes(framing: WsFraming, payload: &[u8]) -> Vec<usize> 
                 label: "127.0.0.1:1".parse().unwrap(),
                 ws,
                 framing,
+                tier: UpstreamTier::Ws,
                 relay_init,
                 ciphers,
                 proto: ProtoTag::PaddedIntermediate,

@@ -38,6 +38,9 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use tungstenite::Message;
 
+use crate::log::schema::{Category, ClosedBy as LogClosedBy, Level, Peer, Tier as LogTier};
+use crate::log_event;
+
 use crate::config::{Config, MtProtoProxy, UpstreamTier};
 use crate::crypto::{
     AesCtr256, ConnectionCiphers, ProtoTag, build_connection_ciphers, generate_client_handshake,
@@ -412,6 +415,18 @@ pub async fn handle_client_with_runtime(
         proto
     );
 
+    // The session's first record, and the only one that says where the client
+    // came from: everything after it is about the route, not the caller.
+    log_event!(
+        Category::Session,
+        Level::Debug,
+        Event::SessionOpened {
+            dc: dc_id,
+            is_media,
+            peer: Some(peer_of(label)),
+        }
+    );
+
     // ── Step 3: generate the relay init packet for the Telegram backend ──
     let relay_init = generate_relay_init(proto, dc_idx);
 
@@ -483,11 +498,32 @@ enum Upstream {
     /// A WebSocket to Telegram — direct, via the Cloudflare proxy, or through
     /// a Cloudflare Worker tunnel.  See [`WsFraming`] for why the two are not
     /// interchangeable once bridged.
-    Ws { ws: TgWsStream, framing: WsFraming },
+    ///
+    /// `tier` is the rung this stream came from.  All three are one variant
+    /// because they bridge identically, so without it the session record could
+    /// only say "ws" about a connection that went through Cloudflare — which is
+    /// the one thing a post-mortem wants to know.  The other two variants are
+    /// their own tier and need no field.
+    Ws {
+        ws: TgWsStream,
+        framing: WsFraming,
+        tier: UpstreamTier,
+    },
     /// An upstream MTProto proxy, plain or FakeTLS-wrapped.
     Mtproto(UpstreamConnection),
     /// Last resort: a direct TCP connection to this Telegram DC IP.
     Tcp(String),
+}
+
+impl Upstream {
+    /// The ladder rung this connection was routed to, for the session record.
+    fn tier(&self) -> UpstreamTier {
+        match self {
+            Self::Ws { tier, .. } => *tier,
+            Self::Mtproto(_) => UpstreamTier::Mtproto,
+            Self::Tcp(_) => UpstreamTier::Tcp,
+        }
+    }
 }
 
 struct BridgeDispatch {
@@ -524,14 +560,20 @@ fn bridge_selected(
         runtime,
     } = params;
 
+    // Read before the match moves the stream out: the WS variant is the only
+    // one whose rung is not implied by its own name.
+    let tier = upstream.tier();
+
     match upstream {
-        Upstream::Ws { ws, framing } => Box::pin(bridge_ws(
+        // The tier is read above, before the match moves the stream.
+        Upstream::Ws { ws, framing, .. } => Box::pin(bridge_ws(
             reader,
             writer,
             WsBridgeParams {
                 label,
                 ws,
                 framing,
+                tier,
                 relay_init,
                 ciphers,
                 proto,
@@ -728,12 +770,14 @@ impl Route<'_> {
             return Some(Upstream::Ws {
                 ws,
                 framing: WsFraming::Packets,
+                tier: UpstreamTier::Ws,
             });
         }
 
         self.direct_ws(target_ip).await.map(|ws| Upstream::Ws {
             ws,
             framing: WsFraming::Packets,
+            tier: UpstreamTier::Ws,
         })
     }
 
@@ -787,6 +831,7 @@ impl Route<'_> {
                         return Some(Upstream::Ws {
                             ws,
                             framing: WsFraming::Tunnel,
+                            tier: UpstreamTier::Cfworker,
                         });
                     }
                 }
@@ -795,6 +840,7 @@ impl Route<'_> {
                         return Some(Upstream::Ws {
                             ws,
                             framing: WsFraming::Packets,
+                            tier: UpstreamTier::Cfproxy,
                         });
                     }
                 }
@@ -871,12 +917,14 @@ impl Route<'_> {
             return Some(Upstream::Ws {
                 ws,
                 framing: WsFraming::Tunnel,
+                tier: UpstreamTier::Cfworker,
             });
         }
 
         self.cf_proxy(reason).await.map(|ws| Upstream::Ws {
             ws,
             framing: WsFraming::Packets,
+            tier: UpstreamTier::Cfproxy,
         })
     }
 
@@ -1318,6 +1366,8 @@ struct WsBridgeParams {
     label: SocketAddr,
     ws: TgWsStream,
     framing: WsFraming,
+    /// Which rung this stream came from, for the session record.
+    tier: UpstreamTier,
     relay_init: [u8; 64],
     ciphers: ConnectionCiphers,
     proto: ProtoTag,
@@ -1329,6 +1379,7 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
     let WsBridgeParams {
         label,
         ws,
+        tier,
         framing,
         relay_init,
         ciphers,
@@ -1450,7 +1501,7 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
     let bytes_up = *bytes_up.lock().unwrap();
 
     log_session_closed(
-        label, dc, is_media, "WS", closed_by, bytes_up, bytes_down, start,
+        label, dc, is_media, "WS", tier, closed_by, bytes_up, bytes_down, start,
     );
 }
 
@@ -1682,7 +1733,15 @@ async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayP
         "upstream"
     };
     log_session_closed(
-        label, dc, is_media, kind, closed_by, bytes_up, bytes_down, start,
+        label,
+        dc,
+        is_media,
+        kind,
+        UpstreamTier::Mtproto,
+        closed_by,
+        bytes_up,
+        bytes_down,
+        start,
     );
 }
 
@@ -1796,7 +1855,15 @@ async fn bridge_tcp(
     let bytes_up = *bytes_up.lock().unwrap();
 
     log_session_closed(
-        label, dc, is_media, "TCP", closed_by, bytes_up, bytes_down, start,
+        label,
+        dc,
+        is_media,
+        "TCP",
+        UpstreamTier::Tcp,
+        closed_by,
+        bytes_up,
+        bytes_down,
+        start,
     );
 }
 
@@ -1849,6 +1916,14 @@ impl ClosedBy {
             Self::Upstream => "upstream",
         }
     }
+
+    /// The same two cases in the schema's vocabulary.
+    fn to_schema(self) -> LogClosedBy {
+        match self {
+            Self::Client => LogClosedBy::Client,
+            Self::Upstream => LogClosedBy::Upstream,
+        }
+    }
 }
 
 struct UploadCounter {
@@ -1878,6 +1953,7 @@ fn log_session_closed(
     dc: u32,
     is_media: bool,
     kind: &str,
+    tier: UpstreamTier,
     closed_by: ClosedBy,
     bytes_up: u64,
     bytes_down: u64,
@@ -1894,6 +1970,44 @@ fn log_session_closed(
         human_bytes(bytes_down),
         start.elapsed().as_secs_f32()
     );
+
+    // The structured half of the same fact. Which rung carried the session and
+    // which side ended it are the two questions a segment exists to answer, and
+    // neither survives in the console line once the terminal is gone.
+    let dur_ms = start.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    log_event!(
+        Category::Session,
+        Level::Info,
+        Event::SessionClosed {
+            dc,
+            is_media,
+            tier: LogTier::from(tier) as i32,
+            closed_by: closed_by.to_schema() as i32,
+            bytes_up,
+            bytes_down,
+            dur_ms,
+        }
+    );
+}
+
+/// The client address in the encoding the schema defines: the raw bytes, with
+/// both redaction flags false.
+///
+/// `--log-redact` defaults to `none` in the design, so this is the documented
+/// default rather than an oversight — and it is why the segment file is created
+/// `0600` instead of trusting the directory's permissions.
+fn peer_of(addr: SocketAddr) -> Peer {
+    let (bytes, port) = match addr {
+        SocketAddr::V4(v4) => (v4.ip().octets().to_vec(), u32::from(v4.port())),
+        SocketAddr::V6(v6) => (v6.ip().octets().to_vec(), u32::from(v6.port())),
+    };
+
+    Peer {
+        addr: bytes,
+        port,
+        hashed: false,
+        encrypted: false,
+    }
 }
 
 async fn read_inbound_handshake(
