@@ -119,8 +119,8 @@ Binary size, measured on the 2.6.0 release profile:
 
 | Target | default | `--features log-zstd` |
 |---|---|---|
-| `x86_64-unknown-linux-musl` | 5 646 536 B | 6 196 072 B |
-| `aarch64-unknown-linux-musl` | 4 858 464 B | 5 317 216 B |
+| `x86_64-unknown-linux-musl` | 5 646 664 B | 6 200 360 B |
+| `aarch64-unknown-linux-musl` | 4 792 928 B | 5 317 216 B |
 
 Against the 4 481 040 B of 2.5.4 that is **+26 %** for the structured sink, and the zstd codec adds
 another ~550 KiB. The release workflow builds `log-zstd` in for the musl targets (aarch64, x86_64),
@@ -134,10 +134,19 @@ writes the descriptor snapshot once a minute. 1 000 connections/day is ≈ 0.3 M
 (1.2 MB at `debug`), idle is ≈ 1 MB/week, and `zstd-l1` roughly halves both. A 4 GB stick therefore
 holds years of `info`-level traffic; `--log-retention 7` is what actually bounds it.
 
-On the reference router (OpenWrt, aarch64, 4 GB USB stick on f2fs, `--log-level debug`,
-`--log-compress zstd-l1`): **35 records from 15 client connections in 50 s** of ordinary Telegram
-use, ≈ 2.3 records per connection including pool refills, and 70 KB on disk for that stretch — the
-day file grows in steps, because a flush is one commit and the file is pre-sized.
+**Those are the record bytes, not what the medium sees.** A flush window that carries at least one
+record ends in one `redb` commit, and a commit dirties pages: on the reference router (OpenWrt,
+aarch64, USB stick on f2fs, `debug`, `zstd-l1`) a seven-minute window with **51 commits, 328 records
+and 98 client sessions** cost the device **916 KiB** — about **18 KB per commit** — while the record
+payload in the same stretch was ~25 B/s. An idle proxy commits nothing at all (`flush` returns early
+on an empty buffer), so the cost follows the number of *active* windows rather than the number of
+records, and the lever is `--log-flush-interval`: a longer interval means fewer, fuller commits and a
+larger crash window, which is the same trade as durability. At that traffic level the extrapolated
+cost is ≈ 180 MB/day of flash traffic — a 4 GB stick's worth of writes every few weeks, well inside
+what the medium is rated for, but two hundred times what the text log writes.
+
+On that same router the day file held **1 268 records for 166 sessions** in its first nine minutes,
+i.e. **4.1 records per session** — the number the level estimate predicted.
 
 ## Durability and power cuts
 
