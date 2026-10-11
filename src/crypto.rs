@@ -19,6 +19,9 @@ use ctr::Ctr128BE;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
+use crate::log::schema::{Category, Level};
+use crate::log_event;
+
 // ─── AES-256-CTR alias ───────────────────────────────────────────────────────
 pub type AesCtr256 = Ctr128BE<Aes256>;
 
@@ -170,6 +173,29 @@ const RESERVED_STARTS: &[[u8; 4]] = &[
 ];
 const RESERVED_CONTINUE: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
 
+/// `EVT:relay_init_retries` — how many draws the reserved-prefix rules threw
+/// away before one was usable.
+///
+/// Only emitted when the count is not zero. A draw that passes on the first
+/// try is the ordinary case — roughly a 255-in-256 chance per rule — and a
+/// record per handshake saying "no retries" would be the most common line in
+/// the file while saying nothing.
+///
+/// A high count is not a network symptom: it means the RNG keeps producing a
+/// prefix the obfuscation format cannot carry, which is worth knowing before
+/// blaming the connection.
+fn log_relay_init_retries(n: u32) {
+    if n == 0 {
+        return;
+    }
+
+    log_event!(
+        Category::Crypto,
+        Level::Debug,
+        Event::RelayInitRetries { n }
+    );
+}
+
 /// Generate a 64-byte obfuscation init packet for the Telegram backend.
 ///
 /// The relay uses raw (non-secret-hashed) AES-256-CTR keys embedded in the
@@ -180,6 +206,7 @@ const RESERVED_CONTINUE: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
 pub fn generate_relay_init(proto: ProtoTag, dc_idx: i16) -> [u8; HANDSHAKE_LEN] {
     let proto_tag = proto.as_bytes();
     let dc_bytes = dc_idx.to_le_bytes();
+    let mut retries = 0u32;
 
     loop {
         // Generate 64 random bytes.
@@ -189,14 +216,17 @@ pub fn generate_relay_init(proto: ProtoTag, dc_idx: i16) -> [u8; HANDSHAKE_LEN] 
         // Reject reserved prefixes that Telegram or intermediate proxies
         // would misinterpret as an HTTP/TLS connection.
         if RESERVED_FIRST_BYTES.contains(&rnd[0]) {
+            retries += 1;
             continue;
         }
 
         if RESERVED_STARTS.iter().any(|s| &rnd[..4] == s) {
+            retries += 1;
             continue;
         }
 
         if rnd[4..8] == RESERVED_CONTINUE {
+            retries += 1;
             continue;
         }
 
@@ -223,6 +253,8 @@ pub fn generate_relay_init(proto: ProtoTag, dc_idx: i16) -> [u8; HANDSHAKE_LEN] 
             let ks = encrypted[PROTO_TAG_POS + i] ^ rnd[PROTO_TAG_POS + i];
             result[PROTO_TAG_POS + i] = tail_plain[i] ^ ks;
         }
+
+        log_relay_init_retries(retries);
 
         return result;
     }
@@ -265,6 +297,7 @@ pub fn generate_client_handshake(
 ) -> ([u8; HANDSHAKE_LEN], AesCtr256, AesCtr256) {
     let proto_bytes = proto.as_bytes();
     let dc_bytes = dc_idx.to_le_bytes();
+    let mut retries = 0u32;
 
     loop {
         let mut raw = [0u8; HANDSHAKE_LEN];
@@ -272,12 +305,15 @@ pub fn generate_client_handshake(
 
         // Reject reserved prefixes (same rules as generate_relay_init).
         if RESERVED_FIRST_BYTES.contains(&raw[0]) {
+            retries += 1;
             continue;
         }
         if RESERVED_STARTS.iter().any(|s| &raw[..4] == s) {
+            retries += 1;
             continue;
         }
         if raw[4..8] == RESERVED_CONTINUE {
+            retries += 1;
             continue;
         }
 
@@ -335,6 +371,8 @@ pub fn generate_client_handshake(
         };
         let dec_iv = &reversed[PREKEY_LEN..];
         let dec = make_cipher(&dec_key, dec_iv);
+
+        log_relay_init_retries(retries);
 
         return (handshake, enc, dec);
     }

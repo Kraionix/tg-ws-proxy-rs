@@ -39,7 +39,8 @@ use tracing::{debug, info, warn};
 use tungstenite::Message;
 
 use crate::log::schema::{
-    Category, ClosedBy as LogClosedBy, ErrorCode, Level, Peer, Reason as LogReason, Tier as LogTier,
+    Category, ClosedBy as LogClosedBy, CooldownKind, ErrorCode, Level, Peer, Reason as LogReason,
+    Tier as LogTier,
 };
 use crate::log_event;
 
@@ -725,6 +726,7 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
             target_ip
         );
         route.log_fallback(UpstreamTier::Ws, reason);
+        log_cooldown_skipped(CooldownKind::IpFail, target_ip);
 
         // Stepped over, not written off: if every fallback is also gone the
         // address gets its chance back rather than leaving the client on the
@@ -895,6 +897,11 @@ impl Route<'_> {
             self.label, self.dc, self.media
         );
         None
+    }
+
+    /// The DC-keyed cooldown maps' key as the operator would recognise it.
+    fn dc_key(&self) -> String {
+        format!("DC{}{}", self.dc, self.media)
     }
 
     /// `EVT:tier_fallback` for a rung the ladder is leaving: names the next rung
@@ -1107,6 +1114,7 @@ impl Route<'_> {
                     "[{}] DC{}{} CF Worker {} in cooldown, skipping",
                     self.label, self.dc, self.media, worker_domain
                 );
+                log_cooldown_skipped(CooldownKind::CfWorkerFail, worker_domain);
                 continue;
             }
 
@@ -1147,7 +1155,10 @@ impl Route<'_> {
 
             match ws {
                 Some(ws) => {
-                    CF_WORKER_FAIL.clear(worker_domain);
+                    if CF_WORKER_FAIL.active(worker_domain) {
+                        CF_WORKER_FAIL.clear(worker_domain);
+                        log_cooldown_cleared(CooldownKind::CfWorkerFail, worker_domain);
+                    }
                     info!(
                         "[{}] DC{}{} {} → CF Worker connected ({})",
                         self.label,
@@ -1173,6 +1184,12 @@ impl Route<'_> {
                 }
                 None => {
                     CF_WORKER_FAIL.set(worker_domain.to_string(), self.timeouts.cf_fail_cooldown);
+                    log_cooldown_armed(
+                        CooldownKind::CfWorkerFail,
+                        worker_domain,
+                        self.timeouts.cf_fail_cooldown,
+                        failure,
+                    );
                     warn!(
                         "[{}] DC{}{} CF Worker {} failed, cooldown {}s",
                         self.label,
@@ -1296,6 +1313,7 @@ impl Route<'_> {
             let key = upstream_key(&upstream.host, upstream.port);
             if !force && UPSTREAM_FAIL.active(key.as_str()) {
                 debug!("[{}] upstream {} in cooldown, skipping", self.label, key);
+                log_cooldown_skipped(CooldownKind::UpstreamFail, &key);
                 continue;
             }
 
@@ -1319,7 +1337,10 @@ impl Route<'_> {
 
             match conn {
                 Ok(conn) => {
-                    UPSTREAM_FAIL.clear(key.as_str());
+                    if UPSTREAM_FAIL.active(key.as_str()) {
+                        UPSTREAM_FAIL.clear(key.as_str());
+                        log_cooldown_cleared(CooldownKind::UpstreamFail, &key);
+                    }
                     info!(
                         "[{}] DC{}{} {} → upstream {} MTProto {}",
                         self.label,
@@ -1331,8 +1352,14 @@ impl Route<'_> {
                     );
                     return Some(conn);
                 }
-                Err(_) => {
+                Err(failure) => {
                     UPSTREAM_FAIL.set(key.clone(), self.timeouts.upstream_fail_cooldown);
+                    log_cooldown_armed(
+                        CooldownKind::UpstreamFail,
+                        &key,
+                        self.timeouts.upstream_fail_cooldown,
+                        Some(failure),
+                    );
                     warn!(
                         "[{}] upstream {} failed, cooldown {}s",
                         self.label,
@@ -1373,8 +1400,15 @@ impl Route<'_> {
         );
 
         if let Some(ws) = attempt.ws {
-            WS_FAIL.clear(&(self.dc, self.is_media));
-            IP_FAIL.clear(target_ip);
+            let dc_key = (self.dc, self.is_media);
+            if WS_FAIL.active(&dc_key) {
+                WS_FAIL.clear(&dc_key);
+                log_cooldown_cleared(CooldownKind::WsFail, &self.dc_key());
+            }
+            if IP_FAIL.active(target_ip) {
+                IP_FAIL.clear(target_ip);
+                log_cooldown_cleared(CooldownKind::IpFail, target_ip);
+            }
             match fronting {
                 Some(domain) => info!(
                     "[{}] DC{}{} → WS connected via {} (fronted SNI {})",
@@ -1389,14 +1423,14 @@ impl Route<'_> {
             return Some(ws);
         }
 
-        self.cool_down_ws(attempt.all_redirects);
+        self.cool_down_ws(attempt.all_redirects, attempt.failure);
 
         // Only a TCP connect that ran out the clock says the address itself is
         // unreachable.  A redirect, a refusal, or a handshake that stalled all
         // came from a host that is very much there, and taking it out of the
         // rotation for an hour on that basis would be wrong.
         if attempt.connect_timed_out && !probing {
-            self.cool_down_ip(target_ip);
+            self.cool_down_ip(target_ip, attempt.failure);
         }
 
         None
@@ -1428,13 +1462,14 @@ impl Route<'_> {
     /// A cooldown rather than a permanent blacklist, so the proxy recovers
     /// automatically if WS becomes available again (e.g. after a network
     /// change or a Telegram-side redirect policy change).
-    fn cool_down_ws(&self, all_redirects: bool) {
+    fn cool_down_ws(&self, all_redirects: bool, failure: Option<RungFailure>) {
         let cooldown = if all_redirects {
             self.timeouts.ws_redirect_cooldown
         } else {
             self.timeouts.ws_fail_cooldown
         };
         WS_FAIL.set((self.dc, self.is_media), cooldown);
+        log_cooldown_armed(CooldownKind::WsFail, &self.dc_key(), cooldown, failure);
 
         if all_redirects {
             warn!(
@@ -1462,8 +1497,14 @@ impl Route<'_> {
     /// into a hole, which is worth doing either way.  [`select_upstream`] is
     /// where the skipping decision — the part that does need a fallback — is
     /// made.
-    fn cool_down_ip(&self, target_ip: &str) {
+    fn cool_down_ip(&self, target_ip: &str, failure: Option<RungFailure>) {
         IP_FAIL.set(target_ip.to_string(), self.timeouts.ip_fail_cooldown);
+        log_cooldown_armed(
+            CooldownKind::IpFail,
+            target_ip,
+            self.timeouts.ip_fail_cooldown,
+            failure,
+        );
         info!(
             "[{}] DC{}{} TCP to {} timed out, cooldown {}s",
             self.label,
@@ -2220,6 +2261,63 @@ fn log_tier_fallback(from: UpstreamTier, to: UpstreamTier, reason: LogReason) {
             from_tier: LogTier::from(from) as i32,
             to_tier: LogTier::from(to) as i32,
             reason: reason as i32,
+        }
+    );
+}
+
+/// `EVT:cooldown_armed` — failure memory being set.
+///
+/// The class of the failure comes along because a cooldown without its offence
+/// records the penalty and not the reason for it: "DC2m is out for 300 s" says
+/// nothing an operator can act on, "300 s because the handshake timed out"
+/// does.
+fn log_cooldown_armed(
+    kind: CooldownKind,
+    key_display: &str,
+    dur: Duration,
+    failure: Option<RungFailure>,
+) {
+    let (err, err_code) = match failure {
+        Some(failure) => (failure.err as i32, failure.err_code),
+        None => (ErrorCode::Unspecified as i32, 0),
+    };
+
+    log_event!(
+        Category::Cooldown,
+        Level::Info,
+        Event::CooldownArmed {
+            kind: kind as i32,
+            key_display: key_display.to_string(),
+            dur_s: dur.as_secs().min(u32::MAX as u64) as u32,
+            err,
+            err_code,
+        }
+    );
+}
+
+/// `EVT:cooldown_cleared` — a success that took an entry out of the map.
+///
+/// Emitted only when there was an entry to take out: a successful connection is
+/// an ordinary event, and one that says it had nothing to clear is noise.
+fn log_cooldown_cleared(kind: CooldownKind, key_display: &str) {
+    log_event!(
+        Category::Cooldown,
+        Level::Debug,
+        Event::CooldownCleared {
+            kind: kind as i32,
+            key_display: key_display.to_string(),
+        }
+    );
+}
+
+/// `EVT:cooldown_skipped` — a rung not dialled because of a cooldown.
+fn log_cooldown_skipped(kind: CooldownKind, key_display: &str) {
+    log_event!(
+        Category::Cooldown,
+        Level::Debug,
+        Event::CooldownSkipped {
+            kind: kind as i32,
+            key_display: key_display.to_string(),
         }
     );
 }

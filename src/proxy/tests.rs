@@ -443,7 +443,10 @@ async fn a_ladder_walk_lands_in_the_segment_as_attempts_and_fallbacks() {
         .expect("the skipped WebSocket rung recorded the step down");
 
     assert_eq!(fallback.0.conn_id, CONN);
-    assert_eq!(fallback.0.category, crate::log::schema::Category::Routing as i32);
+    assert_eq!(
+        fallback.0.category,
+        crate::log::schema::Category::Routing as i32
+    );
     assert_eq!(fallback.0.level, crate::log::schema::Level::Info as i32);
     assert_eq!(fallback.1.from_tier, LogTier::Ws as i32);
     assert_eq!(
