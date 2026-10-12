@@ -42,10 +42,12 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use schema::{Category, Event, Level, LogRecord};
+use view::{TEXT_RING_DEFAULT, TextTarget};
 
 pub mod render;
 pub mod schema;
 pub mod storage;
+pub mod view;
 mod writer;
 
 #[cfg(test)]
@@ -94,6 +96,10 @@ pub enum LogError {
     WriterConflict(PathBuf),
     /// The segment file is not one this build can write.
     Segment(String),
+    /// The text view's destination could not be opened. Fatal for the same
+    /// reason the segment's is: an operator who asked for a log file and did
+    /// not get one has to hear about it at startup, not at the first warning.
+    TextSink(String),
 }
 
 impl std::fmt::Display for LogError {
@@ -108,6 +114,7 @@ impl std::fmt::Display for LogError {
                 path.display()
             ),
             Self::Segment(reason) => f.write_str(reason),
+            Self::TextSink(reason) => f.write_str(reason),
         }
     }
 }
@@ -195,6 +202,15 @@ pub struct Settings {
     pub text: Filter,
     /// Lowest level the RAM ring keeps, for the `SIGUSR1` dump.
     pub ring: Filter,
+    /// Where the rendered lines go.
+    ///
+    /// [`Settings::default`] is the quiet configuration — the text view is
+    /// something an embedder opts into, and the binary's own default lives with
+    /// its command line.
+    pub text_log: TextTarget,
+    /// Records the RAM ring holds, clamped to
+    /// [`view::TEXT_RING_MIN`]..=[`view::TEXT_RING_MAX`].
+    pub ring_capacity: usize,
     /// Records per flush, clamped to [`MIN_BATCH_MAX`]..=[`MAX_BATCH_MAX`].
     pub batch_max: usize,
     /// Records older than this are flushed even if the batch is not full.
@@ -211,6 +227,8 @@ impl Default for Settings {
             disk: [Filter::at(Level::Info); CATEGORY_COUNT],
             text: Filter::at(Level::Info),
             ring: Filter::at(Level::Info),
+            text_log: TextTarget::Off,
+            ring_capacity: TEXT_RING_DEFAULT,
             batch_max: DEFAULT_BATCH_MAX,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             flush_on_warn: false,
@@ -232,6 +250,9 @@ pub struct LogHandle {
     text: Filter,
     ring: Filter,
     shutdown: watch::Sender<bool>,
+    /// Bumped to ask the writer for a ring dump; a counter rather than a flag
+    /// so that two `SIGUSR1`s in a row are two dumps.
+    dump: watch::Sender<u64>,
     join: StdMutex<Option<JoinHandle<()>>>,
 }
 
@@ -322,6 +343,16 @@ impl LogHandle {
         }
     }
 
+    /// Prints the last records the ring holds, through the text sink.
+    ///
+    /// Asynchronous by construction: this only asks, and the writer task — the
+    /// only owner of the ring — answers when it next runs. A signal handler
+    /// must never wait for a task that may be mid-flush.
+    pub fn dump_ring(&self) {
+        self.dump
+            .send_modify(|requested| *requested = requested.wrapping_add(1));
+    }
+
     /// Stops the writer, flushing what is already queued, and waits for it.
     ///
     /// Idempotent, and safe to call when a shutdown is already in progress:
@@ -342,13 +373,22 @@ impl LogHandle {
 
 /// Starts the writer task and returns the producer-side handle.
 ///
-/// The sink is whatever the caller wants the batches written to; nothing in
-/// this module can fail yet, so there is no `Result` here — a log directory
-/// that cannot be opened is a problem for the storage layer, which is the only
-/// thing that can have one.
-fn start<S: writer::BatchSink + 'static>(sink: S, settings: Settings) -> LogHandle {
+/// The sink is whatever the caller wants the batches written to. The one thing
+/// that can fail here is the text view's own destination: a `--text-log` path
+/// that cannot be opened is a startup error, like the segment's.
+fn start<S: writer::BatchSink + 'static>(
+    sink: S,
+    settings: Settings,
+) -> Result<LogHandle, LogError> {
+    let view = view::View::open(&settings).map_err(|error| {
+        LogError::TextSink(format!(
+            "{} could not be opened: {error}",
+            settings.text_log
+        ))
+    })?;
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (shutdown, shutdown_rx) = watch::channel(false);
+    let (dump, dump_rx) = watch::channel(0_u64);
     let counters = Arc::new(Counters::default());
 
     let handle = LogHandle {
@@ -358,16 +398,21 @@ fn start<S: writer::BatchSink + 'static>(sink: S, settings: Settings) -> LogHand
         text: settings.text,
         ring: settings.ring,
         shutdown,
+        dump,
         join: StdMutex::new(None),
     };
 
-    let task = tokio::spawn(writer::run(sink, rx, counters, settings, shutdown_rx));
+    let control = writer::Control {
+        shutdown: shutdown_rx,
+        dump: dump_rx,
+    };
+    let task = tokio::spawn(writer::run(sink, rx, counters, settings, control, view));
     *handle
         .join
         .lock()
         .expect("log writer join mutex cannot be poisoned by `take`") = Some(task);
 
-    handle
+    Ok(handle)
 }
 
 /// Starts the subsystem: opens today's segment under `dir` and the writer task
@@ -387,8 +432,34 @@ pub fn init(
     options: storage::Options,
 ) -> Result<Arc<LogHandle>, LogError> {
     let sink = storage::FileSink::open(dir, options)?;
-    Ok(Arc::new(start(sink, settings)))
+    let handle = Arc::new(start(sink, settings)?);
+    dump_on_usr1(Arc::clone(&handle));
+    Ok(handle)
 }
+
+/// Answers `SIGUSR1` with the ring's contents.
+///
+/// A signal handler runs in a context where almost nothing may be done — not
+/// writing to a file, not allocating — so this is a task waiting on the signal
+/// rather than a handler doing the work: it asks, and the writer task prints
+/// the ring the next time it wakes. Nothing is lost if the signal arrives while
+/// the process is stopping; the dump is a diagnostic, not a record.
+#[cfg(unix)]
+fn dump_on_usr1(handle: Arc<LogHandle>) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let Ok(mut usr1) = signal(SignalKind::user_defined1()) else {
+        return;
+    };
+    tokio::spawn(async move {
+        while usr1.recv().await.is_some() {
+            handle.dump_ring();
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn dump_on_usr1(_handle: Arc<LogHandle>) {}
 
 tokio::task_local! {
     /// The session a record belongs to, and the handle to send it through.

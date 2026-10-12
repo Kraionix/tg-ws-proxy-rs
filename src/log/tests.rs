@@ -6,8 +6,18 @@ use prost::Message;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::schema::*;
+use super::view::TextTarget;
 use super::writer::{BatchSink, Writer, WriterError};
 use super::*;
+
+/// [`super::start`] with the text view's destination taken on trust.
+///
+/// The pipeline tests below are about batching and the segment; the text view
+/// has its own tests, and the settings they pass here either leave it off or
+/// point it at a file they opened themselves.
+fn start<S: BatchSink + 'static>(sink: S, settings: Settings) -> LogHandle {
+    super::start(sink, settings).expect("the text view opens")
+}
 
 /// A record with a fixed, non-zero envelope: every sample differs only in its
 /// payload, which is the part whose size the storage budget depends on.
@@ -1224,6 +1234,229 @@ fn emit_does_not_wait_for_the_writer() {
     assert!(
         per_record < 20_000.0,
         "emit took {per_record:.0} ns/record, three orders of magnitude off"
+    );
+}
+
+/// The view lives in the writer task and `LogHandle` holds no reference to it,
+/// so a text sink that blocks — a terminal nobody reads, a volume that has gone
+/// away — cannot reach the connection path. The cost below is measured with the
+/// writer task never polled, so it is the emit path itself: a view that had
+/// crept onto it would show up as a file write per record.
+#[test]
+fn emit_does_not_wait_for_the_text_view() {
+    const ROUNDS: u32 = 4;
+    let dir = TempDir::new("emit-view");
+    let path = dir.path().join("text.log");
+    let runtime = unpolled_runtime();
+
+    let mut costs = Vec::new();
+    for target in [TextTarget::Off, TextTarget::File(path.clone())] {
+        let mut elapsed = Duration::ZERO;
+        for _ in 0..ROUNDS {
+            let (sink, _shared, _batches) = recording();
+            let settings = Settings {
+                text_log: target.clone(),
+                text: Filter::at(Level::Debug),
+                ..quiet(DEFAULT_BATCH_MAX)
+            };
+            let handle = runtime.block_on(async { super::start(sink, settings).expect("opens") });
+
+            let started = Instant::now();
+            for _ in 0..CHANNEL_CAPACITY {
+                handle.emit(1, Category::Routing, Level::Debug, pool_hit(2));
+            }
+            elapsed += started.elapsed();
+        }
+        costs.push(elapsed.as_nanos() as f64 / (ROUNDS as usize * CHANNEL_CAPACITY) as f64);
+    }
+
+    let (off, on) = (costs[0], costs[1]);
+    println!("emit: {off:.0} ns/record with the text view off, {on:.0} with it on");
+    assert!(
+        on < 20_000.0,
+        "the view reached the emit path: {on:.0} ns/record"
+    );
+    assert!(
+        on < off * 4.0 + 100.0,
+        "configuring a text sink changed what emit costs: {off:.0} → {on:.0} ns/record"
+    );
+}
+
+// ── The text view, end to end ──────────────────────────────────────────────
+
+/// Settings whose text view writes into `path`, which is the only way a test
+/// can read what a terminal would have shown.
+fn text_into(path: &Path, text: Filter, ring: Filter) -> Settings {
+    Settings {
+        text_log: TextTarget::File(path.to_path_buf()),
+        text,
+        ring,
+        ..quiet(DEFAULT_BATCH_MAX)
+    }
+}
+
+async fn wait_for_text(path: &Path, needle: &str) -> String {
+    wait_until(|| fs::read_to_string(path).is_ok_and(|text| text.contains(needle))).await;
+    fs::read_to_string(path).expect("the text log is readable")
+}
+
+#[tokio::test]
+async fn the_text_view_renders_what_the_writer_reads() {
+    let dir = TempDir::new("text-view");
+    let path = dir.path().join("text.log");
+    let (sink, shared, _batches) = recording();
+    let handle = start(
+        sink,
+        text_into(&path, Filter::at(Level::Info), Filter::off()),
+    );
+
+    let peer = Peer {
+        addr: vec![192, 168, 1, 60],
+        port: 51719,
+        hashed: false,
+        encrypted: false,
+    };
+    handle.emit(
+        7,
+        Category::Session,
+        Level::Info,
+        Event::SessionOpened(SessionOpened {
+            ctx: Some(Ctx::new(2, true, Tier::Unspecified)),
+            peer: Some(peer),
+        }),
+    );
+    handle.emit(
+        7,
+        Category::Session,
+        Level::Info,
+        Event::SessionClosed(SessionClosed {
+            ctx: Some(Ctx::new(2, true, Tier::Ws)),
+            closed_by: ClosedBy::Client as i32,
+            bytes_up: 23_961,
+            bytes_down: 5_557_452,
+            dur_ms: 64_512,
+            via: "kws2.web.telegram.org".into(),
+        }),
+    );
+
+    let text = wait_for_text(&path, "session closed").await;
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(
+        lines[0].contains("[192.168.1.60:51719] DC2m session opened"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains(
+            "[192.168.1.60:51719] DC2m WS session closed via kws2.web.telegram.org \
+             by client: \u{2191}23.4KB  \u{2193}5.3MB  64.5s"
+        ),
+        "{}",
+        lines[1]
+    );
+
+    // The same records reached the segment: the view is a second reader of one
+    // stream, not a fork of it.
+    handle.shutdown().await;
+    let batches = shared.batches();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].records.len(), 2);
+}
+
+#[tokio::test]
+async fn a_below_floor_record_still_reaches_the_segment() {
+    let dir = TempDir::new("text-floor");
+    let path = dir.path().join("text.log");
+    let (sink, _shared, _batches) = recording();
+    let handle = start(sink, text_into(&path, Filter::off(), Filter::off()));
+
+    handle.emit(1, Category::Routing, Level::Debug, pool_hit(2));
+    let text = wait_for_text(&path, "").await;
+    assert!(text.is_empty(), "the text view was asked for nothing");
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_ring_dump_reaches_the_text_sink() {
+    let dir = TempDir::new("ring-dump");
+    let path = dir.path().join("text.log");
+    let (sink, _shared, _batches) = recording();
+    // Nothing is printed as it happens: the only text this run writes is the
+    // dump, which is the point of asking for one.
+    let handle = start(
+        sink,
+        text_into(&path, Filter::off(), Filter::at(Level::Info)),
+    );
+
+    for dc in 1..=3 {
+        handle.emit(1, Category::Routing, Level::Info, pool_hit(dc));
+    }
+    handle.dump_ring();
+
+    let text = wait_for_text(&path, "ring dump").await;
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "tg-ws-proxy: ring dump, 3 records");
+    assert_eq!(lines.len(), 4, "{text}");
+    assert!(lines[1].contains("DC1"), "{}", lines[1]);
+    assert!(lines[3].contains("DC3"), "oldest first: {text}");
+
+    handle.shutdown().await;
+}
+
+/// `SIGUSR1` is the whole point of the ring: a router has no debugger, and the
+/// operator's question — "what were the last few hundred records?" — has to be
+/// answerable by a signal.
+#[cfg(unix)]
+#[tokio::test]
+async fn sigusr1_prints_the_ring_through_the_text_sink() {
+    let dir = TempDir::new("usr1");
+    let path = dir.path().join("text.log");
+    // Text off, ring on: the only text this run writes is the dump, so a line
+    // in the file cannot be anything else.
+    let settings = text_into(&path, Filter::off(), Filter::at(Level::Info));
+    let handle = init(dir.path(), settings, Options::default()).expect("the sink starts");
+
+    for dc in 1..=3 {
+        handle.emit(1, Category::Routing, Level::Info, pool_hit(dc));
+    }
+
+    let status = std::process::Command::new("kill")
+        .args(["-USR1", &std::process::id().to_string()])
+        .status()
+        .expect("kill is on every system this runs on");
+    assert!(status.success(), "kill -USR1 failed: {status}");
+
+    let text = wait_for_text(&path, "ring dump").await;
+    assert!(text.contains("ring dump, 3 records"), "{text}");
+    assert!(text.contains("DC2"), "{text}");
+
+    handle.shutdown().await;
+}
+
+/// A text destination that cannot be opened is a startup error, and it says
+/// which destination it was: the same rule the segment's own directory follows.
+#[tokio::test]
+async fn a_text_target_that_cannot_be_opened_is_a_startup_error() {
+    let dir = TempDir::new("text-unopenable");
+    let (sink, _shared, _batches) = recording();
+    // A directory is the one path that always exists and can never be opened
+    // for writing.
+    let settings = Settings {
+        text_log: TextTarget::File(dir.path().to_path_buf()),
+        ..quiet(DEFAULT_BATCH_MAX)
+    };
+
+    let error = match super::start(sink, settings) {
+        Err(error) => error,
+        Ok(_) => panic!("a directory is not a log file"),
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains(&dir.path().display().to_string())
+            && message.contains("could not be opened"),
+        "{message}"
     );
 }
 

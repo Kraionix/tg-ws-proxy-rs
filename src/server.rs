@@ -48,6 +48,8 @@ pub enum RunError {
     InvalidLogFs(String),
     /// `--log-dir` could not be created, opened, or claimed for writing.
     InvalidLogDir(String),
+    /// `--text-log` names something that cannot be written to.
+    InvalidTextLog(String),
     /// The listen socket could not be bound.
     Bind {
         addr: SocketAddr,
@@ -65,6 +67,7 @@ impl std::fmt::Display for RunError {
             Self::InvalidListenAddress(addr) => write!(f, "invalid listen address: {addr}"),
             Self::InvalidLogFs(reason) => f.write_str(reason),
             Self::InvalidLogDir(reason) => write!(f, "invalid --log-dir: {reason}"),
+            Self::InvalidTextLog(reason) => write!(f, "invalid --text-log: {reason}"),
             Self::Bind { addr, source } => write!(f, "cannot bind {addr}: {source}"),
             Self::CheckFailed => write!(f, "connectivity check failed"),
         }
@@ -162,6 +165,7 @@ fn log_start_error(error: log::LogError, dir: &Path) -> RunError {
         // The io error alone ("Permission denied") does not say which directory
         // it was about; the operator named one, so quote it back.
         log::LogError::Io(error) => RunError::InvalidLogDir(format!("{}: {error}", dir.display())),
+        log::LogError::TextSink(reason) => RunError::InvalidTextLog(reason),
         error => RunError::InvalidLogDir(error.to_string()),
     }
 }

@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
 use super::schema::{Category, Event, Level, LogBatch, LogOverflow, LogRecord, build_batch};
+use super::view::View;
 use super::{CATEGORY_COUNT, Counters, Filter, Settings, now_ns};
 
 /// Where a finished batch goes.
@@ -64,6 +65,17 @@ impl std::error::Error for WriterError {
             _ => None,
         }
     }
+}
+
+/// What the writer task listens to besides the record channel.
+///
+/// Both are `watch` receivers rather than queues: neither the stop nor a ring
+/// dump may be lost, and both are states rather than a stream of work — a
+/// second stop during a stop is the same stop, and two dumps in a row are two
+/// bumps of one counter.
+pub(super) struct Control {
+    pub(super) shutdown: watch::Receiver<bool>,
+    pub(super) dump: watch::Receiver<u64>,
 }
 
 /// The batching buffer, separate from the task so that the parts worth testing
@@ -168,10 +180,18 @@ impl<S: BatchSink> Task<S> {
         }
     }
 
+    /// Takes a record the view has already seen: buffered for the segment when
+    /// the segment wants it, flushed when the batch is full.
+    fn accept(&mut self, record: LogRecord, view: &mut View) {
+        if self.ingest(record) && self.writer.is_full() {
+            self.flush(view);
+        }
+    }
+
     /// Reports any records the producers dropped, then writes what is
     /// buffered.
-    fn flush(&mut self) {
-        self.report_overflow();
+    fn flush(&mut self, view: &mut View) {
+        self.report_overflow(view);
         if let Err(error) = self.writer.flush() {
             self.failures += 1;
             warn!(
@@ -188,14 +208,14 @@ impl<S: BatchSink> Task<S> {
     /// since the previous one and a burst of drops becomes one line in the file
     /// instead of a line per dropped record — the channel being full is exactly
     /// when writing more records is the wrong answer.
-    fn report_overflow(&mut self) {
+    fn report_overflow(&mut self, view: &mut View) {
         let dropped = self.counters.dropped.swap(0, Relaxed);
         if dropped == 0 {
             return;
         }
 
         let now = Instant::now();
-        self.ingest(LogRecord {
+        let record = LogRecord {
             ts_ns: now_ns(),
             conn_id: 0,
             seq: self.counters.next_seq(),
@@ -205,7 +225,11 @@ impl<S: BatchSink> Task<S> {
                 dropped,
                 window_ns: now.duration_since(self.overflow_window).as_nanos() as u64,
             })),
-        });
+        };
+        // Through the view as well: this record never crossed the channel, but
+        // it is the one line an operator reads a burst by.
+        view.show(&record);
+        self.ingest(record);
         self.overflow_window = now;
     }
 }
@@ -239,7 +263,8 @@ pub(super) async fn run<S: BatchSink + 'static>(
     mut rx: mpsc::Receiver<LogRecord>,
     counters: Arc<Counters>,
     settings: Settings,
-    mut shutdown: watch::Receiver<bool>,
+    mut control: Control,
+    mut view: View,
 ) {
     let mut task = Task {
         writer: Writer::new(sink, settings.batch_max),
@@ -257,23 +282,47 @@ pub(super) async fn run<S: BatchSink + 'static>(
         settings.flush_interval,
     );
 
+    // Stays true until the handle is dropped, which is when there is nobody
+    // left to ask for a dump. An unchanged `watch` receiver whose sender is
+    // gone reports a change every time it is polled, which in a `biased`
+    // `select!` is a spin.
+    let mut dumps_wanted = true;
+
     loop {
         tokio::select! {
             // Shutdown first: when the process is going away, the last thing it
             // wants is to keep draining a queue that is about to disappear.
             biased;
 
-            _ = shutdown.changed() => break,
+            _ = control.shutdown.changed() => break,
 
-            received = rx.recv() => {
-                let Some(record) = received else { break };
-                let warn_now = settings.flush_on_warn && record.level >= Level::Warn as i32;
-                if task.ingest(record) && (warn_now || task.writer.is_full()) {
-                    task.flush();
+            result = control.dump.changed(), if dumps_wanted => {
+                if result.is_err() {
+                    dumps_wanted = false;
+                } else {
+                    // Everything already queued belongs in the dump: the
+                    // operator is asking about the last few hundred records,
+                    // and the ones still in flight are the most recent of them.
+                    while let Ok(record) = rx.try_recv() {
+                        view.show(&record);
+                        task.accept(record, &mut view);
+                    }
+                    view.dump();
                 }
             }
 
-            _ = ticker.tick() => task.flush(),
+            received = rx.recv() => {
+                let Some(record) = received else { break };
+                // The view first, and whatever the segment's own filter thinks
+                // of the record: the text and the ring have floors of their own.
+                view.show(&record);
+                let warn_now = settings.flush_on_warn && record.level >= Level::Warn as i32;
+                if task.ingest(record) && (warn_now || task.writer.is_full()) {
+                    task.flush(&mut view);
+                }
+            }
+
+            _ = ticker.tick() => task.flush(&mut view),
         }
     }
 
@@ -281,11 +330,10 @@ pub(super) async fn run<S: BatchSink + 'static>(
     // the drain window opens, so a stop that is killed during it still has
     // everything that was already queued.
     while let Ok(record) = rx.try_recv() {
-        if task.ingest(record) && task.writer.is_full() {
-            task.flush();
-        }
+        view.show(&record);
+        task.accept(record, &mut view);
     }
-    task.flush();
+    task.flush(&mut view);
 
     // And now the tail: the sessions that were mid-teardown when the signal
     // arrived. A record that lands exactly on the boundary is still lost — the
@@ -295,14 +343,17 @@ pub(super) async fn run<S: BatchSink + 'static>(
     while started.elapsed() < DRAIN_LIMIT {
         match tokio::time::timeout(DRAIN_QUIET, rx.recv()).await {
             Ok(Some(record)) => {
-                if task.ingest(record) && task.writer.is_full() {
-                    task.flush();
-                }
+                view.show(&record);
+                task.accept(record, &mut view);
             }
             // Every producer is gone, or none has spoken for a whole window.
             Ok(None) | Err(_) => break,
         }
     }
 
-    task.flush();
+    task.flush(&mut view);
+    // The text was written line by line and flushed on every warning; this is
+    // the last line of the stop, and a sink that buffers at all gets its chance
+    // to write what it holds before the process is gone.
+    view.flush();
 }

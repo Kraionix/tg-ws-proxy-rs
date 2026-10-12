@@ -1145,6 +1145,11 @@ impl Config {
             // widest policy either could ask for.
             text: log::Filter::at(level),
             ring: log::Filter::at(level),
+            // The text view renders to stderr by default and the ring is the
+            // size the RAM budget was computed against; both become flags with
+            // the CLI rework.
+            text_log: log::view::TextTarget::Stderr,
+            ring_capacity: log::view::TEXT_RING_DEFAULT,
             batch_max: self.log_batch_max,
             flush_interval: Duration::from_secs(self.log_flush_interval),
             flush_on_warn: self.log_flush_on_warn,
