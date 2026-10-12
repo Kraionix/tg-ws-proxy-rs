@@ -383,7 +383,9 @@ return view.extend({
 		o.value('warn', _('Warn'));
 		o.value('info', _('Info'));
 		o.value('debug', _('Debug'));
-		o.value('trace', _('Trace'));
+		// No `trace`: the text view's lowest floor is debug, and an option that
+		// silently means debug is an option that misleads. A config that still
+		// carries `trace` keeps working — the init script maps it.
 		o.default = 'info';
 		o.rmempty = false;
 		o = s.taboption('logging', form.DummyValue, '_live_log', _('Live log'));
