@@ -42,7 +42,6 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
-use tracing::warn;
 
 use super::LogError;
 use super::schema::{LogBatch, fingerprint};
@@ -213,7 +212,10 @@ impl FileSink {
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(error) => {
-                warn!(dir = %self.dir.display(), %error, "cannot sweep log retention");
+                crate::direct!(
+                    "cannot sweep log retention in {}: {error}",
+                    self.dir.display()
+                );
                 return;
             }
         };
@@ -224,7 +226,10 @@ impl FileSink {
             if segment_day(name).is_some_and(|segment| segment < cutoff.as_str())
                 && let Err(error) = fs::remove_file(entry.path())
             {
-                warn!(file = %entry.path().display(), %error, "cannot delete an expired segment");
+                crate::direct!(
+                    "cannot delete the expired segment {}: {error}",
+                    entry.path().display()
+                );
             }
         }
     }
@@ -465,7 +470,7 @@ impl Drop for Segment {
     /// process all arrive here, and a clean stop is supposed to lose nothing.
     fn drop(&mut self) {
         if let Err(error) = self.sync() {
-            warn!(error = %error, "could not flush the log segment on close");
+            crate::direct!("could not flush the log segment on close: {error}");
         }
     }
 }
@@ -637,8 +642,8 @@ fn durability_of(mode: DurabilityMode) -> Durability {
     }
 }
 
-/// `redb::DatabaseError` and friends, flattened: the write path reports them
-/// through `tracing` and backs off, and nothing above matches on them.
+/// `redb::DatabaseError` and friends, flattened: the write path reports them as
+/// a `tg-ws-proxy:` line and backs off, and nothing above matches on them.
 fn segment_error(error: impl std::fmt::Display) -> WriterError {
     WriterError::Segment(error.to_string())
 }
@@ -727,9 +732,9 @@ pub(crate) fn check_filesystem(dir: &Path) -> Result<(), LogError> {
             // is more likely to be a new Linux one than a FAT variant.
             static ONCE: Once = Once::new();
             ONCE.call_once(|| {
-                warn!(
-                    dir = %dir.display(),
-                    "cannot determine the log directory's filesystem; assuming it is usable"
+                crate::direct!(
+                    "cannot determine the filesystem of {}; assuming it is usable",
+                    dir.display()
                 );
             });
             Ok(())

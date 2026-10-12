@@ -13,9 +13,15 @@
 //! See [`tg_ws_proxy_rs::proxy`] for the connection handling logic and
 //! [`tg_ws_proxy_rs::crypto`] for the MTProto obfuscation details.
 
+use std::fmt;
 use std::io::IsTerminal as _;
 
+use tracing_subscriber::fmt::FmtContext;
+use tracing_subscriber::fmt::format::{Format, FormatEvent, FormatFields, Writer};
+use tracing_subscriber::registry::LookupSpan;
+
 use tg_ws_proxy_rs::config::Config;
+use tg_ws_proxy_rs::direct;
 use tg_ws_proxy_rs::log::schema::ShutdownSignal;
 use tg_ws_proxy_rs::server::{self, RunError};
 
@@ -26,20 +32,23 @@ async fn main() {
         .expect("failed to install rustls ring CryptoProvider");
 
     let config = Config::from_args();
-    init_logging(&config);
+    init_foreign_logging();
 
     match server::run(config, shutdown_signal()).await {
         Ok(()) => {}
+        // The report went to stdout and is the reason for the exit code; a
+        // second line repeating "connectivity check failed" would be noise
+        // under it.
         Err(RunError::CheckFailed) => std::process::exit(1),
         Err(RunError::InvalidOutbound(e)) => {
-            eprintln!("invalid outbound proxy config: {e}");
+            direct!("invalid outbound proxy config: {e}");
             std::process::exit(2);
         }
         // Bind and InvalidListenAddress are ordinary user mistakes -- "port
         // already in use" must not reach the user as a panic with a
         // RUST_BACKTRACE suggestion attached.
         Err(e) => {
-            eprintln!("{e}");
+            direct!("{e}");
             std::process::exit(1);
         }
     }
@@ -79,15 +88,16 @@ async fn shutdown_signal() -> ShutdownSignal {
         // Held by this task, which outlives the shutdown future: the sink's
         // drain window is milliseconds, so anything still here is stuck.
         //
-        // This one line stays a console line even after stage 5 turns the rest
-        // of the log into records: the process is about to exit, and a record
-        // that has not reached the writer task yet would be lost with it.
+        // Printed rather than recorded, unlike every other line about a stop:
+        // the process is about to exit, and a record that has not reached the
+        // writer task yet would be lost with it — which is the one thing this
+        // line exists to avoid.
         tokio::spawn(async move {
             tokio::select! {
                 _ = term.recv() => {}
                 _ = int.recv() => {}
             }
-            tracing::warn!("still stopping; second signal exits now");
+            direct!("still stopping; second signal exits now");
             std::process::exit(130);
         });
 
@@ -101,39 +111,55 @@ async fn shutdown_signal() -> ShutdownSignal {
     }
 }
 
-fn init_logging(config: &Config) {
-    let log_level = if config.quiet {
-        "off"
-    } else if config.verbose {
-        "debug"
-    } else {
-        "info"
-    };
+/// Sends other crates' `tracing` lines to stderr — the one stream this process
+/// does not own.
+///
+/// Off unless `RUST_LOG` names a target: `rustls` and `tungstenite` narrate
+/// their handshakes at debug, which is worth having when a TLS failure makes no
+/// sense and is otherwise a hundred lines nobody asked for. What this process
+/// itself has to say is a record ([`tg_ws_proxy_rs::log`]) or a
+/// `tg-ws-proxy:` line ([`direct!`]), and neither goes through here.
+fn init_foreign_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("off"))
+        // Our own targets emit nothing through `tracing` at all, so this only
+        // keeps a broad `RUST_LOG=debug` from promising a stream that is not
+        // there.
+        .add_directive(
+            "tg_ws_proxy_rs=off"
+                .parse()
+                .expect("a literal directive parses"),
+        );
 
-    let env_filter =
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| log_level.into());
+    // ANSI colour codes are not rendered correctly on Windows consoles that
+    // lack Virtual Terminal Processing support, so they are disabled there and
+    // whenever stderr is not a terminal (output piped or redirected).
+    let use_ansi = std::io::stderr().is_terminal() && !cfg!(windows);
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(use_ansi)
+        .with_writer(std::io::stderr)
+        .event_format(ForeignLine)
+        .init();
+}
 
-    if let Some(ref path) = config.log_file {
-        // File output: always disable ANSI color codes in log files.
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .unwrap_or_else(|e| panic!("cannot open log file '{}': {}", path, e));
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_ansi(false)
-            .with_writer(file)
-            .init();
-    } else {
-        // Console output: ANSI color codes are not rendered correctly on
-        // Windows consoles that lack Virtual Terminal Processing support, so
-        // disable them there.  Also disable when stderr is not a terminal
-        // (e.g. output is piped or redirected).
-        let use_ansi = std::io::stderr().is_terminal() && !cfg!(windows);
-        tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .with_ansi(use_ansi)
-            .init();
+/// Formats a foreign crate's line the way this process writes its own: one
+/// `tg-ws-proxy:`-prefixed line, so a reader can tell the two apart without
+/// knowing which crates are in the build.
+struct ForeignLine;
+
+impl<S, N> FormatEvent<S, N> for ForeignLine
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> fmt::Result {
+        write!(writer, "tg-ws-proxy: ")?;
+        Format::default().format_event(ctx, writer, event)
     }
 }

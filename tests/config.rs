@@ -6,6 +6,7 @@ use tg_ws_proxy_rs::config::{Config, UpstreamTier};
 use tg_ws_proxy_rs::log::Filter;
 use tg_ws_proxy_rs::log::schema::{Category, Level};
 use tg_ws_proxy_rs::log::storage::{Compression, DurabilityMode};
+use tg_ws_proxy_rs::log::view::{TEXT_RING_DEFAULT, TEXT_RING_MAX, TEXT_RING_MIN, TextTarget};
 
 #[test]
 fn ee_secret_supplies_inbound_faketls_domain_and_key() {
@@ -820,10 +821,12 @@ fn structured_log_defaults_are_the_documented_ones() {
             .iter()
             .all(|filter| *filter == Filter::at(Level::Info))
     );
-    // The text view and the ring have no flags of their own yet; both follow the
-    // global level, which is the widest policy either asks for.
+    // Three consumers, three floors: the text view and the ring follow their
+    // own flags rather than the segment's level.
     assert_eq!(settings.text, Filter::at(Level::Info));
     assert_eq!(settings.ring, Filter::at(Level::Info));
+    assert_eq!(settings.text_log, TextTarget::Stderr);
+    assert_eq!(settings.ring_capacity, TEXT_RING_DEFAULT);
     assert_eq!(settings.batch_max, 256);
     assert_eq!(settings.flush_interval, Duration::from_secs(2));
     assert!(!settings.flush_on_warn);
@@ -965,6 +968,135 @@ fn every_level_name_the_schema_prints_is_one_the_flag_parses() {
                 .all(|threshold| *threshold == Filter::at(level)),
             "{} did not parse to itself",
             level.name()
+        );
+    }
+}
+
+// ── The text view's own flags ──────────────────────────────────────────────
+
+#[test]
+fn the_text_log_and_the_ring_have_their_own_floors() {
+    let cfg = log_config(&[
+        "--log-level",
+        "error",
+        "--text-level",
+        "warn",
+        "--ring-level",
+        "debug",
+        "--ring-capacity",
+        "128",
+        "--text-log",
+        "stdout",
+    ]);
+
+    let settings = cfg.log_settings();
+    assert_eq!(
+        settings.disk[Category::Session as usize],
+        Filter::at(Level::Error)
+    );
+    assert_eq!(settings.text, Filter::at(Level::Warn));
+    assert_eq!(settings.ring, Filter::at(Level::Debug));
+    assert_eq!(settings.ring_capacity, 128);
+    assert_eq!(settings.text_log, TextTarget::Stdout);
+}
+
+#[test]
+fn the_text_log_names_a_stream_or_a_path() {
+    for (spec, expected) in [
+        ("stderr", TextTarget::Stderr),
+        ("stdout", TextTarget::Stdout),
+        ("off", TextTarget::Off),
+        (
+            "/var/log/tg-ws-proxy.log",
+            TextTarget::File("/var/log/tg-ws-proxy.log".into()),
+        ),
+        // Not a keyword, so it is a file name: a misspelled `sterr` is a file
+        // somebody will find, and a silently disabled view is not.
+        ("sterr", TextTarget::File("sterr".into())),
+    ] {
+        let cfg = log_config(&["--text-log", spec]);
+        assert_eq!(cfg.log_settings().text_log, expected, "{spec}");
+    }
+}
+
+#[test]
+fn the_ring_capacity_is_bounded_at_parse_time() {
+    for value in ["63", "4097", "many"] {
+        assert!(
+            Config::try_parse_from(["tg-ws-proxy", "--ring-capacity", value]).is_err(),
+            "--ring-capacity {value} should be refused"
+        );
+    }
+    for value in [TEXT_RING_MIN.to_string(), TEXT_RING_MAX.to_string()] {
+        let cfg = Config::try_parse_from(["tg-ws-proxy", "--ring-capacity", &value]).unwrap();
+        assert_eq!(
+            cfg.log_settings().ring_capacity,
+            value.parse::<usize>().unwrap()
+        );
+    }
+}
+
+#[test]
+fn check_mode_keeps_the_text_log_off() {
+    // The report is the product of `--check` and it goes to stdout; a text log
+    // beside it would interleave two unrelated streams in one window.
+    let cfg = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--check",
+        "--text-log",
+        "stderr",
+        "--text-level",
+        "debug",
+    ])
+    .unwrap()
+    .with_defaults();
+
+    let settings = cfg.log_settings();
+    assert_eq!(settings.text_log, TextTarget::Off);
+    assert_eq!(
+        settings.text,
+        Filter::at(Level::Debug),
+        "the filter is untouched"
+    );
+}
+
+#[test]
+fn the_legacy_console_flags_still_map_onto_the_text_log() {
+    // `--verbose` and `--quiet` are what the Android app and older scripts
+    // pass; the new flags are what they mean, and they win when both are given.
+    let quiet_cfg = log_config(&["--quiet"]);
+    assert_eq!(quiet_cfg.log_settings().text_log, TextTarget::Off);
+
+    let verbose_cfg = log_config(&["--verbose"]);
+    assert_eq!(verbose_cfg.log_settings().text, Filter::at(Level::Debug));
+
+    let both = log_config(&["--verbose", "--text-level", "warn"]);
+    assert_eq!(both.log_settings().text, Filter::at(Level::Warn));
+
+    let both_targets = log_config(&["--quiet", "--text-log", "stdout"]);
+    assert_eq!(both_targets.log_settings().text_log, TextTarget::Stdout);
+}
+
+#[test]
+fn the_text_log_is_written_even_without_a_log_directory() {
+    // The pipeline is unconditional: `--log-dir` decides where the records are
+    // *stored*, not whether there are any.
+    let cfg = Config::try_parse_from(["tg-ws-proxy", "--text-log", "stdout"])
+        .unwrap()
+        .with_defaults();
+    assert_eq!(cfg.log_dir, None);
+    assert_eq!(cfg.log_settings().text_log, TextTarget::Stdout);
+}
+
+#[test]
+fn the_removed_log_file_flag_is_refused() {
+    // Removed by the CLI rework in favour of `--text-log`, which writes the
+    // same text: an old command line must fail loudly rather than log to stderr
+    // while the operator watches a file that stays empty.
+    for flag in ["--log-file", "--log-file=/tmp/tg.log"] {
+        assert!(
+            Config::try_parse_from(["tg-ws-proxy", flag]).is_err(),
+            "{flag} should not parse"
         );
     }
 }

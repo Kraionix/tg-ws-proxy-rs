@@ -31,10 +31,11 @@ name = "tg-ws-proxy"
 path = "src/main.rs"
 
 [features]
-# The structured log is always compiled in — it is only started when
-# `--log-dir` is given. Compression is the one part behind a feature, because
-# it is the one part that costs real weight for a mode that is off by default:
-# see the `zstd` dependency below.
+# The structured log is always compiled in, and the record pipeline always
+# runs: the text log is a projection of it. `--log-dir` is what puts the
+# records on disk. Compression is the one part behind a feature, because it is
+# the one part that costs real weight for a mode that is off by default: see
+# the `zstd` dependency below.
 default = []
 log-zstd = ["dep:zstd"]
 
@@ -97,7 +98,10 @@ async-http-proxy = { version = "1.2", features = [
 ] }
 tokio-socks = "0.5"
 
-# Human-facing logging
+# Other crates' logging: `rustls` and `tungstenite` narrate their handshakes
+# through `tracing`, and this process prints those lines — prefixed, and off
+# unless `RUST_LOG` asks for them. This crate's own output is a record
+# (`src/log/`) or a `tg-ws-proxy:` line, neither of which goes through here.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

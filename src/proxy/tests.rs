@@ -332,7 +332,7 @@ async fn a_ladder_walk_lands_in_the_segment_as_attempts_and_fallbacks() {
     .unwrap()
     .with_defaults();
 
-    let handle = crate::log::init(&dir, config.log_settings(), config.log_options())
+    let handle = crate::log::init(Some(&dir), config.log_settings(), config.log_options())
         .expect("a writable temp dir accepts a segment");
     let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
     let pool = Arc::new(WsPool::with_runtime(
@@ -501,7 +501,7 @@ async fn the_aligned_levels_land_in_the_segment() {
     .unwrap()
     .with_defaults();
 
-    let handle = crate::log::init(&dir, config.log_settings(), config.log_options())
+    let handle = crate::log::init(Some(&dir), config.log_settings(), config.log_options())
         .expect("a writable temp dir accepts a segment");
     let ctx = || Some(Ctx::new(2, false, LogTier::Ws));
 
@@ -683,7 +683,7 @@ async fn a_session_with_nowhere_to_route_closes_as_no_route() {
     .unwrap()
     .with_defaults();
 
-    let handle = crate::log::init(&dir, config.log_settings(), config.log_options())
+    let handle = crate::log::init(Some(&dir), config.log_settings(), config.log_options())
         .expect("a writable temp dir accepts a segment");
 
     let config = Arc::new(config);

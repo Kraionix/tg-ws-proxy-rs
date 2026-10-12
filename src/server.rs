@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
-use tracing::{error, info, warn};
 
 use crate::check;
 use crate::config::{Config, UpstreamTier};
@@ -29,7 +28,7 @@ use crate::pool::WsPool;
 use crate::proxy;
 use crate::runtime::Runtime;
 
-/// How often the descriptor budget is recorded, when the sink is on.
+/// How often the descriptor budget is recorded.
 const FD_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Past this, `--log-retention` stops being a retention policy and becomes a
@@ -130,44 +129,46 @@ async fn check_verdict(rx: &mut Option<tokio::sync::oneshot::Receiver<bool>>) ->
 /// `on_listen` is how an embedder learns the real port (when `--port 0`) and
 /// the `tg://proxy` link without scraping log lines.
 ///
-/// The structured sink is started here rather than in the binary's `main`
-/// because this is the function that owns `config`: a handle created outside
-/// would have to be threaded through `run`, every embedder and the Android shim
-/// to be usable inside — or worse, the shim would run without logging at all.
-/// Starting it here also makes "a clean stop loses nothing" a property of the
-/// return path: every way out of [`serve`] comes back through the shutdown,
-/// including the early returns for `--check` and a failed bind.
+/// The pipeline is started here rather than in the binary's `main` because this
+/// is the function that owns `config`: a handle created outside would have to be
+/// threaded through `run`, every embedder and the Android shim to be usable
+/// inside — or worse, the shim would run without logging at all. With a
+/// `--log-dir` the sink is a segment on disk; without one it keeps nothing, and
+/// the text log is the whole of what the records are for. Starting it here also
+/// makes "a clean stop loses nothing" a property of the return path: every way
+/// out of [`serve`] comes back through the shutdown, including the early returns
+/// for `--check` and a failed bind.
 pub async fn run_with_listen(
     config: Config,
     shutdown: impl Future<Output = ShutdownSignal> + Send,
     on_listen: impl FnOnce(ListenInfo) + Send,
 ) -> Result<(), RunError> {
-    let log = match &config.log_dir {
-        Some(dir) => Some(
-            log::init(dir, config.log_settings(), config.log_options())
-                .map_err(|error| log_start_error(error, dir))?,
-        ),
-        None => None,
-    };
+    let log = log::init(
+        config.log_dir.as_deref(),
+        config.log_settings(),
+        config.log_options(),
+    )
+    .map_err(|error| log_start_error(error, config.log_dir.as_deref()))?;
 
-    let result = serve(config, shutdown, on_listen, log.as_ref()).await;
+    let result = serve(config, shutdown, on_listen, &log).await;
 
-    if let Some(handle) = &log {
-        handle.shutdown().await;
-    }
+    log.shutdown().await;
 
     result
 }
 
-/// `--log-dir` is the one startup setting whose failure has no fallback: a
-/// directory this process cannot write to is a configuration mistake the
-/// operator has to see, not a reason to run on quietly without logs.
-fn log_start_error(error: log::LogError, dir: &Path) -> RunError {
+/// A destination that could not be opened is the one startup failure with no
+/// fallback: a log the operator asked for and did not get is a configuration
+/// mistake to see, not a reason to run on quietly without it.
+fn log_start_error(error: log::LogError, dir: Option<&Path>) -> RunError {
     match error {
         log::LogError::FsUnsupported(reason) => RunError::InvalidLogFs(reason),
         // The io error alone ("Permission denied") does not say which directory
         // it was about; the operator named one, so quote it back.
-        log::LogError::Io(error) => RunError::InvalidLogDir(format!("{}: {error}", dir.display())),
+        log::LogError::Io(error) => RunError::InvalidLogDir(match dir {
+            Some(dir) => format!("{}: {error}", dir.display()),
+            None => error.to_string(),
+        }),
         log::LogError::TextSink(reason) => RunError::InvalidTextLog(reason),
         error => RunError::InvalidLogDir(error.to_string()),
     }
@@ -197,36 +198,276 @@ fn configured_tiers(config: &Config, cf_worker_domains: &[String]) -> Vec<String
     tiers.iter().map(ToString::to_string).collect()
 }
 
-/// The server itself: everything [`run_with_listen`] does once the sink is up.
-/// Runs the probes with the pool's attribution: `conn_id = 0`, and only when a
-/// sink exists at all.
+/// The server itself: everything [`run_with_listen`] does once the pipeline is
+/// up. Runs the probes with the pool's attribution: `conn_id = 0`.
 ///
 /// A probe is not a session — nothing about it belongs to a client connection —
-/// so it reports as the process does, and a probe run without `--log-dir`
-/// reports nowhere rather than needing a scope built for it.
+/// so it reports as the process does rather than under a scope built for it.
 async fn run_check_logged(
     config: &Config,
     outbound: &OutboundConnector,
     listener: Option<SocketAddr>,
-    log: Option<&Arc<LogHandle>>,
+    log: &Arc<LogHandle>,
 ) -> bool {
-    match log {
-        Some(handle) => {
-            log::scope_global(
-                Arc::clone(handle),
-                check::run_check_with_outbound(config, outbound, listener),
-            )
-            .await
-        }
-        None => check::run_check_with_outbound(config, outbound, listener).await,
+    log::scope_global(
+        Arc::clone(log),
+        check::run_check_with_outbound(config, outbound, listener),
+    )
+    .await
+}
+
+/// Prints the startup banner to stdout and returns the primary `tg://` link.
+///
+/// stdout rather than the log, and unconditionally: the banner carries the
+/// secret and the `tg://` links, which are the one thing a user needs before
+/// anything else works, and it is printed before the pipeline exists. It is
+/// also the reason nothing here is a record — "this is the whole
+/// configuration" is not a level, and a record has a session or a process to
+/// belong to, not a screen to appear on.
+///
+/// The ⚠ lines are part of it rather than warnings written elsewhere: they are
+/// facts about the configuration being printed, and splitting them off would
+/// leave a reader of the console log with half of it.
+///
+/// What it takes is only what the caller had to compute: the *bound* port (a
+/// `--port 0` is not the configured one), the descriptor budget, and the
+/// runtime whose outbound summary is part of the picture.
+fn print_banner(
+    config: &Config,
+    runtime: &Runtime,
+    listen_port: u16,
+    max_connections: usize,
+    fd_limit: usize,
+) -> String {
+    let secret = config.primary_secret();
+    let bind_host = config.bind_host();
+    let link_host = config.link_host();
+    let dc_redirects = config.dc_redirects();
+    let tg_link = format!(
+        "tg://proxy?server={}&port={}&secret={}",
+        link_host,
+        listen_port,
+        config.link_secret()
+    );
+
+    println!("{}", "=".repeat(60));
+    println!(
+        "  Telegram MTProto WS Bridge Proxy  (tg-ws-proxy-rs v{})",
+        env!("CARGO_PKG_VERSION")
+    );
+    println!("  Listening on   {}:{}", bind_host, listen_port);
+    println!("  Secret:        {}", secret);
+    if let Some(domain) = config.listen_faketls_domain() {
+        println!("  Inbound mode:   FakeTLS ee (SNI: {})", domain);
+    } else {
+        println!("  Inbound mode:   padded MTProto dd");
     }
+    println!("  Target DC IPs:");
+    let mut dcs: Vec<_> = dc_redirects.iter().collect();
+    dcs.sort_by_key(|(k, _)| *k);
+    for (dc, ip) in &dcs {
+        println!("    DC{}: {}", dc, ip);
+    }
+
+    if config.skip_tls_verify {
+        println!("  ⚠  TLS certificate verification DISABLED");
+    }
+
+    if !config.cf_domains.is_empty() {
+        println!("  Cloudflare proxy domain(s):");
+        for d in &config.cf_domains {
+            println!("    {} (kws{{N}}.{} subdomains)", d, d);
+        }
+        if config.cf_balance && config.cf_domains.len() > 1 {
+            println!("    ⚖  CF balance mode: connections are round-robin'd across domains");
+        }
+    }
+
+    let cf_worker_domains = config.cf_worker_domains();
+    if !cf_worker_domains.is_empty() {
+        println!("  Cloudflare Worker domain(s):");
+        for domain in cf_worker_domains {
+            println!("    {}", domain);
+        }
+    }
+
+    if config.cf_disable_tls && (!config.cf_domains.is_empty() || !cf_worker_domains.is_empty()) {
+        println!(
+            "  ⚠  CF transport: plaintext ws:// on port 80 — the obfuscated MTProto stream is \
+             on the wire in the clear: every frame's auth_key_id is readable and the \
+             obfuscation is recoverable from captured bytes (#123), so connections are \
+             identifiable. Route media through these tiers, not text."
+        );
+    }
+    if !config.pinned_upstreams.is_empty() || !config.pinned_media_upstreams.is_empty() {
+        println!("  Pinned upstream order (default ladder is used for the rest):");
+        let names = |tiers: &[UpstreamTier]| {
+            tiers
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        if !config.pinned_upstreams.is_empty() {
+            println!("    non-media: {}", names(&config.pinned_upstreams));
+        }
+        if !config.pinned_media_upstreams.is_empty() {
+            println!("    media: {}", names(&config.pinned_media_upstreams));
+        } else if !config.pinned_upstreams.is_empty() {
+            println!("    media: inherits non-media pin above");
+        }
+    }
+
+    if !config.cf_ips.is_empty() {
+        println!(
+            "  Cloudflare preferred IP(s): {}",
+            config
+                .cf_ips
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        if config.cf_domains.is_empty() && cf_worker_domains.is_empty() {
+            println!(
+                "  ⚠  --cf-ip has no effect: no --cf-domain, --default-domains, \
+                 or --cf-worker-domain route is configured"
+            );
+        }
+    }
+
+    if !config.mtproto_proxies.is_empty() {
+        println!("  Upstream MTProto proxies (WS fallback):");
+        for p in &config.mtproto_proxies {
+            println!("    {}:{}", p.host, p.port);
+        }
+    }
+
+    if let Some(summary) = runtime.outbound().summary() {
+        println!("  Outbound proxy: {}", summary);
+    }
+
+    if let Some(domain) = runtime.fronting_domain() {
+        if dc_redirects.is_empty() {
+            println!(
+                "  ⚠  --fronting-domain {} has no effect: no --dc-ip is configured. \
+                 Fronting only applies to a direct connection to a DC's real IP \
+                 (matching upstream tg-ws-proxy) — it is never used for CF proxy, \
+                 CF Worker, or upstream MTProto proxy connections.",
+                domain
+            );
+        } else {
+            println!("  Domain fronting: always (SNI {})", domain);
+        }
+    }
+
+    println!(
+        "  Max connections: {} (fd-limit: {})",
+        max_connections, fd_limit
+    );
+    // The text view: where it goes, and the two floors that decide what
+    // reaches it. Printed even when it is off, because "the console is silent"
+    // is the answer to a question an operator asks by starting the proxy.
+    let settings = config.log_settings();
+    println!(
+        "  Text log:      {} (text {}, ring {} ×{})",
+        settings.text_log.name(),
+        settings.text.name(),
+        settings.ring.name(),
+        settings.ring_capacity,
+    );
+
+    match &config.log_dir {
+        None => println!(
+            "  Log sink:      none — records are not written to disk (--log-dir keeps them)"
+        ),
+        Some(dir) => {
+            let options = config.log_options();
+            let retention = match options.retention_days {
+                0 => "keep all".to_string(),
+                days => format!("{days} days"),
+            };
+            // The filesystem, not just the path: which one the directory landed
+            // on is the difference between a stick that works and one that has
+            // to be re-formatted, and between a log file and a slice of RAM.
+            let filesystem = log::storage::filesystem_name(dir);
+            println!(
+                "  Log sink:      {} ({}, compression {}, durability {}{})",
+                dir.display(),
+                retention,
+                config.log_compress,
+                config.log_durability,
+                filesystem
+                    .as_deref()
+                    .map(|name| format!(", {name}"))
+                    .unwrap_or_default()
+            );
+            // What it costs, from the measurement in the implementation plan's
+            // §5.1: a record is ~44 B, a client connection writes about one of
+            // them at the default level and about four with `--log-level
+            // debug`, and an idle process writes the descriptor snapshot once
+            // a minute.
+            println!(
+                "  Log volume:    ~44 B/record · ~1 record per client connection (~4 at debug)"
+            );
+            println!(
+                "                 1 000 connections/day ≈ 0.3 MB/week (debug 1.2 MB) · \
+             idle ≈ 1 MB/week · zstd-l1 ≈ 2× smaller"
+            );
+            if filesystem.as_deref() == Some("tmpfs") {
+                println!(
+                    "  ⚠  --log-dir is on tmpfs: the log lives in RAM, and --log-retention is \
+                 the only thing bounding it"
+                );
+            }
+            // Retention is a sweep by file name, so an absurd value deletes
+            // nothing rather than failing — worth saying out loud, not worth
+            // refusing.
+            if options.retention_days > RETENTION_WARN_DAYS {
+                println!(
+                    "  ⚠  --log-retention {} days keeps every segment in practice",
+                    options.retention_days
+                );
+            }
+        }
+    }
+    println!("{}", "=".repeat(60));
+    println!("  Telegram proxy link (use this on all devices):");
+    println!("    {}", tg_link);
+    if config.secrets.len() > 1 {
+        println!("  Additional per-user proxy links:");
+        for secret in &config.secrets[1..] {
+            let link_secret = config.link_secret_for(secret);
+            println!(
+                "    tg://proxy?server={}&port={}&secret={}",
+                link_host, listen_port, link_secret
+            );
+        }
+    }
+
+    if link_host != bind_host.as_str() {
+        println!(
+            "  ℹ  Link uses auto-detected IP {}. \
+             Use --link-ip <IP> to override.",
+            link_host
+        );
+    } else if matches!(bind_host.as_str(), "127.0.0.1" | "::1") {
+        println!(
+            "  ⚠  Link shows {} — only the local machine can use this link. \
+             Run with --host 0.0.0.0 (or --link-ip <router-LAN-IP>) \
+             so other devices on the network can connect.",
+            bind_host
+        );
+    }
+
+    tg_link
 }
 
 async fn serve(
     mut config: Config,
     shutdown: impl Future<Output = ShutdownSignal> + Send,
     on_listen: impl FnOnce(ListenInfo) + Send,
-    log: Option<&Arc<LogHandle>>,
+    log: &Arc<LogHandle>,
 ) -> Result<(), RunError> {
     install_crypto_provider();
 
@@ -255,7 +496,7 @@ async fn serve(
                 // so there is no "proxy stopped" to record — the run never got
                 // that far.
                 log::emit_global(
-                    log,
+                    Some(log),
                     Category::Config,
                     Level::Info,
                     Event::Shutdown(Shutdown {
@@ -287,7 +528,10 @@ async fn serve(
         if let Some(pos) = tiers.iter().position(|t| *t == UpstreamTier::Tcp)
             && pos + 1 != tiers.len()
         {
-            warn!(
+            // Not a record and not part of the banner either: this is a
+            // configuration mistake, and it is the same line whether or not a
+            // log was asked for.
+            crate::direct!(
                 "{flag}: tcp is a terminal tier — everything listed after it \
                  ({}) is never reached",
                 tiers[pos + 1..]
@@ -344,11 +588,13 @@ async fn serve(
         Some(n) => {
             let safe = auto_max_connections(fd_limit, config.pool_size, dc_buckets);
             if n > safe {
-                warn!(
+                crate::direct!(
                     "max-connections={} may exceed the safe limit for this system's \
                      FD budget (fd-limit={}, recommended ≤{}). \
                      Consider raising `ulimit -n` or reducing --max-connections.",
-                    n, fd_limit, safe
+                    n,
+                    fd_limit,
+                    safe
                 );
             }
             n
@@ -357,211 +603,13 @@ async fn serve(
     };
 
     // ── Print startup banner ──────────────────────────────────────────────
-    let secret = config.primary_secret();
+    let tg_link = print_banner(&config, &runtime, listen_port, max_connections, fd_limit);
 
-    let link_host = config.link_host();
-    let tg_link = format!(
-        "tg://proxy?server={}&port={}&secret={}",
-        link_host,
-        listen_port,
-        config.link_secret()
-    );
-
-    info!("{}", "=".repeat(60));
-    info!(
-        "  Telegram MTProto WS Bridge Proxy  (tg-ws-proxy-rs v{})",
-        env!("CARGO_PKG_VERSION")
-    );
-    info!("  Listening on   {}:{}", bind_host, listen_port);
-    info!("  Secret:        {}", secret);
-    if let Some(domain) = config.listen_faketls_domain() {
-        info!("  Inbound mode:   FakeTLS ee (SNI: {})", domain);
-    } else {
-        info!("  Inbound mode:   padded MTProto dd");
-    }
-    info!("  Target DC IPs:");
-    let mut dcs: Vec<_> = dc_redirects.iter().collect();
-    dcs.sort_by_key(|(k, _)| *k);
-    for (dc, ip) in &dcs {
-        info!("    DC{}: {}", dc, ip);
-    }
-
-    if config.skip_tls_verify {
-        info!("  ⚠  TLS certificate verification DISABLED");
-    }
-
-    if !config.cf_domains.is_empty() {
-        info!("  Cloudflare proxy domain(s):");
-        for d in &config.cf_domains {
-            info!("    {} (kws{{N}}.{} subdomains)", d, d);
-        }
-        if config.cf_balance && config.cf_domains.len() > 1 {
-            info!("    ⚖  CF balance mode: connections are round-robin'd across domains");
-        }
-    }
-
-    let cf_worker_domains = config.cf_worker_domains();
-    if !cf_worker_domains.is_empty() {
-        info!("  Cloudflare Worker domain(s):");
-        for domain in cf_worker_domains {
-            info!("    {}", domain);
-        }
-    }
-
-    if config.cf_disable_tls && (!config.cf_domains.is_empty() || !cf_worker_domains.is_empty()) {
-        warn!(
-            "  ⚠  CF transport: plaintext ws:// on port 80 — the obfuscated MTProto stream is \
-             on the wire in the clear: every frame's auth_key_id is readable and the \
-             obfuscation is recoverable from captured bytes (#123), so connections are \
-             identifiable. Route media through these tiers, not text."
-        );
-    }
-    if !config.pinned_upstreams.is_empty() || !config.pinned_media_upstreams.is_empty() {
-        info!("  Pinned upstream order (default ladder is used for the rest):");
-        let names = |tiers: &[UpstreamTier]| {
-            tiers
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        if !config.pinned_upstreams.is_empty() {
-            info!("    non-media: {}", names(&config.pinned_upstreams));
-        }
-        if !config.pinned_media_upstreams.is_empty() {
-            info!("    media: {}", names(&config.pinned_media_upstreams));
-        } else if !config.pinned_upstreams.is_empty() {
-            info!("    media: inherits non-media pin above");
-        }
-    }
-
-    if !config.cf_ips.is_empty() {
-        info!(
-            "  Cloudflare preferred IP(s): {}",
-            config
-                .cf_ips
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        if config.cf_domains.is_empty() && cf_worker_domains.is_empty() {
-            warn!(
-                "  ⚠  --cf-ip has no effect: no --cf-domain, --default-domains, \
-                 or --cf-worker-domain route is configured"
-            );
-        }
-    }
-
-    if !config.mtproto_proxies.is_empty() {
-        info!("  Upstream MTProto proxies (WS fallback):");
-        for p in &config.mtproto_proxies {
-            info!("    {}:{}", p.host, p.port);
-        }
-    }
-
-    if let Some(summary) = runtime.outbound().summary() {
-        info!("  Outbound proxy: {}", summary);
-    }
-
-    if let Some(domain) = runtime.fronting_domain() {
-        if dc_redirects.is_empty() {
-            warn!(
-                "  ⚠  --fronting-domain {} has no effect: no --dc-ip is configured. \
-                 Fronting only applies to a direct connection to a DC's real IP \
-                 (matching upstream tg-ws-proxy) — it is never used for CF proxy, \
-                 CF Worker, or upstream MTProto proxy connections.",
-                domain
-            );
-        } else {
-            info!("  Domain fronting: always (SNI {})", domain);
-        }
-    }
-
-    info!(
-        "  Max connections: {} (fd-limit: {})",
-        max_connections, fd_limit
-    );
-    if let Some(dir) = &config.log_dir {
-        let options = config.log_options();
-        let retention = match options.retention_days {
-            0 => "keep all".to_string(),
-            days => format!("{days} days"),
-        };
-        // The filesystem, not just the path: which one the directory landed on
-        // is the difference between a stick that works and one that has to be
-        // re-formatted, and between a log file and a slice of RAM.
-        let filesystem = log::storage::filesystem_name(dir);
-        info!(
-            "  Log sink:      {} ({}, compression {}, durability {}{})",
-            dir.display(),
-            retention,
-            config.log_compress,
-            config.log_durability,
-            filesystem
-                .as_deref()
-                .map(|name| format!(", {name}"))
-                .unwrap_or_default()
-        );
-        // What it costs, from the measurement in the implementation plan's
-        // §5.1: a record is ~44 B, a client connection writes about one of them
-        // at the default level and about four with `--log-level debug`, and an
-        // idle process writes the descriptor snapshot once a minute.
-        info!("  Log volume:    ~44 B/record · ~1 record per client connection (~4 at debug)");
-        info!(
-            "                 1 000 connections/day ≈ 0.3 MB/week (debug 1.2 MB) · \
-             idle ≈ 1 MB/week · zstd-l1 ≈ 2× smaller"
-        );
-        if filesystem.as_deref() == Some("tmpfs") {
-            warn!(
-                "  ⚠  --log-dir is on tmpfs: the log lives in RAM, and --log-retention is the \
-                 only thing bounding it"
-            );
-        }
-        // Retention is a sweep by file name, so an absurd value deletes nothing
-        // rather than failing — worth saying out loud, not worth refusing.
-        if options.retention_days > RETENTION_WARN_DAYS {
-            warn!(
-                "  ⚠  --log-retention {} days keeps every segment in practice",
-                options.retention_days
-            );
-        }
-    }
-    info!("{}", "=".repeat(60));
-    info!("  Telegram proxy link (use this on all devices):");
-    info!("    {}", tg_link);
-    if config.secrets.len() > 1 {
-        info!("  Additional per-user proxy links:");
-        for secret in &config.secrets[1..] {
-            let link_secret = config.link_secret_for(secret);
-            info!(
-                "    tg://proxy?server={}&port={}&secret={}",
-                link_host, listen_port, link_secret
-            );
-        }
-    }
-
-    if link_host != bind_host {
-        info!(
-            "  ℹ  Link uses auto-detected IP {}. \
-             Use --link-ip <IP> to override.",
-            link_host
-        );
-    } else if matches!(bind_host.as_str(), "127.0.0.1" | "::1") {
-        warn!(
-            "  ⚠  Link shows {} — only the local machine can use this link. \
-             Run with --host 0.0.0.0 (or --link-ip <router-LAN-IP>) \
-             so other devices on the network can connect.",
-            bind_host
-        );
-    }
-    info!("{}", "=".repeat(60));
-
-    // ── The banner as one record ──────────────────────────────────────────
-    // Written once, and only when the sink is on: it is how a segment says
-    // which configuration produced the sessions in it, months later, on a
-    // device whose console output nobody kept.
-    if let Some(handle) = &log {
+    // ── The same banner as one record ─────────────────────────────────────
+    // The printed banner above is for whoever is watching; this is for the
+    // segment, which is how a log says months later which configuration
+    // produced the sessions in it when nobody kept the console output.
+    {
         let mut dc_ips: Vec<DcIp> = dc_redirects
             .iter()
             .map(|(dc, ip)| DcIp {
@@ -579,10 +627,10 @@ async fn serve(
 
         let version = env!("CARGO_PKG_VERSION").to_string();
         let listen = format!("{bind_host}:{listen_port}");
-        let tiers = configured_tiers(&config, cf_worker_domains);
+        let tiers = configured_tiers(&config, config.cf_worker_domains());
 
         log::emit_global(
-            Some(handle),
+            Some(log),
             Category::Config,
             Level::Info,
             Event::StartupSummary(crate::log::schema::StartupSummary {
@@ -607,7 +655,7 @@ async fn serve(
             Duration::from_secs(config.pool_max_age),
             Arc::clone(&runtime),
         )
-        .with_log(log.cloned()),
+        .with_log(Some(Arc::clone(log))),
     );
     // Shared for the rest of the process: every connection reads the same
     // settings, so they are behind one `Arc` instead of a per-connection clone.
@@ -631,10 +679,10 @@ async fn serve(
     let _check_keep = if config.check {
         let config = Arc::clone(&config);
         let runtime = Arc::clone(&runtime);
-        let log = log.cloned();
+        let log = Arc::clone(log);
         tokio::spawn(async move {
             let all_ok =
-                run_check_logged(&config, runtime.outbound(), Some(bound_addr), log.as_ref()).await;
+                run_check_logged(&config, runtime.outbound(), Some(bound_addr), &log).await;
             let _ = check_tx.send(all_ok);
         });
         None
@@ -654,16 +702,16 @@ async fn serve(
     const ENFILE: i32 = 23; // file table overflow (system-wide fd limit)
     let semaphore = Arc::new(Semaphore::new(max_connections));
     // One clone for the loop: each accepted connection needs its own handle to
-    // plant in its task, and the option itself is borrowed from the caller.
-    let log = log.cloned();
+    // plant in its task, and the caller's reference is only borrowed.
+    let log = Arc::clone(log);
 
     // ── Descriptor snapshot (EVT:fd_snapshot) ─────────────────────────────
     // A task of its own rather than a branch in the selects below: the first
     // select blocks when the process is at its connection limit, which is the
     // one moment a descriptor count is interesting. Aborted with the loop, so
     // an embedder that starts and stops servers does not accumulate timers.
-    let snapshot = log.as_ref().map(|handle| {
-        let handle = Arc::clone(handle);
+    let snapshot = {
+        let handle = Arc::clone(&log);
         let semaphore = Arc::clone(&semaphore);
         let soft_limit = fd_limit.min(u32::MAX as usize) as u32;
         tokio::spawn(log::scope_global(handle, async move {
@@ -684,7 +732,7 @@ async fn serve(
                 );
             }
         }))
-    });
+    };
 
     // Which signal ended the run, when one did: the record of the stop is
     // written after the loop, because a stop is two facts — it was asked for,
@@ -735,12 +783,7 @@ async fn serve(
                             // off the ~110 call sites below this one.  Scoping the
                             // whole future — including the tasks it spawns — is the
                             // only place it has to be set up.
-                            match &log {
-                                Some(handle) => {
-                                    log::scope(handle.next_conn_id(), Arc::clone(handle), client).await
-                                }
-                                None => client.await,
-                            }
+                            log::scope(log.next_conn_id(), log, client).await
                         });
                     }
                     Err(e) => {
@@ -755,29 +798,15 @@ async fn serve(
                             // `Resource` would claim a budget problem that is not there.
                             (50, ErrorCode::Unspecified)
                         };
-                        if let Some(handle) = &log {
-                            let errno = e.raw_os_error().unwrap_or(0);
-                            log::scope_global(Arc::clone(handle), async {
-                                log_event!(Category::Accept, Level::Warn, Event::AcceptError {
-                                    errno,
-                                    backoff_ms,
-                                    err: code as i32,
-                                });
-                            })
-                            .await;
-                        }
-                        // The record above is the line an operator reads. Until
-                        // the pipeline exists without `--log-dir` (stage 5) a run
-                        // with no sink would otherwise swallow the accept loop's
-                        // own errors entirely, so the console line stays for that
-                        // case only.
-                        if log.is_none() {
-                            if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
-                                warn!("accept error: {} — backing off to allow FDs to free", e);
-                            } else {
-                                error!("accept error: {}", e);
-                            }
-                        }
+                        let errno = e.raw_os_error().unwrap_or(0);
+                        log::scope_global(Arc::clone(&log), async {
+                            log_event!(Category::Accept, Level::Warn, Event::AcceptError {
+                                errno,
+                                backoff_ms,
+                                err: code as i32,
+                            });
+                        })
+                        .await;
 
                         tokio::time::sleep(Duration::from_millis(u64::from(backoff_ms))).await;
                     }
@@ -786,9 +815,7 @@ async fn serve(
         }
     }
 
-    if let Some(task) = snapshot {
-        task.abort();
-    }
+    snapshot.abort();
 
     if let Some(all_ok) = check_ok {
         return if all_ok {
@@ -800,7 +827,7 @@ async fn serve(
 
     if let Some(signal) = stop_signal {
         log::emit_global(
-            log.as_ref(),
+            Some(&log),
             Category::Config,
             Level::Info,
             Event::Shutdown(Shutdown {
@@ -811,7 +838,7 @@ async fn serve(
     }
 
     log::emit_global(
-        log.as_ref(),
+        Some(&log),
         Category::Config,
         Level::Info,
         Event::Shutdown(Shutdown {
@@ -829,7 +856,7 @@ async fn serve(
 /// the community list, and a fallback quietly in use is how a proxy ends up
 /// dialling domains nobody maintains. The failure class says which it was —
 /// GitHub unreachable, or a list that parsed to nothing.
-fn log_domain_list(log: Option<&Arc<LogHandle>>, fetched: &Fetched) {
+fn log_domain_list(log: &Arc<LogHandle>, fetched: &Fetched) {
     let (err, err_code) = match &fetched.failure {
         Some(failure) => (failure.err as i32, failure.err_code),
         None => (ErrorCode::Unspecified as i32, 0),
@@ -842,7 +869,7 @@ fn log_domain_list(log: Option<&Arc<LogHandle>>, fetched: &Fetched) {
     };
 
     log::emit_global(
-        log,
+        Some(log),
         Category::Config,
         level,
         Event::DomainListFetched(DomainListFetched {

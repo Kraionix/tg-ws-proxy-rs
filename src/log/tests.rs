@@ -1418,7 +1418,7 @@ async fn sigusr1_prints_the_ring_through_the_text_sink() {
     // Text off, ring on: the only text this run writes is the dump, so a line
     // in the file cannot be anything else.
     let settings = text_into(&path, Filter::off(), Filter::at(Level::Info));
-    let handle = init(dir.path(), settings, Options::default()).expect("the sink starts");
+    let handle = init(Some(dir.path()), settings, Options::default()).expect("the sink starts");
 
     for dc in 1..=3 {
         handle.emit(1, Category::Routing, Level::Info, pool_hit(dc));
@@ -2079,7 +2079,7 @@ fn init_starts_a_writable_segment_from_the_public_entry_point() {
     let day = storage::today();
 
     let handle = runtime
-        .block_on(async { init(dir.path(), Settings::default(), Options::default()) })
+        .block_on(async { init(Some(dir.path()), Settings::default(), Options::default()) })
         .expect("the sink starts");
     handle.emit(1, Category::Accept, Level::Info, pool_hit(2));
     runtime.block_on(handle.shutdown());
@@ -2092,6 +2092,61 @@ fn init_starts_a_writable_segment_from_the_public_entry_point() {
             .sum::<usize>(),
         1
     );
+}
+
+#[test]
+fn without_a_directory_the_records_still_reach_the_text() {
+    // What an unset `--log-dir` means: the pipeline runs, the sink keeps
+    // nothing, and the text view is the whole of what the records are for.
+    let runtime = unpolled_runtime();
+    let dir = TempDir::new("memory-sink");
+    let path = dir.path().join("text.log");
+    let settings = text_into(&path, Filter::at(Level::Info), Filter::off());
+
+    let handle = runtime
+        .block_on(async { init(None, settings, Options::default()) })
+        .expect("the pipeline starts without a directory");
+    handle.emit(1, Category::Accept, Level::Info, pool_hit(2));
+    runtime.block_on(handle.shutdown());
+
+    let text = fs::read_to_string(&path).expect("the text log is readable");
+    assert!(text.contains("pool hit"), "{text}");
+
+    // And nothing else appeared beside it: a sink that keeps nothing must not
+    // be a sink that quietly writes somewhere.
+    let files: Vec<_> = fs::read_dir(dir.path())
+        .expect("the temp dir")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "text.log")
+        .collect();
+    assert!(files.is_empty(), "{files:?}");
+}
+
+#[tokio::test]
+async fn the_text_floor_is_the_text_views_own_policy() {
+    // The producer gate is the union of three consumers, so a record the
+    // segment alone asked for is *enabled* and still must not be printed.
+    let (sink, _shared, _batches) = recording();
+    let settings = Settings {
+        disk: [Filter::at(Level::Debug); CATEGORY_COUNT],
+        text: Filter::at(Level::Info),
+        ring: Filter::off(),
+        text_log: TextTarget::Off,
+        ..quiet(DEFAULT_BATCH_MAX)
+    };
+    let handle = start(sink, settings);
+
+    assert!(
+        handle.enabled(Category::Session, Level::Debug),
+        "the segment asked for debug"
+    );
+    assert!(
+        !handle.text_keeps(Level::Debug),
+        "the text view did not, so a console line at debug is not printed"
+    );
+    assert!(handle.text_keeps(Level::Info));
+    assert!(handle.text_keeps(Level::Error), "a floor is not a ceiling");
 }
 
 #[test]

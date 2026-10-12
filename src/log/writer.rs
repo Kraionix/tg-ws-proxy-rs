@@ -18,7 +18,6 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
-use tracing::warn;
 
 use super::schema::{Category, Event, Level, LogBatch, LogOverflow, LogRecord, build_batch};
 use super::view::View;
@@ -31,6 +30,21 @@ use super::{CATEGORY_COUNT, Counters, Filter, Settings, now_ns};
 /// grow its buffer.
 pub(crate) trait BatchSink: Send {
     fn write(&mut self, batch: &LogBatch) -> Result<(), WriterError>;
+}
+
+/// The sink a run without `--log-dir` gets: records reach the writer, the
+/// text view and the ring, and stop there.
+///
+/// It is a sink rather than a second code path because everything above it —
+/// batching, the flush timer, the overflow report — is the same work whatever
+/// happens to the batch, and a run that switched those off would be a run whose
+/// log behaves differently depending on where it is going.
+pub(super) struct MemorySink;
+
+impl BatchSink for MemorySink {
+    fn write(&mut self, _batch: &LogBatch) -> Result<(), WriterError> {
+        Ok(())
+    }
 }
 
 /// A sink refused a batch. The records in it are lost — the sink's own retry
@@ -194,10 +208,13 @@ impl<S: BatchSink> Task<S> {
         self.report_overflow(view);
         if let Err(error) = self.writer.flush() {
             self.failures += 1;
-            warn!(
-                failures = self.failures,
-                error = %error,
-                "log sink write failed, batch dropped"
+            // Not a record: this is the sink the record would have been
+            // written to saying it could not write. The count is in the line
+            // because the first failure is the interesting one and the
+            // thousandth is the same failure.
+            crate::direct!(
+                "log sink write failed ({} so far), batch dropped: {error}",
+                self.failures
             );
         }
     }

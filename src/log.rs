@@ -4,13 +4,16 @@
 //!
 //! The text a human reads is a *projection* of these records, not a parallel
 //! stream: [`render`] turns one record into one console line and [`view`] writes
-//! them to a terminal or a file, so the two can no longer drift apart. What is
-//! still true of `tracing` is that it has nowhere to go on a router and dies
-//! with the process; what is left of it after stage 4 is the startup banner and
-//! the lines about connections that never became sessions.
+//! them to a terminal or a file, so the two can no longer drift apart. The
+//! pipeline runs whether or not `--log-dir` is set — without one the sink keeps
+//! nothing and the text log is the whole of what the records are for.
 //!
-//! The subsystem is only started when `--log-dir` is set (stage 5 makes the
-//! pipeline unconditional, with an in-memory sink when there is no directory).
+//! Three things are deliberately *not* records, because they cannot be: the
+//! startup banner (it carries the `tg://` links and is printed before anything
+//! else exists), the log's own failures (a broken sink cannot report through
+//! itself), and the lines of other crates (`rustls`, `tungstenite`), which have
+//! no schema of ours to be a variant of. [`direct!`] is how those are written:
+//! one `tg-ws-proxy:`-prefixed line to stderr, never gated by a level.
 //!
 //! [`schema`] is the wire format, written by hand rather than generated: the
 //! build has no `protoc` and no `build.rs`, and `prost`'s derives give a
@@ -309,6 +312,13 @@ impl LogHandle {
         self.disk[index].keeps(level) || self.text.keeps(level) || self.ring.keeps(level)
     }
 
+    /// True when the *text view* would render a record at this level. Its own
+    /// policy, not the union: a line the segment alone asked for is not a line
+    /// to print.
+    pub fn text_keeps(&self, level: Level) -> bool {
+        self.text.keeps(level)
+    }
+
     /// Next session id, allocated once per accepted connection. Never zero,
     /// which is what makes `conn_id == 0` readable as "not a session".
     pub fn next_conn_id(&self) -> u64 {
@@ -423,21 +433,34 @@ fn start<S: writer::BatchSink + 'static>(
 /// Starts the subsystem: opens today's segment under `dir` and the writer task
 /// behind it, or reports why it could not.
 ///
+/// `dir` is the only optional part. Without one the records go nowhere but the
+/// text view and the ring — the pipeline itself is unconditional, because the
+/// text a human reads is a projection of it and a run without a segment is
+/// still a run somebody has to be able to read.
+///
 /// This is the only fallible step in the module, and it is fallible for exactly
-/// one reason: the sink. A directory that cannot be created, a filesystem that
-/// cannot carry a segment, another process already writing today's file — all
-/// of them are startup errors with an exit code, which is what lets the caller
-/// refuse to run rather than run without logs. Everything after this point
-/// degrades instead: a write that fails later is a backoff and a warning.
+/// one reason: a destination. A directory that cannot be created, a filesystem
+/// that cannot carry a segment, another process already writing today's file, a
+/// text log that cannot be opened — all of them are startup errors with an exit
+/// code, which is what lets the caller refuse to run rather than run without
+/// logs. Everything after this point degrades instead: a write that fails later
+/// is a backoff and a warning.
 ///
 /// Must be called from within a Tokio runtime — the writer is a spawned task.
 pub fn init(
-    dir: &Path,
+    dir: Option<&Path>,
     settings: Settings,
     options: storage::Options,
 ) -> Result<Arc<LogHandle>, LogError> {
-    let sink = storage::FileSink::open(dir, options)?;
-    let handle = Arc::new(start(sink, settings)?);
+    let handle = match dir {
+        Some(dir) => {
+            let sink = storage::FileSink::open(dir, options)?;
+            start(sink, settings)?
+        }
+        None => start(writer::MemorySink, settings)?,
+    };
+
+    let handle = Arc::new(handle);
     dump_on_usr1(Arc::clone(&handle));
     Ok(handle)
 }
@@ -541,6 +564,49 @@ pub fn enabled(category: Category, level: Level) -> bool {
     LOG_CTX
         .try_with(|ctx| ctx.handle.enabled(category, level))
         .unwrap_or(false)
+}
+
+/// True when the *text view* renders records at `level` and above.
+///
+/// The producer gate is the union of three policies; this is one of them, and
+/// it is the one that governs the few console lines that are not records — a
+/// handshake refused before a session existed. Without a scope, or with the
+/// text log off, nothing is written.
+pub fn text_keeps(level: Level) -> bool {
+    LOG_CTX
+        .try_with(|ctx| ctx.handle.text_keeps(level))
+        .unwrap_or(false)
+}
+
+/// Writes one line that is not a record: stderr, one write, `tg-ws-proxy:` in
+/// front of it.
+///
+/// The prefix is what tells a reader which lines came from this process rather
+/// than from a record's own rendering, and it is the same prefix the Android
+/// shim tags logcat with. Never gated by a level: what uses this either has
+/// nowhere else to go (a sink that failed) or has already decided
+/// ([`direct_at!`]).
+#[macro_export]
+macro_rules! direct {
+    ($($arg:tt)*) => {
+        eprintln!("tg-ws-proxy: {}", format_args!($($arg)*))
+    };
+}
+
+/// [`direct!`] for a line that belongs to no session but would be a record at
+/// `level` if it did — the refused-handshake diagnostics.
+///
+/// They follow the text view's floor rather than a policy of their own: at the
+/// default `info` a port scanner leaves nothing behind, and at
+/// `--text-level debug` the operator gets exactly the lines `--verbose` used to
+/// print.
+#[macro_export]
+macro_rules! direct_at {
+    ($level:expr, $($arg:tt)*) => {
+        if $crate::log::text_keeps($level) {
+            $crate::direct!($($arg)*)
+        }
+    };
 }
 
 /// Logs one structured event, if the current scope's filter keeps it.

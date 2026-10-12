@@ -35,9 +35,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::task::JoinHandle;
-use tracing::debug;
 use tungstenite::Message;
 
+use crate::direct_at;
 use crate::log::schema::{
     Category, ClosedBy as LogClosedBy, CooldownKind, Ctx, ErrorCode, Level, Peer,
     Reason as LogReason, Tier as LogTier,
@@ -225,28 +225,29 @@ async fn accept_inbound_faketls(
         .await
         .ok()??;
     if record[0] != TLS_RECORD_HANDSHAKE || record[1..3] != [0x03, 0x01] {
-        debug!("[{}] bad FakeTLS ClientHello record", label);
+        direct_at!(Level::Debug, "[{label}] bad FakeTLS ClientHello record");
         return None;
     }
 
     let Some((hello, matched_secret)) = secrets.iter().find_map(|secret| {
         parse_faketls_client_hello(&record, secret).map(|hello| (hello, secret))
     }) else {
-        debug!("[{}] bad FakeTLS ClientHello digest", label);
+        direct_at!(Level::Debug, "[{label}] bad FakeTLS ClientHello digest");
         return None;
     };
 
     if hello.hostname.as_deref() != Some(expected_domain) {
-        debug!(
-            "[{}] FakeTLS SNI mismatch: got {:?}, expected {}",
-            label, hello.hostname, expected_domain
+        direct_at!(
+            Level::Debug,
+            "[{label}] FakeTLS SNI mismatch: got {:?}, expected {expected_domain}",
+            hello.hostname
         );
         return None;
     }
 
     let server_hello = build_faketls_server_hello(matched_secret, &hello);
     if let Err(e) = writer.write_all(&server_hello).await {
-        debug!("[{}] write FakeTLS ServerHello: {}", label, e);
+        direct_at!(Level::Debug, "[{label}] write FakeTLS ServerHello: {e}");
         return None;
     }
 
@@ -372,7 +373,7 @@ pub async fn handle_client_with_runtime(
         Ok(Some(result)) => result,
         Ok(None) => return,
         Err(_) => {
-            debug!("[{}] handshake timeout", label);
+            direct_at!(Level::Debug, "[{label}] handshake timeout");
             return;
         }
     };
@@ -394,9 +395,9 @@ pub async fn handle_client_with_runtime(
         .iter()
         .find_map(|secret| parse_handshake(&handshake_buf, secret).map(|i| (i, secret.as_slice())))
     else {
-        debug!(
-            "[{}] bad handshake (wrong secret or reserved prefix)",
-            label
+        direct_at!(
+            Level::Debug,
+            "[{label}] bad handshake (wrong secret or reserved prefix)"
         );
 
         // Drain the connection silently to avoid giving information to scanners.
@@ -2492,7 +2493,7 @@ async fn read_inbound_handshake(
     match reader.read_exact(&mut handshake_buf).await {
         Ok(_) => Some((handshake_buf, PendingData::default())),
         Err(e) => {
-            debug!("[{}] read handshake: {}", label, e);
+            direct_at!(Level::Debug, "[{label}] read handshake: {e}");
             None
         }
     }

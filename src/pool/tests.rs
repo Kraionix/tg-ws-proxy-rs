@@ -87,7 +87,7 @@ async fn a_miss_is_recorded_against_the_pool_rather_than_the_caller() {
     .unwrap()
     .with_defaults();
 
-    let handle = crate::log::init(&dir, config.log_settings(), config.log_options())
+    let handle = crate::log::init(Some(&dir), config.log_settings(), config.log_options())
         .expect("a writable temp dir accepts a segment");
     let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
     let pool = Arc::new(
@@ -189,7 +189,7 @@ async fn discards_warmup_and_refills_are_recorded() {
     .unwrap()
     .with_defaults();
 
-    let handle = crate::log::init(&dir, config.log_settings(), config.log_options())
+    let handle = crate::log::init(Some(&dir), config.log_settings(), config.log_options())
         .expect("a writable temp dir accepts a segment");
     let pool = Arc::new(
         WsPool::with_runtime(

@@ -28,12 +28,11 @@ async fn the_domain_list_records_where_it_came_from() {
     ])
     .expect("the fixture parses");
 
-    let handle = log::init(&dir, config.log_settings(), config.log_options())
+    let handle = log::init(Some(&dir), config.log_settings(), config.log_options())
         .expect("a writable temp dir accepts a segment");
-    let handle = Some(&handle);
 
     log_domain_list(
-        handle,
+        &handle,
         &Fetched {
             domains: vec!["a.co.uk".to_string(), "b.co.uk".to_string()],
             source: DomainSource::Github,
@@ -41,7 +40,7 @@ async fn the_domain_list_records_where_it_came_from() {
         },
     );
     log_domain_list(
-        handle,
+        &handle,
         &Fetched {
             domains: vec!["c.co.uk".to_string()],
             source: DomainSource::Builtin,
@@ -53,9 +52,7 @@ async fn the_domain_list_records_where_it_came_from() {
         },
     );
 
-    if let Some(handle) = handle {
-        handle.shutdown().await;
-    }
+    handle.shutdown().await;
 
     let day = std::fs::read_dir(&dir)
         .expect("the segment directory")

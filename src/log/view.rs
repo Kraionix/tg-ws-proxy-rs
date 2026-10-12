@@ -122,6 +122,17 @@ impl TextTarget {
     pub fn is_off(&self) -> bool {
         matches!(self, Self::Off)
     }
+
+    /// What the banner prints in the `Text log:` line: `off`, `stderr`,
+    /// `stdout`, or the path itself.
+    pub fn name(&self) -> String {
+        match self {
+            Self::Off => "off".to_string(),
+            Self::Stderr => "stderr".to_string(),
+            Self::Stdout => "stdout".to_string(),
+            Self::File(path) => path.display().to_string(),
+        }
+    }
 }
 
 impl std::fmt::Display for TextTarget {

@@ -325,6 +325,26 @@ fn parse_log_batch_max(value: &str) -> Result<usize, String> {
     }
 }
 
+/// `--ring-capacity`: the RAM the ring is allowed, in records.
+///
+/// The view clamps as well, but an explicit out-of-range value is a mistake
+/// worth a message that names the bounds rather than a silent 512.
+fn parse_ring_capacity(value: &str) -> Result<usize, String> {
+    let records: usize = value
+        .parse()
+        .map_err(|_| format!("expected a record count, got {value:?}"))?;
+
+    if (log::view::TEXT_RING_MIN..=log::view::TEXT_RING_MAX).contains(&records) {
+        Ok(records)
+    } else {
+        Err(format!(
+            "must be between {} and {}",
+            log::view::TEXT_RING_MIN,
+            log::view::TEXT_RING_MAX
+        ))
+    }
+}
+
 /// `--log-flush-interval` in seconds.
 ///
 /// Zero is refused rather than read as "flush on size only": the writer arms a
@@ -426,8 +446,10 @@ pub struct Config {
     #[arg(long = "max-connections", env = "TG_MAX_CONNECTIONS")]
     pub max_connections: Option<usize>,
 
-    /// Enable verbose (DEBUG) logging.
-    #[arg(short, long, env = "TG_VERBOSE")]
+    /// Raise the text log to DEBUG. Legacy alias for `--text-level debug`,
+    /// hidden because the Android app's argument field and its contract tests
+    /// still pass it; `--text-level` wins when both are given.
+    #[arg(short, long, env = "TG_VERBOSE", hide = true)]
     pub verbose: bool,
 
     /// Skip TLS certificate verification when connecting to Telegram.
@@ -436,25 +458,23 @@ pub struct Config {
     #[arg(long = "danger-accept-invalid-certs", env = "TG_SKIP_TLS_VERIFY")]
     pub skip_tls_verify: bool,
 
-    /// Suppress all log output (useful on routers / embedded devices).
-    /// Overrides `--verbose` when both are set.
-    #[arg(short = 'q', long, env = "TG_QUIET")]
+    /// Turn the text log off, which `--text-log off` also does. Legacy alias,
+    /// hidden because the Android app passes it by default; `--text-log` wins
+    /// when both are given. The startup banner is not affected — it is printed
+    /// by the process, not by the log.
+    #[arg(short = 'q', long, env = "TG_QUIET", hide = true)]
     pub quiet: bool,
 
-    /// Write log output to this file instead of stderr.
-    /// Log lines written to a file never contain ANSI color codes.
-    #[arg(long = "log-file", value_name = "PATH", env = "TG_LOG_FILE")]
-    pub log_file: Option<String>,
-
-    // ── Structured log sink (--log-*) ─────────────────────────────────────
-    // A second sink beside `tracing`, not a replacement: `--verbose`,
-    // `--quiet` and `--log-file` keep governing the console, and none of these
-    // has any effect until `--log-dir` is set.
-    /// Write structured events to one segment file per UTC day under this
+    // ── The record stream and its text projection ─────────────────────────
+    // One pipeline, two consumers: the segment on disk when `--log-dir` is
+    // set, and the text view, which renders the same records into the lines a
+    // human reads. `--log-dir` is the only one of these that decides whether
+    // anything is written to a file at all.
+    /// Write structured records to one segment file per UTC day under this
     /// directory, keeping `--log-retention` days of them.
     ///
-    /// Unset (the default) disables the structured sink completely: the banner,
-    /// the console output and `--log-file` are unchanged.
+    /// Unset (the default) keeps the records in memory only: the text log and
+    /// the ring still see every one of them, and nothing is written to disk.
     ///
     /// The directory is created when it is missing. It has to be on a
     /// filesystem that can hold a lock-protected database — ext4, xfs, btrfs,
@@ -463,10 +483,55 @@ pub struct Config {
     #[arg(long = "log-dir", value_name = "PATH", env = "TG_LOG_DIR")]
     pub log_dir: Option<PathBuf>,
 
-    /// Lowest level the structured sink records, for every category.
+    /// Where the rendered text goes: `stderr` (the default), `stdout`, `off`,
+    /// or a path, which is appended to and never truncated.
+    ///
+    /// The text is a projection of the same records that go to `--log-dir`, so
+    /// turning it off costs no facts — only the file's own copy of them. It is
+    /// also not affected by `--log-level`: the two consumers filter
+    /// independently, and each has its own floor.
+    #[arg(
+        long = "text-log",
+        value_name = "[stderr|stdout|off|PATH]",
+        env = "TG_TEXT_LOG"
+    )]
+    pub text_log: Option<String>,
+
+    /// Lowest level the text log renders, for every category.
+    ///
+    /// `debug` is what `--verbose` used to mean, and it is where the lines
+    /// about refused handshakes appear: they belong to no session and so are
+    /// not records, but they are written when the text log is at their level.
+    #[arg(long = "text-level", value_name = "LEVEL", env = "TG_TEXT_LEVEL")]
+    pub text_level: Option<LogLevel>,
+
+    /// Lowest level the RAM ring keeps, for the `SIGUSR1` dump.
+    ///
+    /// The ring is what `kill -USR1` prints: the last few hundred records, at
+    /// this floor, through the same sink as the text. `debug` makes a dump
+    /// after the fact worth taking — raise `--ring-capacity` with it.
+    #[arg(long = "ring-level", value_name = "LEVEL", env = "TG_RING_LEVEL")]
+    pub ring_level: Option<LogLevel>,
+
+    /// Records the RAM ring holds, from 64 to 4096.
+    ///
+    /// One record is well under 200 B, so the default is ~100 KB of a router's
+    /// memory; the build-time default is the same number and can be changed
+    /// with `TG_TEXT_RING=<N> cargo build`.
+    #[arg(
+        long = "ring-capacity",
+        value_name = "N",
+        value_parser = parse_ring_capacity,
+        env = "TG_RING_CAPACITY"
+    )]
+    pub ring_capacity: Option<usize>,
+
+    /// Lowest level the segment on disk records, for every category.
     ///
     /// A floor, not a ceiling: `warn` keeps warnings and errors and drops the
-    /// rest. Per-category exceptions belong in `--log-category`.
+    /// rest. Per-category exceptions belong in `--log-category`; the text log
+    /// and the ring have floors of their own (`--text-level`, `--ring-level`),
+    /// and a record is built if *any* of the three wants it.
     #[arg(
         long = "log-level",
         value_name = "LEVEL",
@@ -1140,16 +1205,10 @@ impl Config {
         let level = self.log_level.to_schema();
         let mut settings = log::Settings {
             disk: [log::Filter::at(level); log::CATEGORY_COUNT],
-            // The text view and the ring get their own flags with the CLI
-            // rework; until then both follow the global level, which is the
-            // widest policy either could ask for.
-            text: log::Filter::at(level),
-            ring: log::Filter::at(level),
-            // The text view renders to stderr by default and the ring is the
-            // size the RAM budget was computed against; both become flags with
-            // the CLI rework.
-            text_log: log::view::TextTarget::Stderr,
-            ring_capacity: log::view::TEXT_RING_DEFAULT,
+            text: log::Filter::at(self.text_floor()),
+            ring: log::Filter::at(self.ring_floor()),
+            text_log: self.text_destination(),
+            ring_capacity: self.ring_capacity.unwrap_or(log::view::TEXT_RING_DEFAULT),
             batch_max: self.log_batch_max,
             flush_interval: Duration::from_secs(self.log_flush_interval),
             flush_on_warn: self.log_flush_on_warn,
@@ -1160,6 +1219,42 @@ impl Config {
         }
 
         settings
+    }
+
+    /// The text view's floor: `--text-level`, or what `--verbose` used to ask
+    /// for, or the default.
+    fn text_floor(&self) -> log::schema::Level {
+        let level = match self.text_level {
+            Some(level) => level,
+            None if self.verbose => LogLevel::Debug,
+            None => LogLevel::Info,
+        };
+        level.to_schema()
+    }
+
+    /// The ring's floor. Nothing but `--ring-level` moves it: `--verbose` is
+    /// the console's old switch, and a ring that quietly grew with it would be
+    /// RAM the operator did not ask for.
+    fn ring_floor(&self) -> log::schema::Level {
+        self.ring_level.unwrap_or(LogLevel::Info).to_schema()
+    }
+
+    /// Where the text goes: `--text-log`, or what `--quiet` used to mean, or
+    /// stderr.
+    ///
+    /// `--check` is the one mode that overrides both: its report is the product
+    /// and goes to stdout, so a text log beside it would interleave two
+    /// unrelated streams in one window.
+    fn text_destination(&self) -> log::view::TextTarget {
+        if self.check {
+            return log::view::TextTarget::Off;
+        }
+
+        match &self.text_log {
+            Some(spec) => log::view::TextTarget::from_spec(spec),
+            None if self.quiet => log::view::TextTarget::Off,
+            None => log::view::TextTarget::Stderr,
+        }
     }
 
     /// The structured sink's on-disk policy: compression, durability and how
