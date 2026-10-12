@@ -39,8 +39,8 @@ use tracing::{debug, info, warn};
 use tungstenite::Message;
 
 use crate::log::schema::{
-    Category, ClosedBy as LogClosedBy, CooldownKind, ErrorCode, Level, Peer, Reason as LogReason,
-    Tier as LogTier,
+    Category, ClosedBy as LogClosedBy, CooldownKind, Ctx, ErrorCode, Level, Peer,
+    Reason as LogReason, Tier as LogTier,
 };
 use crate::log_event;
 
@@ -421,12 +421,14 @@ pub async fn handle_client_with_runtime(
 
     // The session's first record, and the only one that says where the client
     // came from: everything after it is about the route, not the caller.
+    //
+    // No rung yet — the ladder has not been walked — so the context names the DC
+    // and the media flag and leaves the tier unset.
     log_event!(
         Category::Session,
         Level::Debug,
         Event::SessionOpened {
-            dc: dc_id,
-            is_media,
+            ctx: Some(Ctx::new(dc_id, is_media, LogTier::Unspecified)),
             peer: Some(peer_of(label)),
         }
     );
@@ -2204,13 +2206,14 @@ fn log_session_closed(
         Category::Session,
         Level::Info,
         Event::SessionClosed {
-            dc,
-            is_media,
-            tier: LogTier::from(tier) as i32,
+            ctx: Some(Ctx::new(dc, is_media, LogTier::from(tier))),
             closed_by: closed_by.to_schema() as i32,
             bytes_up,
             bytes_down,
             dur_ms,
+            // The domain the session ran through, which the console line prints
+            // beside the address. Filled by the caller that knows it.
+            via: String::new(),
         }
     );
 }
@@ -2242,13 +2245,13 @@ fn log_tier_attempt(
         Category::Routing,
         Level::Debug,
         Event::TierAttempt {
-            tier: LogTier::from(tier) as i32,
-            dc,
-            is_media,
+            ctx: Some(Ctx::new(dc, is_media, LogTier::from(tier))),
+            host: String::new(),
             ok,
             dur_ns: dur.as_nanos().min(u64::MAX as u128) as u64,
             err,
             err_code,
+            errno: 0,
         }
     );
 }
@@ -2265,6 +2268,7 @@ fn log_tier_fallback(from: UpstreamTier, to: UpstreamTier, reason: LogReason) {
         Category::Routing,
         Level::Info,
         Event::TierFallback {
+            ctx: None,
             from_tier: LogTier::from(from) as i32,
             to_tier: LogTier::from(to) as i32,
             reason: reason as i32,
@@ -2293,6 +2297,7 @@ fn log_cooldown_armed(
         Category::Cooldown,
         Level::Info,
         Event::CooldownArmed {
+            ctx: None,
             kind: kind as i32,
             key_display: key_display.to_string(),
             dur_s: dur.as_secs().min(u32::MAX as u64) as u32,
@@ -2311,6 +2316,7 @@ fn log_cooldown_cleared(kind: CooldownKind, key_display: &str) {
         Category::Cooldown,
         Level::Debug,
         Event::CooldownCleared {
+            ctx: None,
             kind: kind as i32,
             key_display: key_display.to_string(),
         }
@@ -2323,6 +2329,7 @@ fn log_cooldown_skipped(kind: CooldownKind, key_display: &str) {
         Category::Cooldown,
         Level::Debug,
         Event::CooldownSkipped {
+            ctx: None,
             kind: kind as i32,
             key_display: key_display.to_string(),
         }

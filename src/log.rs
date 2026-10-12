@@ -120,14 +120,80 @@ impl std::error::Error for LogError {
     }
 }
 
-/// What the subsystem is configured with. Every field has a CLI flag behind it
-/// in a later stage; nothing here allocates.
+/// One consumer's level policy.
+///
+/// The stream has three consumers — the segment on disk, the text view and the
+/// RAM ring — and each has its own floor, so a single `Level` table is no
+/// longer enough to describe one. `Off` is a policy and not the absence of one:
+/// the producer gate is the union of the three, so a consumer nobody asked for
+/// must not be the reason a payload is built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filter {
+    /// Keeps nothing, whatever the level.
+    Off,
+    /// Keeps this level and everything above it.
+    At(Level),
+}
+
+impl Filter {
+    /// Keeps `level` and above.
+    pub const fn at(level: Level) -> Self {
+        Self::At(level)
+    }
+
+    /// Keeps nothing.
+    pub const fn off() -> Self {
+        Self::Off
+    }
+
+    /// True when this policy keeps nothing at all.
+    pub fn is_off(self) -> bool {
+        matches!(self, Self::Off)
+    }
+
+    /// The lowest level kept, or `None` when nothing is.
+    pub fn floor(self) -> Option<Level> {
+        match self {
+            Self::Off => None,
+            Self::At(level) => Some(level),
+        }
+    }
+
+    /// True when a record at `level` is kept: a floor, not a ceiling, so
+    /// `warn` keeps warnings and errors and drops the rest.
+    pub fn keeps(self, level: Level) -> bool {
+        match self {
+            Self::Off => false,
+            Self::At(floor) => level as i32 >= floor as i32,
+        }
+    }
+
+    /// The name the banner prints — the level's own, or `off`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::At(level) => level.name(),
+        }
+    }
+}
+
+/// What the subsystem is configured with.
+///
+/// Three filters, one per consumer, plus the writer's batching policy. Which
+/// consumer sees which record is decided here and in the writer task: the
+/// producers only ask whether *anyone* wants the payload.
 #[derive(Clone, Debug)]
 pub struct Settings {
-    /// Lowest level recorded, indexed by [`Category`]. Initialised from one
-    /// global level and overridden per category — a flat table rather than a
-    /// map so the filter on the emit path is an index and a compare.
-    pub levels: [Level; CATEGORY_COUNT],
+    /// Lowest level the segment sink records, indexed by [`Category`]. The only
+    /// consumer with per-category exceptions, because it is the one an operator
+    /// tunes — a flat table rather than a map so the filter on the emit path is
+    /// an index and a compare.
+    pub disk: [Filter; CATEGORY_COUNT],
+    /// Lowest level the text view renders. One floor for every category: the
+    /// view is read by a human watching a terminal, not queried.
+    pub text: Filter,
+    /// Lowest level the RAM ring keeps, for the `SIGUSR1` dump.
+    pub ring: Filter,
     /// Records per flush, clamped to [`MIN_BATCH_MAX`]..=[`MAX_BATCH_MAX`].
     pub batch_max: usize,
     /// Records older than this are flushed even if the batch is not full.
@@ -141,7 +207,9 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            levels: [Level::Info; CATEGORY_COUNT],
+            disk: [Filter::at(Level::Info); CATEGORY_COUNT],
+            text: Filter::at(Level::Info),
+            ring: Filter::at(Level::Info),
             batch_max: DEFAULT_BATCH_MAX,
             flush_interval: DEFAULT_FLUSH_INTERVAL,
             flush_on_warn: false,
@@ -157,7 +225,11 @@ impl Default for Settings {
 pub struct LogHandle {
     tx: mpsc::Sender<LogRecord>,
     counters: Arc<Counters>,
-    levels: [Level; CATEGORY_COUNT],
+    /// The three consumers' floors, copied out of [`Settings`] so that the
+    /// producer gate needs no lock and no second lookup.
+    disk: [Filter; CATEGORY_COUNT],
+    text: Filter,
+    ring: Filter,
     shutdown: watch::Sender<bool>,
     join: StdMutex<Option<JoinHandle<()>>>,
 }
@@ -193,16 +265,21 @@ impl Counters {
 }
 
 impl LogHandle {
-    /// True when a record of this category and level would be kept.
+    /// True when a record of this category and level would be kept by *any*
+    /// consumer — the segment, the text view or the ring.
     ///
     /// A level is a floor, not a ceiling: a threshold of `info` keeps `info`,
     /// `warn` and `error` and drops `debug`, which is what every operator
     /// means by "log level info".
     ///
     /// Callers use this to skip building a payload — the `key_display` strings
-    /// and the `format!` behind them — that the filter would drop anyway.
+    /// and the `format!` behind them — that no consumer wants. What each
+    /// consumer keeps is a narrower question, answered in the writer task where
+    /// the record is delivered: getting the widening right here is what makes
+    /// three consumers cost no more than one.
     pub fn enabled(&self, category: Category, level: Level) -> bool {
-        level as i32 >= self.levels[category as usize] as i32
+        let index = category as usize;
+        self.disk[index].keeps(level) || self.text.keeps(level) || self.ring.keeps(level)
     }
 
     /// Next session id, allocated once per accepted connection. Never zero,
@@ -276,7 +353,9 @@ fn start<S: writer::BatchSink + 'static>(sink: S, settings: Settings) -> LogHand
     let handle = LogHandle {
         tx,
         counters: Arc::clone(&counters),
-        levels: settings.levels,
+        disk: settings.disk,
+        text: settings.text,
+        ring: settings.ring,
         shutdown,
         join: StdMutex::new(None),
     };

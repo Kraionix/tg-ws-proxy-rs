@@ -28,8 +28,7 @@ fn samples() -> Vec<(&'static str, LogRecord)> {
         (
             "session_opened",
             record(Event::SessionOpened(SessionOpened {
-                dc: 2,
-                is_media: false,
+                ctx: Some(Ctx::new(2, false, Tier::Unspecified)),
                 peer: Some(Peer {
                     addr: vec![203, 0, 113, 5],
                     port: 51234,
@@ -41,30 +40,30 @@ fn samples() -> Vec<(&'static str, LogRecord)> {
         (
             "session_closed",
             record(Event::SessionClosed(SessionClosed {
-                dc: 2,
-                is_media: true,
-                tier: Tier::Ws as i32,
+                ctx: Some(Ctx::new(2, true, Tier::Ws)),
                 closed_by: ClosedBy::Upstream as i32,
                 bytes_up: 1 << 20,
                 bytes_down: 1 << 22,
                 dur_ms: 120_000,
+                via: "kws2.web.telegram.org".to_string(),
             })),
         ),
         (
             "tier_attempt",
             record(Event::TierAttempt(TierAttempt {
-                tier: Tier::Cfproxy as i32,
-                dc: 4,
-                is_media: true,
+                ctx: Some(Ctx::new(4, true, Tier::Cfproxy)),
+                host: "cf.example.com".to_string(),
                 ok: false,
                 dur_ns: 2_500_000_000,
-                err: ErrorCode::TlsTimeout as i32,
+                err: ErrorCode::TcpConnect as i32,
                 err_code: 0,
+                errno: 113,
             })),
         ),
         (
             "tier_fallback",
             record(Event::TierFallback(TierFallback {
+                ctx: Some(Ctx::new(2, false, Tier::Ws)),
                 from_tier: Tier::Ws as i32,
                 to_tier: Tier::Cfworker as i32,
                 reason: Reason::WsFail as i32,
@@ -73,6 +72,7 @@ fn samples() -> Vec<(&'static str, LogRecord)> {
         (
             "cooldown_armed",
             record(Event::CooldownArmed(CooldownArmed {
+                ctx: Some(Ctx::new(2, false, Tier::Cfworker)),
                 kind: CooldownKind::WsFail as i32,
                 key_display: "kws2.web.telegram.org:443".to_string(),
                 dur_s: 300,
@@ -83,6 +83,7 @@ fn samples() -> Vec<(&'static str, LogRecord)> {
         (
             "cooldown_cleared",
             record(Event::CooldownCleared(CooldownCleared {
+                ctx: Some(Ctx::new(2, false, Tier::Ws)),
                 kind: CooldownKind::IpFail as i32,
                 key_display: "149.154.167.220".to_string(),
             })),
@@ -90,6 +91,7 @@ fn samples() -> Vec<(&'static str, LogRecord)> {
         (
             "cooldown_skipped",
             record(Event::CooldownSkipped(CooldownSkipped {
+                ctx: Some(Ctx::new(2, true, Tier::Mtproto)),
                 kind: CooldownKind::UpstreamFail as i32,
                 key_display: "proxy.example:443".to_string(),
             })),
@@ -97,34 +99,33 @@ fn samples() -> Vec<(&'static str, LogRecord)> {
         (
             "pool_hit",
             record(Event::PoolHit(PoolHit {
-                dc: 2,
-                is_media: false,
-                tier: Tier::Ws as i32,
+                ctx: Some(Ctx::new(2, false, Tier::Ws)),
+                left: 3,
             })),
         ),
         (
             "pool_miss",
             record(Event::PoolMiss(PoolMiss {
-                dc: 2,
-                is_media: true,
-                tier: Tier::Cfworker as i32,
+                ctx: Some(Ctx::new(2, true, Tier::Cfworker)),
             })),
         ),
         (
             "pool_refill",
             record(Event::PoolRefill(PoolRefill {
-                dc: 203,
-                is_media: false,
+                ctx: Some(Ctx::new(203, false, Tier::Cfproxy)),
                 added: 4,
+                ready: 4,
                 dur_ms: 850,
-                tier: Tier::Cfproxy as i32,
             })),
         ),
         (
             "tls_handshake",
             record(Event::TlsHandshake(TlsHandshake {
+                ctx: Some(Ctx::new(2, false, Tier::Ws)),
                 kind: HandshakeKind::Full as i32,
                 dur_ns: 180_000_000,
+                err: ErrorCode::Unspecified as i32,
+                errno: 0,
             })),
         ),
         (
@@ -186,6 +187,44 @@ fn samples() -> Vec<(&'static str, LogRecord)> {
                     .collect(),
             })),
         ),
+        (
+            "pool_discard",
+            record(Event::PoolDiscard(PoolDiscard {
+                ctx: Some(Ctx::new(2, false, Tier::Ws)),
+                reason: DiscardReason::Stale as i32,
+            })),
+        ),
+        (
+            "warmup_complete",
+            record(Event::WarmupComplete(WarmupComplete {
+                ready: 16,
+                dur_ms: 1_200,
+            })),
+        ),
+        (
+            "attempt_skipped",
+            record(Event::AttemptSkipped(AttemptSkipped {
+                ctx: Some(Ctx::new(2, true, Tier::Mtproto)),
+                tier: Tier::Mtproto as i32,
+                reason: Reason::Pinned as i32,
+            })),
+        ),
+        (
+            "domain_list_fetched",
+            record(Event::DomainListFetched(DomainListFetched {
+                source: DomainSource::Github as i32,
+                count: 5,
+                err: ErrorCode::Unspecified as i32,
+                err_code: 0,
+            })),
+        ),
+        (
+            "shutdown",
+            record(Event::Shutdown(Shutdown {
+                phase: ShutdownPhase::Requested as i32,
+                signal: ShutdownSignal::Term as i32,
+            })),
+        ),
     ]
 }
 
@@ -200,7 +239,7 @@ fn sample(name: &str) -> LogRecord {
 #[test]
 fn every_event_variant_round_trips() {
     let samples = samples();
-    assert_eq!(samples.len(), 17, "one sample per oneof variant");
+    assert_eq!(samples.len(), 22, "one sample per oneof variant");
 
     for (name, record) in samples {
         let encoded = record.encode_to_vec();
@@ -221,6 +260,8 @@ fn every_field_survives_the_round_trip_individually() {
             let peer = e.peer.expect("the peer is part of the fixture");
             assert_eq!(peer.addr, vec![203, 0, 113, 5]);
             assert_eq!(peer.port, 51234);
+            let ctx = e.ctx.expect("the session's own facts are part of it");
+            assert_eq!((ctx.dc, ctx.is_media), (2, false));
         }
         other => panic!("wrong variant: {other:?}"),
     }
@@ -229,13 +270,18 @@ fn every_field_survives_the_round_trip_individually() {
             assert_eq!((e.bytes_up, e.bytes_down), (1 << 20, 1 << 22));
             assert_eq!(e.closed_by, ClosedBy::Upstream as i32);
             assert_eq!(e.dur_ms, 120_000);
+            assert_eq!(e.via, "kws2.web.telegram.org");
+            let ctx = e.ctx.expect("the session's own facts are part of it");
+            assert_eq!((ctx.dc, ctx.is_media, ctx.tier), (2, true, Tier::Ws as i32));
         }
         other => panic!("wrong variant: {other:?}"),
     }
     match sample("tier_attempt").event.unwrap() {
         Event::TierAttempt(e) => {
-            assert_eq!(e.err, ErrorCode::TlsTimeout as i32);
+            assert_eq!(e.host, "cf.example.com");
+            assert_eq!(e.err, ErrorCode::TcpConnect as i32);
             assert_eq!(e.err_code, 0);
+            assert_eq!(e.errno, 113);
         }
         other => panic!("wrong variant: {other:?}"),
     }
@@ -328,45 +374,44 @@ fn dc_bit_maps_the_documented_table() {
 fn header_masks_follow_the_records() {
     let mut records = vec![
         record(Event::SessionOpened(SessionOpened {
-            dc: 2,
-            is_media: true,
+            ctx: Some(Ctx::new(2, true, Tier::Unspecified)),
             peer: None,
         })),
         record(Event::SessionClosed(SessionClosed {
-            dc: 203,
-            is_media: false,
-            tier: Tier::Ws as i32,
+            ctx: Some(Ctx::new(203, false, Tier::Ws)),
             closed_by: ClosedBy::Client as i32,
             bytes_up: 0,
             bytes_down: 0,
             dur_ms: 1,
+            via: String::new(),
         })),
         record(Event::TlsHandshake(TlsHandshake {
+            ctx: Some(Ctx::new(4, false, Tier::Ws)),
             kind: HandshakeKind::Full as i32,
             dur_ns: 1,
+            err: ErrorCode::Unspecified as i32,
+            errno: 0,
         })),
         record(Event::TierAttempt(TierAttempt {
-            tier: Tier::Ws as i32,
-            dc: 2,
-            is_media: false,
+            ctx: Some(Ctx::new(2, false, Tier::Ws)),
+            host: String::new(),
             ok: true,
             dur_ns: 1,
             err: ErrorCode::Unspecified as i32,
             err_code: 0,
+            errno: 0,
         })),
         // A record whose event never got set: counted, but contributing no bit.
         LogRecord {
             event: None,
             ..record(Event::PoolHit(PoolHit {
-                dc: 1,
-                is_media: false,
-                tier: Tier::Ws as i32,
+                ctx: Some(Ctx::new(1, false, Tier::Ws)),
+                left: 0,
             }))
         },
         record(Event::PoolHit(PoolHit {
-            dc: 1,
-            is_media: false,
-            tier: Tier::Ws as i32,
+            ctx: Some(Ctx::new(1, false, Tier::Ws)),
+            left: 0,
         })),
     ];
 
@@ -387,8 +432,10 @@ fn header_masks_follow_the_records() {
         header.kind_mask,
         (1 << 0) | (1 << 1) | (1 << 2) | (1 << 7) | (1 << 10)
     );
-    // dc 1 → bit 0, dc 2 → bit 1, dc 203 → bit 5.
-    assert_eq!(header.dc_mask, 0b10_0011);
+    // dc 1 → bit 0, dc 2 → bit 1, dc 4 → bit 3, dc 203 → bit 5: the DC of a
+    // record now comes from its own context, so a handshake contributes its
+    // session's DC like the rest.
+    assert_eq!(header.dc_mask, 0b10_1011);
     // Only the dc 2 session is a media session.
     assert_eq!(header.dc_media_mask, 0b10);
     assert_eq!(header.conn_ids, vec![42]);
@@ -405,9 +452,7 @@ fn split_respects_the_unique_conn_bound() {
                 event_for(
                     conn,
                     Event::PoolMiss(PoolMiss {
-                        dc: 2,
-                        is_media: false,
-                        tier: Tier::Ws as i32,
+                        ctx: Some(Ctx::new(2, false, Tier::Ws)),
                     }),
                 )
             })
@@ -422,9 +467,8 @@ fn split_respects_the_unique_conn_bound() {
         event_for(
             99,
             Event::PoolHit(PoolHit {
-                dc: 2,
-                is_media: false,
-                tier: Tier::Ws as i32,
+                ctx: Some(Ctx::new(2, false, Tier::Ws)),
+                left: 0,
             }),
         ),
     );
@@ -508,7 +552,7 @@ fn unknown_enum_values_are_preserved_as_integers() {
     // A code this build does know still resolves as one.
     match sample("tier_attempt").event.unwrap() {
         Event::TierAttempt(e) => {
-            assert_eq!(ErrorCode::try_from(e.err), Ok(ErrorCode::TlsTimeout));
+            assert_eq!(ErrorCode::try_from(e.err), Ok(ErrorCode::TcpConnect));
         }
         other => panic!("wrong variant: {other:?}"),
     }
@@ -518,13 +562,13 @@ fn unknown_enum_values_are_preserved_as_integers() {
 fn unset_error_fields_do_not_reach_the_wire() {
     let attempt = |err: ErrorCode, err_code: u32| {
         record(Event::TierAttempt(TierAttempt {
-            tier: Tier::Ws as i32,
-            dc: 2,
-            is_media: false,
+            ctx: Some(Ctx::new(2, false, Tier::Ws)),
+            host: "kws2.web.telegram.org".to_string(),
             ok: true,
             dur_ns: 120_000_000,
             err: i32::from(err),
             err_code,
+            errno: 0,
         }))
     };
 
@@ -595,9 +639,8 @@ fn event_for(conn_id: u64, event: Event) -> LogRecord {
 
 fn pool_hit(dc: u32) -> Event {
     Event::PoolHit(PoolHit {
-        dc,
-        is_media: false,
-        tier: Tier::Ws as i32,
+        ctx: Some(Ctx::new(dc, false, Tier::Ws)),
+        left: 0,
     })
 }
 
@@ -960,18 +1003,15 @@ async fn the_macro_builds_the_payload_and_skips_what_the_filter_drops() {
             Category::Routing,
             Level::Info,
             Event::PoolHit {
-                dc,
-                is_media,
-                tier: Tier::Ws as i32,
+                ctx: Some(Ctx::new(dc, is_media, Tier::Ws)),
+                left: 0,
             }
         );
         crate::log_event!(
             Category::Routing,
             Level::Debug,
             Event::PoolMiss {
-                dc: 2,
-                is_media: false,
-                tier: Tier::Ws as i32,
+                ctx: Some(Ctx::new(dc, is_media, Tier::Ws)),
             },
         );
     })
@@ -989,7 +1029,7 @@ async fn the_macro_builds_the_payload_and_skips_what_the_filter_drops() {
 async fn a_category_can_be_quieter_than_the_global_level() {
     let (sink, shared, _batches) = recording();
     let mut settings = quiet(DEFAULT_BATCH_MAX);
-    settings.levels[Category::Pool as usize] = Level::Warn;
+    settings.disk[Category::Pool as usize] = Filter::at(Level::Warn);
     let handle = Arc::new(start(sink, settings));
 
     scope(1, Arc::clone(&handle), async {
@@ -997,27 +1037,24 @@ async fn a_category_can_be_quieter_than_the_global_level() {
             Category::Pool,
             Level::Info,
             Event::PoolHit {
-                dc: 2,
-                is_media: false,
-                tier: Tier::Ws as i32,
+                ctx: Some(Ctx::new(2, false, Tier::Ws)),
+                left: 0,
             }
         );
         crate::log_event!(
             Category::Routing,
             Level::Info,
             Event::PoolHit {
-                dc: 2,
-                is_media: false,
-                tier: Tier::Ws as i32,
+                ctx: Some(Ctx::new(2, false, Tier::Ws)),
+                left: 0,
             }
         );
         crate::log_event!(
             Category::Pool,
             Level::Warn,
             Event::PoolHit {
-                dc: 2,
-                is_media: false,
-                tier: Tier::Ws as i32,
+                ctx: Some(Ctx::new(2, false, Tier::Ws)),
+                left: 0,
             }
         );
     })
@@ -1035,6 +1072,94 @@ async fn a_category_can_be_quieter_than_the_global_level() {
         kept,
         vec![Category::Routing as i32, Category::Pool as i32],
         "the pool's info record is below its own threshold, its warning is not"
+    );
+}
+
+#[test]
+fn a_filter_keeps_its_floor_and_everything_above_it() {
+    let info = Filter::at(Level::Info);
+    assert!(info.keeps(Level::Info));
+    assert!(info.keeps(Level::Warn));
+    assert!(info.keeps(Level::Error));
+    assert!(!info.keeps(Level::Debug));
+    assert_eq!(info.floor(), Some(Level::Info));
+    assert_eq!(info.name(), "info");
+    assert!(!info.is_off());
+
+    assert!(!Filter::off().keeps(Level::Error));
+    assert_eq!(Filter::off().floor(), None);
+    assert_eq!(Filter::off().name(), "off");
+    assert!(Filter::off().is_off());
+}
+
+#[test]
+fn the_gate_is_the_union_of_the_three_policies() {
+    let runtime = unpolled_runtime();
+
+    // Disk at warn, text at info, ring off: the union is info, so an info
+    // payload is built for the text view even though the segment drops it.
+    let (sink, _shared, _batches) = recording();
+    let settings = Settings {
+        disk: [Filter::at(Level::Warn); CATEGORY_COUNT],
+        text: Filter::at(Level::Info),
+        ring: Filter::off(),
+        ..Settings::default()
+    };
+    let handle = runtime.block_on(async { start(sink, settings) });
+    assert!(handle.enabled(Category::Pool, Level::Info));
+    assert!(!handle.enabled(Category::Pool, Level::Debug));
+
+    // Only the ring wants debug, and that alone is enough.
+    let (sink, _shared, _batches) = recording();
+    let settings = Settings {
+        disk: [Filter::at(Level::Warn); CATEGORY_COUNT],
+        text: Filter::off(),
+        ring: Filter::at(Level::Debug),
+        ..Settings::default()
+    };
+    let handle = runtime.block_on(async { start(sink, settings) });
+    assert!(handle.enabled(Category::Pool, Level::Debug));
+
+    // Nobody wants it: the payload is not built at all.
+    let (sink, _shared, _batches) = recording();
+    let settings = Settings {
+        disk: [Filter::at(Level::Warn); CATEGORY_COUNT],
+        text: Filter::off(),
+        ring: Filter::off(),
+        ..Settings::default()
+    };
+    let handle = runtime.block_on(async { start(sink, settings) });
+    assert!(!handle.enabled(Category::Pool, Level::Debug));
+}
+
+#[tokio::test]
+async fn a_record_the_segment_does_not_keep_never_reaches_it() {
+    // The counterpart of the union above: widening the gate must not widen the
+    // file, or the three policies would be one policy with extra steps.
+    let (sink, shared, _batches) = recording();
+    let mut settings = quiet(DEFAULT_BATCH_MAX);
+    settings.disk = [Filter::off(); CATEGORY_COUNT];
+    settings.text = Filter::at(Level::Info);
+    let handle = Arc::new(start(sink, settings));
+
+    scope(1, Arc::clone(&handle), async {
+        assert!(enabled(Category::Routing, Level::Info));
+        crate::log_event!(
+            Category::Routing,
+            Level::Info,
+            Event::PoolHit {
+                ctx: Some(Ctx::new(2, false, Tier::Ws)),
+                left: 0,
+            }
+        );
+    })
+    .await;
+
+    handle.shutdown().await;
+
+    assert!(
+        shared.batches().is_empty(),
+        "the text view's record must not be written to the segment"
     );
 }
 
@@ -1524,7 +1649,7 @@ fn the_fingerprint_follows_the_schema() {
     // land without someone noticing that it moved.
     assert_eq!(
         fingerprint(),
-        0xaac1_cfc3_54b8_926b_u64,
+        0xfcde_72a6_61a5_28b2_u64,
         "the wire format changed"
     );
 }

@@ -1131,22 +1131,27 @@ impl Config {
         self
     }
 
-    /// The structured sink's producer-side settings — the filter, the batch
-    /// size and the flush triggers.
+    /// The structured sink's producer-side settings — the three filters, the
+    /// batch size and the flush triggers.
     ///
     /// Only the sink's own view: the on-disk policy is [`Self::log_options`].
-    /// Both are read by the code that starts the sink, and only when
-    /// `--log-dir` is set; without it nothing is built from either.
+    /// Both are read by the code that starts the sink.
     pub fn log_settings(&self) -> log::Settings {
+        let level = self.log_level.to_schema();
         let mut settings = log::Settings {
-            levels: [self.log_level.to_schema(); log::CATEGORY_COUNT],
+            disk: [log::Filter::at(level); log::CATEGORY_COUNT],
+            // The text view and the ring get their own flags with the CLI
+            // rework; until then both follow the global level, which is the
+            // widest policy either could ask for.
+            text: log::Filter::at(level),
+            ring: log::Filter::at(level),
             batch_max: self.log_batch_max,
             flush_interval: Duration::from_secs(self.log_flush_interval),
             flush_on_warn: self.log_flush_on_warn,
         };
 
         for (category, level) in &self.log_categories {
-            settings.levels[*category as usize] = *level;
+            settings.disk[*category as usize] = log::Filter::at(*level);
         }
 
         settings

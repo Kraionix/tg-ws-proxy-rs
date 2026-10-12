@@ -549,10 +549,10 @@ async fn serve(
             .collect();
         dc_ips.sort_by_key(|entry| entry.dc);
 
-        let levels = config.log_settings().levels;
+        let disks = config.log_settings().disk;
         let categories: Vec<String> = Category::ALL
             .iter()
-            .map(|category| format!("{}={}", category.name(), levels[*category as usize].name()))
+            .map(|category| format!("{}={}", category.name(), disks[*category as usize].name()))
             .collect();
 
         let version = env!("CARGO_PKG_VERSION").to_string();

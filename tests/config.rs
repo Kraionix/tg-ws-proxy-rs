@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use tg_ws_proxy_rs::config::{Config, UpstreamTier};
+use tg_ws_proxy_rs::log::Filter;
 use tg_ws_proxy_rs::log::schema::{Category, Level};
 use tg_ws_proxy_rs::log::storage::{Compression, DurabilityMode};
 
@@ -813,7 +814,16 @@ fn structured_log_defaults_are_the_documented_ones() {
         cfg.log_dir.as_deref(),
         Some(Path::new("/var/log/tg-ws-proxy"))
     );
-    assert!(settings.levels.iter().all(|level| *level == Level::Info));
+    assert!(
+        settings
+            .disk
+            .iter()
+            .all(|filter| *filter == Filter::at(Level::Info))
+    );
+    // The text view and the ring have no flags of their own yet; both follow the
+    // global level, which is the widest policy either asks for.
+    assert_eq!(settings.text, Filter::at(Level::Info));
+    assert_eq!(settings.ring, Filter::at(Level::Info));
     assert_eq!(settings.batch_max, 256);
     assert_eq!(settings.flush_interval, Duration::from_secs(2));
     assert!(!settings.flush_on_warn);
@@ -827,9 +837,9 @@ fn the_global_log_level_is_the_floor_every_category_starts_from() {
     let cfg = log_config(&["--log-level", "warn"]);
     assert!(
         cfg.log_settings()
-            .levels
+            .disk
             .iter()
-            .all(|level| *level == Level::Warn)
+            .all(|filter| *filter == Filter::at(Level::Warn))
     );
 }
 
@@ -844,10 +854,10 @@ fn a_log_category_override_wins_over_the_global_level() {
         "pool,error",
     ]);
 
-    let levels = cfg.log_settings().levels;
-    assert_eq!(levels[Category::Routing as usize], Level::Debug);
-    assert_eq!(levels[Category::Pool as usize], Level::Error);
-    assert_eq!(levels[Category::Session as usize], Level::Warn);
+    let disk = cfg.log_settings().disk;
+    assert_eq!(disk[Category::Routing as usize], Filter::at(Level::Debug));
+    assert_eq!(disk[Category::Pool as usize], Filter::at(Level::Error));
+    assert_eq!(disk[Category::Session as usize], Filter::at(Level::Warn));
 }
 
 #[test]
@@ -855,9 +865,9 @@ fn log_categories_can_be_joined_for_a_single_valued_env_var() {
     // `TG_LOG_CATEGORY` can only carry one value, so pairs are joined with `+`;
     // the same syntax works on the command line.
     let cfg = log_config(&["--log-category", "routing,debug+tls,error"]);
-    let levels = cfg.log_settings().levels;
-    assert_eq!(levels[Category::Routing as usize], Level::Debug);
-    assert_eq!(levels[Category::Tls as usize], Level::Error);
+    let disk = cfg.log_settings().disk;
+    assert_eq!(disk[Category::Routing as usize], Filter::at(Level::Debug));
+    assert_eq!(disk[Category::Tls as usize], Filter::at(Level::Error));
 }
 
 #[test]
@@ -950,9 +960,9 @@ fn every_level_name_the_schema_prints_is_one_the_flag_parses() {
         let cfg = log_config(&["--log-level", level.name()]);
         assert!(
             cfg.log_settings()
-                .levels
+                .disk
                 .iter()
-                .all(|threshold| *threshold == level),
+                .all(|threshold| *threshold == Filter::at(level)),
             "{} did not parse to itself",
             level.name()
         );

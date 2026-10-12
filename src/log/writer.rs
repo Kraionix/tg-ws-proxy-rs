@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::warn;
 
 use super::schema::{Category, Event, Level, LogBatch, LogOverflow, LogRecord, build_batch};
-use super::{Counters, Settings, now_ns};
+use super::{CATEGORY_COUNT, Counters, Filter, Settings, now_ns};
 
 /// Where a finished batch goes.
 ///
@@ -132,11 +132,42 @@ impl<S: BatchSink> Writer<S> {
 struct Task<S> {
     writer: Writer<S>,
     counters: Arc<Counters>,
+    /// The segment's own filter, indexed by category. The producer gate is the
+    /// union of the three consumers' policies, so a record can reach this task
+    /// that the segment does not want: the text view or the ring asked for it,
+    /// and this is where the disk policy becomes exact.
+    disk: [Filter; CATEGORY_COUNT],
     failures: u64,
     overflow_window: Instant,
 }
 
 impl<S: BatchSink> Task<S> {
+    /// Takes one record off the channel, keeping it when the segment wants it.
+    /// Returns whether it was buffered, which is what decides on a flush.
+    fn ingest(&mut self, record: LogRecord) -> bool {
+        if !self.keeps(&record) {
+            return false;
+        }
+        self.writer.push(record);
+        true
+    }
+
+    /// True when the segment's filter keeps this record.
+    ///
+    /// A level this build does not know — a discriminant a later writer added,
+    /// which `prost` preserves as an integer — is kept rather than dropped: the
+    /// filter exists to keep the file small, not to lose records it cannot
+    /// classify.
+    fn keeps(&self, record: &LogRecord) -> bool {
+        let Some(filter) = self.disk.get(record.category as usize) else {
+            return false;
+        };
+        match Level::try_from(record.level) {
+            Ok(level) => filter.keeps(level),
+            Err(_) => true,
+        }
+    }
+
     /// Reports any records the producers dropped, then writes what is
     /// buffered.
     fn flush(&mut self) {
@@ -164,7 +195,7 @@ impl<S: BatchSink> Task<S> {
         }
 
         let now = Instant::now();
-        self.writer.push(LogRecord {
+        self.ingest(LogRecord {
             ts_ns: now_ns(),
             conn_id: 0,
             seq: self.counters.next_seq(),
@@ -213,6 +244,7 @@ pub(super) async fn run<S: BatchSink + 'static>(
     let mut task = Task {
         writer: Writer::new(sink, settings.batch_max),
         counters,
+        disk: settings.disk,
         failures: 0,
         overflow_window: Instant::now(),
     };
@@ -236,8 +268,7 @@ pub(super) async fn run<S: BatchSink + 'static>(
             received = rx.recv() => {
                 let Some(record) = received else { break };
                 let warn_now = settings.flush_on_warn && record.level >= Level::Warn as i32;
-                task.writer.push(record);
-                if warn_now || task.writer.is_full() {
+                if task.ingest(record) && (warn_now || task.writer.is_full()) {
                     task.flush();
                 }
             }
@@ -250,8 +281,7 @@ pub(super) async fn run<S: BatchSink + 'static>(
     // the drain window opens, so a stop that is killed during it still has
     // everything that was already queued.
     while let Ok(record) = rx.try_recv() {
-        task.writer.push(record);
-        if task.writer.is_full() {
+        if task.ingest(record) && task.writer.is_full() {
             task.flush();
         }
     }
@@ -265,8 +295,7 @@ pub(super) async fn run<S: BatchSink + 'static>(
     while started.elapsed() < DRAIN_LIMIT {
         match tokio::time::timeout(DRAIN_QUIET, rx.recv()).await {
             Ok(Some(record)) => {
-                task.writer.push(record);
-                if task.writer.is_full() {
+                if task.ingest(record) && task.writer.is_full() {
                     task.flush();
                 }
             }

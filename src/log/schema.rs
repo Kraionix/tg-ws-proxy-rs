@@ -23,7 +23,14 @@
 
 /// Written into a day-segment's `STOR:meta` so a reader can tell which rules a
 /// file was written under. Bumped only for a non-additive change.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// `2` is the version that moved the session's own facts — DC, media flag, the
+/// rung that carried it — into a [`Ctx`] on every event that has them, so that
+/// one record renders to a text line without the records before it. It also
+/// adds the fields the console line printed and the record did not: the host a
+/// rung was dialled at, the domain a session ran through, the raw `errno`
+/// behind a classified error, and the two pool counters.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Upper bound on distinct `conn_id`s in one [`LogBatch`], so that
 /// `STOR:by_conn`'s key prefix stays selective: a batch spanning more sessions
@@ -56,7 +63,7 @@ pub struct LogRecord {
     pub category: i32,
     #[prost(
         oneof = "Event",
-        tags = "16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32"
+        tags = "16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37"
     )]
     pub event: Option<Event>,
 }
@@ -101,6 +108,16 @@ pub enum Event {
     LogOverflow(LogOverflow),
     #[prost(message, tag = "32")]
     StartupSummary(StartupSummary),
+    #[prost(message, tag = "33")]
+    PoolDiscard(PoolDiscard),
+    #[prost(message, tag = "34")]
+    WarmupComplete(WarmupComplete),
+    #[prost(message, tag = "35")]
+    AttemptSkipped(AttemptSkipped),
+    #[prost(message, tag = "36")]
+    DomainListFetched(DomainListFetched),
+    #[prost(message, tag = "37")]
+    Shutdown(Shutdown),
 }
 
 /// What a writer hands to storage: the batch's summary plus its records.
@@ -126,7 +143,7 @@ pub struct BatchHeader {
     #[prost(uint32, tag = "3")]
     pub record_count: u32,
     /// One bit per oneof field number, offset by 16: `EVT:session_opened` (16)
-    /// is bit 0, `EVT:startup_summary` (32) is bit 16.
+    /// is bit 0, `EVT:shutdown` (37) is bit 21.
     #[prost(uint64, tag = "4")]
     pub kind_mask: u64,
     /// One bit per DC, laid out by [`dc_bit`] — never `1 << dc`, which
@@ -363,162 +380,233 @@ pub enum ErrorCode {
     WriterConflict = 14,
 }
 
+/// Why an idle pooled connection was thrown away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DiscardReason {
+    Unspecified = 0,
+    /// Older than the pool's maximum age.
+    Stale = 1,
+    /// The server had already closed it, or sent something on an idle
+    /// connection — the liveness check that costs nothing to run.
+    Closed = 2,
+}
+
+/// Where the Cloudflare domain list in use came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum DomainSource {
+    Unspecified = 0,
+    /// The community list, fetched over HTTPS.
+    Github = 1,
+    /// The list compiled into the binary, used when the fetch produced
+    /// nothing.
+    Builtin = 2,
+}
+
+/// Which part of a stop a `shutdown` record describes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ShutdownPhase {
+    Unspecified = 0,
+    /// A signal arrived; the proxy is about to stop serving.
+    Requested = 1,
+    /// The accept loop is gone and the sink has been flushed.
+    Complete = 2,
+    /// A second signal cut the stop short.
+    Forced = 3,
+}
+
+/// The signal behind a [`ShutdownPhase::Requested`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ShutdownSignal {
+    Unspecified = 0,
+    Term = 1,
+    Int = 2,
+}
+
 // ── Event payloads ─────────────────────────────────────────────────────────
 
 /// `EVT:session_opened` — one per inbound client handshake.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SessionOpened {
-    #[prost(uint32, tag = "1")]
-    pub dc: u32,
-    #[prost(bool, tag = "2")]
-    pub is_media: bool,
-    #[prost(message, optional, tag = "3")]
+    #[prost(message, optional, tag = "1")]
+    pub ctx: Option<Ctx>,
+    /// The only event that carries the peer: every later one is about the route
+    /// rather than the caller, and a reader that wants the prefix back replays
+    /// the stream from the session's own open record.
+    #[prost(message, optional, tag = "2")]
     pub peer: Option<Peer>,
 }
 
 /// `EVT:session_closed` — one per bridge session end, whatever ended it.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SessionClosed {
-    #[prost(uint32, tag = "1")]
-    pub dc: u32,
-    #[prost(bool, tag = "2")]
-    pub is_media: bool,
-    #[prost(enumeration = "Tier", tag = "3")]
-    pub tier: i32,
-    #[prost(enumeration = "ClosedBy", tag = "4")]
+    #[prost(message, optional, tag = "1")]
+    pub ctx: Option<Ctx>,
+    #[prost(enumeration = "ClosedBy", tag = "2")]
     pub closed_by: i32,
-    #[prost(uint64, tag = "5")]
+    #[prost(uint64, tag = "3")]
     pub bytes_up: u64,
-    #[prost(uint64, tag = "6")]
+    #[prost(uint64, tag = "4")]
     pub bytes_down: u64,
-    #[prost(uint32, tag = "7")]
+    #[prost(uint32, tag = "5")]
     pub dur_ms: u32,
+    /// The domain or worker the session actually ran through, empty when the
+    /// rung has none: `kws2.web.telegram.org`, the CF fronting domain, the
+    /// worker URL's host. The console line printed it and the record could not,
+    /// which left a saved segment unable to say which way a session went.
+    #[prost(string, tag = "6")]
+    pub via: String,
 }
 
 /// `EVT:tier_attempt` — one per rung that actually opens a connection.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TierAttempt {
-    #[prost(enumeration = "Tier", tag = "1")]
-    pub tier: i32,
-    #[prost(uint32, tag = "2")]
-    pub dc: u32,
+    #[prost(message, optional, tag = "1")]
+    pub ctx: Option<Ctx>,
+    /// The host the rung dialled — `kws2.web.telegram.org`, a CF domain, a
+    /// worker host, `host:port` for the MTProto proxy and TCP rungs. Empty for
+    /// a rung that dialled an address it does not name.
+    #[prost(string, tag = "2")]
+    pub host: String,
     #[prost(bool, tag = "3")]
-    pub is_media: bool,
-    #[prost(bool, tag = "4")]
     pub ok: bool,
     /// Nanoseconds, as a `u64` because a rung's dial is bounded by
     /// `--ws-connect-timeout` / `--cf-connect-timeout` — ten seconds by
     /// default, and a `u32` of nanoseconds saturates at 4.29.
-    #[prost(uint64, tag = "5")]
+    #[prost(uint64, tag = "4")]
     pub dur_ns: u64,
     /// [`ErrorCode`] discriminant; meaningful when `ok` is false, and not
     /// written at all when it is zero.
-    #[prost(enumeration = "ErrorCode", tag = "6")]
+    #[prost(enumeration = "ErrorCode", tag = "5")]
     pub err: i32,
     /// Numeric detail behind `err`, currently the HTTP status for
     /// `ErrorCode::HttpStatus` and `ErrorCode::HttpRedirect`.
-    #[prost(uint32, tag = "7")]
+    #[prost(uint32, tag = "6")]
     pub err_code: u32,
+    /// The OS error behind `err`, when there was one. `err` classifies the
+    /// failure for recovery; this is the diagnosis — `ENETUNREACH` and
+    /// `ECONNREFUSED` are the same `TcpConnect` and a different problem.
+    #[prost(int32, tag = "7")]
+    pub errno: i32,
 }
 
 /// `EVT:tier_fallback` — the ladder stepping down from one rung to the next.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TierFallback {
-    #[prost(enumeration = "Tier", tag = "1")]
-    pub from_tier: i32,
+    #[prost(message, optional, tag = "1")]
+    pub ctx: Option<Ctx>,
     #[prost(enumeration = "Tier", tag = "2")]
+    pub from_tier: i32,
+    #[prost(enumeration = "Tier", tag = "3")]
     pub to_tier: i32,
-    #[prost(enumeration = "Reason", tag = "3")]
+    #[prost(enumeration = "Reason", tag = "4")]
     pub reason: i32,
 }
 
 /// `EVT:cooldown_armed` — failure memory being set.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CooldownArmed {
-    #[prost(enumeration = "CooldownKind", tag = "1")]
+    #[prost(message, optional, tag = "1")]
+    pub ctx: Option<Ctx>,
+    #[prost(enumeration = "CooldownKind", tag = "2")]
     pub kind: i32,
     /// The map key as the operator would recognise it: a DC, an IP, a domain, a
     /// worker URL. Never a secret.
-    #[prost(string, tag = "2")]
+    #[prost(string, tag = "3")]
     pub key_display: String,
-    #[prost(uint32, tag = "3")]
+    #[prost(uint32, tag = "4")]
     pub dur_s: u32,
     /// Why the cooldown was armed — without it the log records the penalty and
     /// not the offence.
-    #[prost(enumeration = "ErrorCode", tag = "4")]
+    #[prost(enumeration = "ErrorCode", tag = "5")]
     pub err: i32,
-    #[prost(uint32, tag = "5")]
+    #[prost(uint32, tag = "6")]
     pub err_code: u32,
 }
 
 /// `EVT:cooldown_cleared` — a success that cleared a cooldown entry.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CooldownCleared {
-    #[prost(enumeration = "CooldownKind", tag = "1")]
+    #[prost(message, optional, tag = "1")]
+    pub ctx: Option<Ctx>,
+    #[prost(enumeration = "CooldownKind", tag = "2")]
     pub kind: i32,
-    #[prost(string, tag = "2")]
+    #[prost(string, tag = "3")]
     pub key_display: String,
 }
 
 /// `EVT:cooldown_skipped` — a rung that was not tried because of a cooldown.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CooldownSkipped {
-    #[prost(enumeration = "CooldownKind", tag = "1")]
+    #[prost(message, optional, tag = "1")]
+    pub ctx: Option<Ctx>,
+    #[prost(enumeration = "CooldownKind", tag = "2")]
     pub kind: i32,
-    #[prost(string, tag = "2")]
+    #[prost(string, tag = "3")]
     pub key_display: String,
 }
 
 /// `EVT:pool_hit` — a pre-warmed connection was reused.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PoolHit {
-    #[prost(uint32, tag = "1")]
-    pub dc: u32,
-    #[prost(bool, tag = "2")]
-    pub is_media: bool,
-    /// Which bucket was hit. The plain WebSocket pool and the Cloudflare ones
-    /// are keyed separately, so without this the record cannot say which path
-    /// the pre-warmed connection was for.
-    #[prost(enumeration = "Tier", tag = "3")]
-    pub tier: i32,
+    /// [`Ctx::tier`] names the bucket: the plain WebSocket pool and the
+    /// Cloudflare ones are keyed separately, so without it the record cannot
+    /// say which path the pre-warmed connection was for.
+    #[prost(message, optional, tag = "1")]
+    pub ctx: Option<Ctx>,
+    /// Connections left in the bucket after this one was taken, which is what
+    /// says whether the pool is keeping up.
+    #[prost(uint32, tag = "2")]
+    pub left: u32,
 }
 
 /// `EVT:pool_miss` — no idle connection in the bucket.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PoolMiss {
-    #[prost(uint32, tag = "1")]
-    pub dc: u32,
-    #[prost(bool, tag = "2")]
-    pub is_media: bool,
-    /// See [`PoolHit::tier`].
-    #[prost(enumeration = "Tier", tag = "3")]
-    pub tier: i32,
+    /// See [`PoolHit::ctx`].
+    #[prost(message, optional, tag = "1")]
+    pub ctx: Option<Ctx>,
 }
 
 /// `EVT:pool_refill` — background refill finished, with what it produced.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PoolRefill {
-    #[prost(uint32, tag = "1")]
-    pub dc: u32,
-    #[prost(bool, tag = "2")]
-    pub is_media: bool,
-    #[prost(uint32, tag = "3")]
+    /// See [`PoolHit::ctx`].
+    #[prost(message, optional, tag = "1")]
+    pub ctx: Option<Ctx>,
+    /// Connections this refill added.
+    #[prost(uint32, tag = "2")]
     pub added: u32,
+    /// Connections the bucket holds once it is done — `added` says what the
+    /// dial produced, `ready` what the pool is worth now.
+    #[prost(uint32, tag = "3")]
+    pub ready: u32,
     #[prost(uint32, tag = "4")]
     pub dur_ms: u32,
-    /// See [`PoolHit::tier`].
-    #[prost(enumeration = "Tier", tag = "5")]
-    pub tier: i32,
 }
 
 /// `EVT:tls_handshake` — the TLS cost of one upstream WebSocket connect.
+///
+/// A failing handshake carries the classification and the OS error rather than
+/// an `ok` flag: zero `err` is the success this event exists to time, and a
+/// failure is a `tls_handshake` record that says why.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TlsHandshake {
-    #[prost(enumeration = "HandshakeKind", tag = "1")]
+    #[prost(message, optional, tag = "1")]
+    pub ctx: Option<Ctx>,
+    #[prost(enumeration = "HandshakeKind", tag = "2")]
     pub kind: i32,
     /// Nanoseconds; `u64` for the same reason as [`TierAttempt::dur_ns`].
-    #[prost(uint64, tag = "2")]
+    #[prost(uint64, tag = "3")]
     pub dur_ns: u64,
+    #[prost(enumeration = "ErrorCode", tag = "4")]
+    pub err: i32,
+    /// See [`TierAttempt::errno`].
+    #[prost(int32, tag = "5")]
+    pub errno: i32,
 }
 
 /// `EVT:relay_init_retries` — reserved-prefix rejections while generating the
@@ -599,7 +687,118 @@ pub struct StartupSummary {
     pub categories: Vec<String>,
 }
 
+/// `EVT:pool_discard` — an idle connection thrown away instead of handed to a
+/// client.
+///
+/// One record per connection, unlike the console line it replaces: the line
+/// said the pool was shedding, this says how much of it and why.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PoolDiscard {
+    /// See [`PoolHit::ctx`].
+    #[prost(message, optional, tag = "1")]
+    pub ctx: Option<Ctx>,
+    #[prost(enumeration = "DiscardReason", tag = "2")]
+    pub reason: i32,
+}
+
+/// `EVT:warmup_complete` — the startup warm-up finished.
+///
+/// Process-wide rather than per bucket: the per-bucket half is the
+/// `pool_refill` each bucket already reports, and what this adds is the one
+/// question the console answered — "is the pool up?".
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct WarmupComplete {
+    /// Connections the pool holds across every bucket.
+    #[prost(uint32, tag = "1")]
+    pub ready: u32,
+    #[prost(uint32, tag = "2")]
+    pub dur_ms: u32,
+}
+
+/// `EVT:attempt_skipped` — a rung that the ladder did not dial at all.
+///
+/// Distinct from `tier_attempt`: nothing was tried, so there is no duration and
+/// no error, only the reason the rung was passed over. Today's console prints
+/// these as ladder notes and a segment cannot reconstruct the walk without
+/// them.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AttemptSkipped {
+    #[prost(message, optional, tag = "1")]
+    pub ctx: Option<Ctx>,
+    /// The rung that was passed over.
+    #[prost(enumeration = "Tier", tag = "2")]
+    pub tier: i32,
+    #[prost(enumeration = "Reason", tag = "3")]
+    pub reason: i32,
+}
+
+/// `EVT:domain_list_fetched` — where the default Cloudflare domain list came
+/// from.
+///
+/// The list decides which routes exist for the whole process, and the console
+/// said so once at startup; a segment that starts after the banner could not.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DomainListFetched {
+    #[prost(enumeration = "DomainSource", tag = "1")]
+    pub source: i32,
+    /// Domains in the list that is now in use.
+    #[prost(uint32, tag = "2")]
+    pub count: u32,
+    /// Why the fetch failed, when it did — the record that says the built-in
+    /// list is in use because GitHub was unreachable rather than because the
+    /// operator asked for it.
+    #[prost(enumeration = "ErrorCode", tag = "3")]
+    pub err: i32,
+    #[prost(uint32, tag = "4")]
+    pub err_code: u32,
+}
+
+/// `EVT:shutdown` — the process being asked to stop, and stopping.
+///
+/// Written through the sink it is describing, which is why it exists: the last
+/// record in a segment says whether the run ended cleanly or the power did.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Shutdown {
+    #[prost(enumeration = "ShutdownPhase", tag = "1")]
+    pub phase: i32,
+    /// The signal that asked for the stop; unset for the phases that are not
+    /// caused by one.
+    #[prost(enumeration = "ShutdownSignal", tag = "2")]
+    pub signal: i32,
+}
+
 // ── Shared value types ─────────────────────────────────────────────────────
+
+/// The session facts every session-scoped event carries.
+///
+/// The point is that a record is readable on its own: without this, `DC2 media
+/// session closed` needs the `session_opened` before it to say which DC and
+/// whether it was media, and a reader handed one batch — or a session whose
+/// open record predates the file — has neither. `peer` deliberately stays out:
+/// it is the client's address, one per session, and only [`SessionOpened`]
+/// carries it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Ctx {
+    #[prost(uint32, tag = "1")]
+    pub dc: u32,
+    #[prost(bool, tag = "2")]
+    pub is_media: bool,
+    /// The rung this event belongs to, where one applies. Unset for events that
+    /// belong to the session rather than to a route through it.
+    #[prost(enumeration = "Tier", tag = "3")]
+    pub tier: i32,
+}
+
+impl Ctx {
+    /// The context of one event, in the order the fields are declared.
+    pub fn new(dc: u32, is_media: bool, tier: Tier) -> Self {
+        Self {
+            dc,
+            is_media,
+            tier: tier as i32,
+        }
+    }
+}
 
 /// A client address, in one of the three encodings `70_SECURITY.md` defines.
 ///
@@ -693,7 +892,7 @@ pub fn fingerprint() -> u64 {
 }
 
 /// Every enum's discriminants, in declaration order.
-fn enum_values() -> [&'static [i32]; 9] {
+fn enum_values() -> [&'static [i32]; 13] {
     [
         &[
             Level::Unspecified as i32,
@@ -777,6 +976,27 @@ fn enum_values() -> [&'static [i32]; 9] {
             ErrorCode::FsUnsupported as i32,
             ErrorCode::WriterConflict as i32,
         ],
+        &[
+            DiscardReason::Unspecified as i32,
+            DiscardReason::Stale as i32,
+            DiscardReason::Closed as i32,
+        ],
+        &[
+            DomainSource::Unspecified as i32,
+            DomainSource::Github as i32,
+            DomainSource::Builtin as i32,
+        ],
+        &[
+            ShutdownPhase::Unspecified as i32,
+            ShutdownPhase::Requested as i32,
+            ShutdownPhase::Complete as i32,
+            ShutdownPhase::Forced as i32,
+        ],
+        &[
+            ShutdownSignal::Unspecified as i32,
+            ShutdownSignal::Term as i32,
+            ShutdownSignal::Int as i32,
+        ],
     ]
 }
 
@@ -784,7 +1004,7 @@ fn enum_values() -> [&'static [i32]; 9] {
 /// depends on every field number and type the format declares. Synthetic
 /// values, never written to a segment — including a `Peer` with both `hashed`
 /// and `encrypted` set, which a real record may not be.
-fn canonical_records() -> [LogRecord; 17] {
+fn canonical_records() -> [LogRecord; 22] {
     let record = |event: Event| LogRecord {
         ts_ns: 1,
         conn_id: 1,
@@ -796,8 +1016,7 @@ fn canonical_records() -> [LogRecord; 17] {
 
     [
         record(Event::SessionOpened(SessionOpened {
-            dc: 1,
-            is_media: true,
+            ctx: Some(Ctx::new(1, true, Tier::Ws)),
             peer: Some(Peer {
                 addr: vec![1],
                 port: 1,
@@ -806,29 +1025,30 @@ fn canonical_records() -> [LogRecord; 17] {
             }),
         })),
         record(Event::SessionClosed(SessionClosed {
-            dc: 1,
-            is_media: true,
-            tier: Tier::Ws as i32,
+            ctx: Some(Ctx::new(1, true, Tier::Cfproxy)),
             closed_by: ClosedBy::Client as i32,
             bytes_up: 1,
             bytes_down: 1,
             dur_ms: 1,
+            via: "v".to_string(),
         })),
         record(Event::TierAttempt(TierAttempt {
-            tier: Tier::Ws as i32,
-            dc: 1,
-            is_media: true,
+            ctx: Some(Ctx::new(1, true, Tier::Ws)),
+            host: "h".to_string(),
             ok: true,
             dur_ns: 1,
             err: ErrorCode::Dns as i32,
             err_code: 1,
+            errno: -1,
         })),
         record(Event::TierFallback(TierFallback {
+            ctx: Some(Ctx::new(1, true, Tier::Ws)),
             from_tier: Tier::Ws as i32,
             to_tier: Tier::Tcp as i32,
             reason: Reason::WsFail as i32,
         })),
         record(Event::CooldownArmed(CooldownArmed {
+            ctx: Some(Ctx::new(1, true, Tier::Cfworker)),
             kind: CooldownKind::WsFail as i32,
             key_display: "k".to_string(),
             dur_s: 1,
@@ -836,33 +1056,34 @@ fn canonical_records() -> [LogRecord; 17] {
             err_code: 1,
         })),
         record(Event::CooldownCleared(CooldownCleared {
+            ctx: Some(Ctx::new(1, true, Tier::Cfworker)),
             kind: CooldownKind::IpFail as i32,
             key_display: "k".to_string(),
         })),
         record(Event::CooldownSkipped(CooldownSkipped {
+            ctx: Some(Ctx::new(1, true, Tier::Cfworker)),
             kind: CooldownKind::UpstreamFail as i32,
             key_display: "k".to_string(),
         })),
         record(Event::PoolHit(PoolHit {
-            dc: 1,
-            is_media: true,
-            tier: Tier::Ws as i32,
+            ctx: Some(Ctx::new(1, true, Tier::Ws)),
+            left: 1,
         })),
         record(Event::PoolMiss(PoolMiss {
-            dc: 1,
-            is_media: true,
-            tier: Tier::Ws as i32,
+            ctx: Some(Ctx::new(1, true, Tier::Ws)),
         })),
         record(Event::PoolRefill(PoolRefill {
-            dc: 1,
-            is_media: true,
+            ctx: Some(Ctx::new(1, true, Tier::Ws)),
             added: 1,
+            ready: 1,
             dur_ms: 1,
-            tier: Tier::Ws as i32,
         })),
         record(Event::TlsHandshake(TlsHandshake {
+            ctx: Some(Ctx::new(1, true, Tier::Ws)),
             kind: HandshakeKind::Full as i32,
             dur_ns: 1,
+            err: ErrorCode::Tls as i32,
+            errno: -1,
         })),
         record(Event::RelayInitRetries(RelayInitRetries { n: 1 })),
         record(Event::AcceptError(AcceptError {
@@ -896,6 +1117,29 @@ fn canonical_records() -> [LogRecord; 17] {
             }],
             tiers: vec!["t".to_string()],
             categories: vec!["c".to_string()],
+        })),
+        record(Event::PoolDiscard(PoolDiscard {
+            ctx: Some(Ctx::new(1, true, Tier::Cfworker)),
+            reason: DiscardReason::Stale as i32,
+        })),
+        record(Event::WarmupComplete(WarmupComplete {
+            ready: 1,
+            dur_ms: 1,
+        })),
+        record(Event::AttemptSkipped(AttemptSkipped {
+            ctx: Some(Ctx::new(1, true, Tier::Mtproto)),
+            tier: Tier::Mtproto as i32,
+            reason: Reason::Pinned as i32,
+        })),
+        record(Event::DomainListFetched(DomainListFetched {
+            source: DomainSource::Builtin as i32,
+            count: 1,
+            err: ErrorCode::Dns as i32,
+            err_code: 1,
+        })),
+        record(Event::Shutdown(Shutdown {
+            phase: ShutdownPhase::Forced as i32,
+            signal: ShutdownSignal::Term as i32,
         })),
     ]
 }
@@ -968,23 +1212,39 @@ fn batch_of(records: &[LogRecord], mut conns: Vec<u64>) -> LogBatch {
 /// decided rather than a silent zero.
 fn shape(record: &LogRecord) -> (u32, Option<u32>, bool) {
     match &record.event {
-        Some(Event::SessionOpened(e)) => (16, Some(e.dc), e.is_media),
-        Some(Event::SessionClosed(e)) => (17, Some(e.dc), e.is_media),
-        Some(Event::TierAttempt(e)) => (18, Some(e.dc), e.is_media),
-        Some(Event::TierFallback(_)) => (19, None, false),
-        Some(Event::CooldownArmed(_)) => (20, None, false),
-        Some(Event::CooldownCleared(_)) => (21, None, false),
-        Some(Event::CooldownSkipped(_)) => (22, None, false),
-        Some(Event::PoolHit(e)) => (23, Some(e.dc), e.is_media),
-        Some(Event::PoolMiss(e)) => (24, Some(e.dc), e.is_media),
-        Some(Event::PoolRefill(e)) => (25, Some(e.dc), e.is_media),
-        Some(Event::TlsHandshake(_)) => (26, None, false),
+        Some(Event::SessionOpened(e)) => tagged(16, &e.ctx),
+        Some(Event::SessionClosed(e)) => tagged(17, &e.ctx),
+        Some(Event::TierAttempt(e)) => tagged(18, &e.ctx),
+        Some(Event::TierFallback(e)) => tagged(19, &e.ctx),
+        Some(Event::CooldownArmed(e)) => tagged(20, &e.ctx),
+        Some(Event::CooldownCleared(e)) => tagged(21, &e.ctx),
+        Some(Event::CooldownSkipped(e)) => tagged(22, &e.ctx),
+        Some(Event::PoolHit(e)) => tagged(23, &e.ctx),
+        Some(Event::PoolMiss(e)) => tagged(24, &e.ctx),
+        Some(Event::PoolRefill(e)) => tagged(25, &e.ctx),
+        Some(Event::TlsHandshake(e)) => tagged(26, &e.ctx),
         Some(Event::RelayInitRetries(_)) => (27, None, false),
         Some(Event::AcceptError(_)) => (28, None, false),
         Some(Event::FdSnapshot(_)) => (29, None, false),
         Some(Event::ProbeResult(_)) => (30, None, false),
         Some(Event::LogOverflow(_)) => (31, None, false),
         Some(Event::StartupSummary(_)) => (32, None, false),
+        Some(Event::PoolDiscard(e)) => tagged(33, &e.ctx),
+        Some(Event::WarmupComplete(_)) => (34, None, false),
+        Some(Event::AttemptSkipped(e)) => tagged(35, &e.ctx),
+        Some(Event::DomainListFetched(_)) => (36, None, false),
+        Some(Event::Shutdown(_)) => (37, None, false),
         None => (0, None, false),
+    }
+}
+
+/// A record's oneof tag together with the DC and media flag its [`Ctx`] carries,
+/// which is what the batch header's masks are made of. A session-scoped event
+/// without a context — the schema allows it, no producer writes it — contributes
+/// no DC rather than a wrong one.
+fn tagged(tag: u32, ctx: &Option<Ctx>) -> (u32, Option<u32>, bool) {
+    match ctx {
+        Some(ctx) => (tag, Some(ctx.dc), ctx.is_media),
+        None => (tag, None, false),
     }
 }

@@ -414,8 +414,13 @@ async fn a_ladder_walk_lands_in_the_segment_as_attempts_and_fallbacks() {
         crate::log::schema::Category::Routing as i32
     );
     assert_eq!(attempt.0.level, crate::log::schema::Level::Debug as i32);
-    assert_eq!(attempt.1.tier, LogTier::Ws as i32);
-    assert_eq!(attempt.1.dc, 2);
+    let ctx = attempt
+        .1
+        .ctx
+        .as_ref()
+        .expect("the attempt carries its session");
+    assert_eq!(ctx.tier, LogTier::Ws as i32);
+    assert_eq!(ctx.dc, 2);
     assert!(!attempt.1.ok);
     assert_eq!(attempt.1.err, ErrorCode::TcpConnect as i32);
     assert_eq!(attempt.1.err_code, 0);

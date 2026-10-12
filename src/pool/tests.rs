@@ -126,9 +126,10 @@ async fn a_miss_is_recorded_against_the_pool_rather_than_the_caller() {
     assert_eq!(miss.0.conn_id, 0, "a pool record belongs to the pool");
     assert_eq!(miss.0.category, Category::Pool as i32);
     assert_eq!(miss.0.level, Level::Debug as i32);
-    assert_eq!(miss.1.dc, 2);
-    assert!(!miss.1.is_media);
-    assert_eq!(miss.1.tier, Tier::Ws as i32);
+    let ctx = miss.1.ctx.as_ref().expect("the miss carries its bucket");
+    assert_eq!(ctx.dc, 2);
+    assert!(!ctx.is_media);
+    assert_eq!(ctx.tier, Tier::Ws as i32);
 
     std::fs::remove_dir_all(&dir).expect("the temp dir is ours");
 }

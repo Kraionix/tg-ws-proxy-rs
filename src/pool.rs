@@ -29,7 +29,7 @@ use futures_util::{FutureExt, StreamExt, stream};
 
 use crate::config::{Config, UpstreamTier};
 use crate::log::LogHandle;
-use crate::log::schema::{Category, Event, Level, PoolHit, PoolMiss, PoolRefill, Tier};
+use crate::log::schema::{Category, Ctx, Event, Level, PoolHit, PoolMiss, PoolRefill, Tier};
 use crate::outbound::OutboundConnector;
 use crate::runtime::Runtime;
 use crate::ws_client::{
@@ -255,7 +255,12 @@ impl WsPool {
                 media_tag(is_media),
                 remaining
             );
-            self.log_hit(Tier::Ws, dc, is_media);
+            self.log_hit(
+                Tier::Ws,
+                dc,
+                is_media,
+                remaining.min(u32::MAX as usize) as u32,
+            );
 
             // Schedule a background task to refill the bucket.
             if allow_refill {
@@ -306,8 +311,9 @@ impl WsPool {
                 continue;
             }
 
+            let remaining = bucket.len().min(u32::MAX as usize) as u32;
             drop(lock);
-            self.log_hit(tier.to_schema(), dc, is_media);
+            self.log_hit(tier.to_schema(), dc, is_media, remaining);
             self.cf_prefetch(CfTarget {
                 tier,
                 dc,
@@ -403,7 +409,8 @@ impl WsPool {
             // the run still happens, and a record saying it added none of the
             // none it was asked for is noise.
             if self.pool_size > 0 {
-                self.log_refill(Tier::Ws, dc, is_media, added, elapsed);
+                let ready = bucket.len().min(u32::MAX as usize) as u32;
+                self.log_refill(Tier::Ws, dc, is_media, added, ready, elapsed);
             }
         }
 
@@ -419,16 +426,15 @@ impl WsPool {
             .filter(|handle| handle.enabled(Category::Pool, level))
     }
 
-    fn log_hit(&self, tier: Tier, dc: u32, is_media: bool) {
+    fn log_hit(&self, tier: Tier, dc: u32, is_media: bool, left: u32) {
         if let Some(handle) = self.logging(Level::Debug) {
             handle.emit(
                 0,
                 Category::Pool,
                 Level::Debug,
                 Event::PoolHit(PoolHit {
-                    dc,
-                    is_media,
-                    tier: tier as i32,
+                    ctx: Some(Ctx::new(dc, is_media, tier)),
+                    left,
                 }),
             );
         }
@@ -441,26 +447,31 @@ impl WsPool {
                 Category::Pool,
                 Level::Debug,
                 Event::PoolMiss(PoolMiss {
-                    dc,
-                    is_media,
-                    tier: tier as i32,
+                    ctx: Some(Ctx::new(dc, is_media, tier)),
                 }),
             );
         }
     }
 
-    fn log_refill(&self, tier: Tier, dc: u32, is_media: bool, added: u32, dur: Duration) {
+    fn log_refill(
+        &self,
+        tier: Tier,
+        dc: u32,
+        is_media: bool,
+        added: u32,
+        ready: u32,
+        dur: Duration,
+    ) {
         if let Some(handle) = self.logging(Level::Debug) {
             handle.emit(
                 0,
                 Category::Pool,
                 Level::Debug,
                 Event::PoolRefill(PoolRefill {
-                    dc,
-                    is_media,
+                    ctx: Some(Ctx::new(dc, is_media, tier)),
                     added,
+                    ready,
                     dur_ms: dur.as_millis().min(u32::MAX as u128) as u32,
-                    tier: tier as i32,
                 }),
             );
         }
@@ -529,13 +540,21 @@ impl WsPool {
                 added += 1;
             }
 
+            let ready = lock.get(&(dc, is_media)).map_or(0, |b| b.len());
             debug!(
                 "pool refilled DC{}{}: {} ready",
                 dc,
                 media_tag(is_media),
-                lock.get(&(dc, is_media)).map_or(0, |b| b.len())
+                ready
             );
-            self.log_refill(Tier::Ws, dc, is_media, added, started.elapsed());
+            self.log_refill(
+                Tier::Ws,
+                dc,
+                is_media,
+                added,
+                ready.min(u32::MAX as usize) as u32,
+                started.elapsed(),
+            );
         }
     }
 
@@ -555,12 +574,16 @@ impl WsPool {
         let Some(ws) = self.cf_connect_one(&target).await else {
             // A refill that was asked for something and produced nothing is
             // worth a record: it is what a dead Worker or a broken CF route
-            // looks like from the pool's side.
+            // looks like from the pool's side. The bucket's own length is the
+            // "ready" half, and it is read rather than assumed — the bucket may
+            // have been filled by another refill while this one was dialling.
+            let ready = self.cf_idle.lock().await.get(&key).map_or(0, Vec::len);
             self.log_refill(
                 target.tier.to_schema(),
                 target.dc,
                 target.is_media,
                 0,
+                ready.min(u32::MAX as usize) as u32,
                 started.elapsed(),
             );
             return;
@@ -593,6 +616,7 @@ impl WsPool {
                 target.dc,
                 target.is_media,
                 1,
+                bucket.len().min(u32::MAX as usize) as u32,
                 started.elapsed(),
             );
         }
