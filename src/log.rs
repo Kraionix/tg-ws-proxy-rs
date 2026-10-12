@@ -43,6 +43,7 @@ use tokio::task::JoinHandle;
 
 use schema::{Category, Event, Level, LogRecord};
 
+pub mod render;
 pub mod schema;
 pub mod storage;
 mod writer;

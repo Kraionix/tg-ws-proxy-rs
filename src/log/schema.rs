@@ -1004,7 +1004,11 @@ fn enum_values() -> [&'static [i32]; 13] {
 /// depends on every field number and type the format declares. Synthetic
 /// values, never written to a segment — including a `Peer` with both `hashed`
 /// and `encrypted` set, which a real record may not be.
-fn canonical_records() -> [LogRecord; 22] {
+///
+/// The text view renders this same corpus in `render::tests`, which is how a
+/// variant that gains no line is caught twice: once by the exhaustive match and
+/// once by a test that would otherwise be looking at an empty line.
+pub(crate) fn canonical_records() -> [LogRecord; 22] {
     let record = |event: Event| LogRecord {
         ts_ns: 1,
         conn_id: 1,
