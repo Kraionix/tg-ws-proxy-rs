@@ -163,8 +163,12 @@ TG_LISTEN_FAKETLS_DOMAIN=www.yandex.ru
 TG_POOL_SIZE=4
 TG_BUF_KB=256
 TG_MAX_CONNECTIONS=64
-TG_QUIET=true
-TG_VERBOSE=false
+TG_TEXT_LOG=stderr
+TG_TEXT_LEVEL=info
+TG_RING_LEVEL=debug
+TG_RING_CAPACITY=512
+TG_QUIET=true          # legacy alias for TG_TEXT_LOG=off
+TG_VERBOSE=false       # legacy alias for TG_TEXT_LEVEL=debug
 TG_SKIP_TLS_VERIFY=false
 TG_CF_DOMAIN=yourdomain.com
 TG_CF_WORKER_DOMAIN=random-symbols-1234.username.workers.dev
@@ -179,7 +183,8 @@ TG_FRONTING_DOMAIN=sprinthost.ru
 TG_OUTBOUND_PROXY=socks5h://user:pass@192.168.1.1:1080
 TG_NO_OUTBOUND_PROXY=false
 TG_NO_PROXY=localhost,127.0.0.1
-TG_LOG_FILE=/var/log/tg-ws-proxy.log
+TG_TEXT_LOG=/var/log/tg-ws-proxy.log
+TG_LOG_DIR=/mnt/usb/tgws-logs
 TG_MTPROTO_PROXY=proxy.example.com:443:ddabcdef1234567890abcdef1234567890
 ```
 
@@ -195,10 +200,15 @@ fixed: ANSI escape codes are automatically disabled when running on Windows or
 when stderr is not a terminal (e.g. output is piped or redirected).
 
 If you prefer completely clean logs or want to capture them to a file, use
-`--log-file`:
+`--text-log` (the rendered text is written as it is produced — there is no
+buffer to lose):
 
 ```bash
-tg-ws-proxy --log-file proxy.log
+tg-ws-proxy --text-log proxy.log
 # or
-set TG_LOG_FILE=proxy.log && tg-ws-proxy
+set TG_TEXT_LOG=proxy.log && tg-ws-proxy
 ```
+
+The startup banner goes to stdout, not into that file: redirect stdout too
+(`tg-ws-proxy --text-log proxy.log > proxy.log`) if you want one file with
+everything, including the `tg://` link.

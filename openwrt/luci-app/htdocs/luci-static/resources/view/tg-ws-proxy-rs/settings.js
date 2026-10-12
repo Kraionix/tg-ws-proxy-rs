@@ -108,16 +108,16 @@ function binaryNode(binary) {
 
 function formatLogLine(line) {
 	const value = String(line || '');
-	const traced = value.match(/^[A-Z][a-z]{2}\s+([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\d{4}\s+\S+\s+tg-ws-proxy-rs\[\d+\]:\s+\d{4}-\d{2}-\d{2}T\S+\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+(\S+):\s*(.*)$/);
-	if (traced) {
-		const level = traced[2];
-		const target = traced[3];
-		if ((level === 'TRACE' || level === 'DEBUG') &&
-			!/^tg_ws_proxy(?:_rs)?(?:::|$)/.test(target))
-			return null;
-		return `${traced[1]} [${level}] ${target} — ${traced[4]}`;
-	}
+	// The console text is rendered from the structured records: an ISO-8601 UTC
+	// timestamp, a five-column level, then the message. logd has already
+	// prefixed its own local time, and the record's is the same instant in UTC,
+	// so it is dropped rather than shown twice.
+	const record = value.match(/^[A-Z][a-z]{2}\s+([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\d{4}\s+\S+\s+tg-ws-proxy-rs\[\d+\]:\s+\d{4}-\d{2}-\d{2}T\S+\s+(DEBUG|INFO|WARN|ERROR)\s+(.*)$/);
+	if (record)
+		return `${record[1]} [${record[2]}] ${record[3]}`;
 
+	// Anything else is a line that is not a record — the startup banner on
+	// stdout, the tg-ws-proxy: ones on stderr — and is shown as it came.
 	const plain = value.match(/^[A-Z][a-z]{2}\s+([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+\d{4}\s+\S+\s+tg-ws-proxy-rs\[\d+\]:\s*(.*)$/);
 	return plain ? `${plain[1]} ${plain[2]}` : value;
 }
@@ -376,7 +376,8 @@ return view.extend({
 		o = addSeconds(s, 'fronting_fail_cooldown', _('Fronting failure cooldown'), null, '60');
 
 		o = s.taboption('logging', form.ListValue, 'log_level', _('Log level'),
-			_('Native Rust tracing level passed through RUST_LOG.'));
+			_('How much of the console text log to render. The log is a projection of ' +
+			  'the structured records; "off" renders nothing, "debug" adds the per-rung ladder.'));
 		o.value('off', _('Off'));
 		o.value('error', _('Error'));
 		o.value('warn', _('Warn'));

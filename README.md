@@ -266,11 +266,13 @@ tg-ws-proxy [OPTIONS]
 | `--no-proxy <LIST>` | — | Comma-separated host bypass list for `--outbound-proxy` |
 | `--check` | off | Test every configured CF domain and MTProto proxy, print OK/FAIL with latency, then exit `0` if all pass and `1` otherwise |
 | `--check-listener` | off | Implies `--check`: binds and serves, probes its own listener end-to-end (obfuscation handshake, a real `req_pq_multi`, the DC's `resPQ` back), then exits with the check's code |
-| `--log-file <PATH>` | — | Write logs to a file instead of stderr (no ANSI color codes) |
-| `--log-dir <PATH>` | off | Write structured event segments (one file per UTC day) to this directory; without it the structured sink is off and nothing else changes (see [docs/Logging.md](docs/Logging.md)) |
-| `--log-level <LEVEL>` | `info` | Floor for the structured sink, adjustable per category with `--log-category`; the ladder's per-rung decisions (`session_opened`, `tier_attempt`, `pool_*`) are `debug` |
-| `-q / --quiet` | off | Suppress all log output |
-| `-v / --verbose` | off | Debug logging |
+| `--text-log <stderr\|stdout\|off\|PATH>` | `stderr` | Where the text log goes; a path is appended to. The text is rendered from the same records the segments hold (see [docs/Logging.md](docs/Logging.md)) |
+| `--text-level <LEVEL>` | `info` | Floor for the text log; `debug` adds the per-rung ladder (`session_opened`, `tier_attempt`, `pool_*`) and refused handshakes |
+| `--ring-level <LEVEL>` / `--ring-capacity <N>` | `info` / `512` | The RAM ring behind `SIGUSR1`, which dumps the last records to the text log |
+| `--log-dir <PATH>` | off | Write the records as one segment file per UTC day in this directory. Unset keeps them in memory only — the text log still works |
+| `--log-level <LEVEL>` | `info` | Floor for the segment, adjustable per category with `--log-category` |
+| `-q / --quiet` | off | Legacy alias for `--text-log off` (the startup banner still prints) |
+| `-v / --verbose` | off | Legacy alias for `--text-level debug` |
 | `--danger-accept-invalid-certs` | off | Skip TLS verification |
 | `-V / --version` | — | Print the version and exit |
 
@@ -331,8 +333,12 @@ tg-ws-proxy --host 0.0.0.0
 # Public home server: inbound ee FakeTLS, backend still WSS to Telegram Web
 tg-ws-proxy --host 0.0.0.0 --port 443 --listen-faketls-domain www.yandex.ru
 
-# Log to a file instead of stderr (no garbled ANSI codes — useful on Windows)
-tg-ws-proxy --log-file proxy.log
+# Write the text log to a file instead of stderr (no garbled ANSI codes — useful on Windows)
+tg-ws-proxy --text-log proxy.log
+
+# Keep the records themselves, one segment per UTC day, and dump the last few
+# hundred to the console on SIGUSR1 when something goes wrong
+tg-ws-proxy --log-dir /tmp/tgws-logs --ring-level debug
 
 # All options via environment variables (useful for Docker / systemd)
 TG_PORT=1443 TG_SECRET=deadbeef... tg-ws-proxy
@@ -362,7 +368,7 @@ cooldown are all documented in [docs/Fallbacks.md](docs/Fallbacks.md).
 | Guide | Covers |
 |---|---|
 | [docs/Fallbacks.md](docs/Fallbacks.md) | Routing tiers: Cloudflare proxy/Worker, default domains, domain fronting, upstream MTProto proxies, inbound FakeTLS, outbound proxy |
-| [docs/Logging.md](docs/Logging.md) | Structured event log: what it records, which filesystem to put it on, what it costs, and how to read a segment back |
+| [docs/Logging.md](docs/Logging.md) | The record stream and the text log rendered from it: the flags, the ring and `SIGUSR1`, what gets recorded, which filesystem to put the segments on, what it costs, and how to read a segment back |
 | [docs/Building.md](docs/Building.md) | Building, cross-compiling for OpenWrt, and shrinking the binary with UPX |
 | [docs/Deployment.md](docs/Deployment.md) | Docker, router deployment, OpenWrt init script, environment variables |
 | [docs/OpenWrtPackage.md](docs/OpenWrtPackage.md) | Standalone APK/IPK builds, UCI/procd configuration, installer, upgrades and rollback |

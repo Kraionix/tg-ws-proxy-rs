@@ -141,9 +141,13 @@ Every flag except `--dc-ip` also has a `TG_*` environment variable. Booleans acc
 | `TG_NO_OUTBOUND_PROXY` | `--no-outbound-proxy` | `false` | Ignore the standard proxy environment variables |
 | `TG_NO_PROXY` | `--no-proxy` | — | Comma-separated bypass list for `--outbound-proxy` |
 | `TG_CHECK` | `--check` | `false` | Probe every configured CF domain / MTProto proxy, print OK/FAIL, exit |
-| `TG_LOG_FILE` | `--log-file` | — | Write logs to a file instead of stderr (needs a mounted, writable volume) |
-| `TG_VERBOSE` | `-v` / `--verbose` | `false` | Debug logging |
-| `TG_QUIET` | `-q` / `--quiet` | `false` | Suppress all log output |
+| `TG_TEXT_LOG` | `--text-log` | `stderr` | Where the rendered text goes: `stderr`, `stdout`, `off` or a path (needs a mounted, writable volume) |
+| `TG_TEXT_LEVEL` | `--text-level` | `info` | Floor for the text log; `debug` adds the per-rung ladder |
+| `TG_RING_LEVEL` | `--ring-level` | `info` | Floor for the RAM ring that `SIGUSR1` dumps to the text log |
+| `TG_RING_CAPACITY` | `--ring-capacity` | `512` | Records the ring holds (64…4096) |
+| `TG_LOG_DIR` | `--log-dir` | — | Store the records as one segment per UTC day in this directory (needs a writable volume with a supported filesystem, not FAT) |
+| `TG_VERBOSE` | `-v` / `--verbose` | `false` | Legacy alias for `TG_TEXT_LEVEL=debug` |
+| `TG_QUIET` | `-q` / `--quiet` | `false` | Legacy alias for `TG_TEXT_LOG=off`; the startup banner is not affected |
 | `TG_SKIP_TLS_VERIFY` | `--danger-accept-invalid-certs` | `false` | Skip TLS verification |
 
 Additional timeout and cooldown knobs (`TG_WS_CONNECT_TIMEOUT`,
@@ -205,8 +209,10 @@ docker run --rm valnesfjord/tg-ws-proxy-rs --check --default-domains
   WebSocket path, so it is only a useful health signal when those are configured.
   Point it at your own domains rather than at `--default-domains`, which probes
   the whole fetched list.
-- The proxy keeps no state on disk. A volume is only needed for `TG_LOG_FILE`, and
-  the mounted directory must be writable by UID 1000.
+- The proxy keeps no state on disk. A volume is only needed for `TG_TEXT_LOG`
+  (a text file) or `TG_LOG_DIR` (the segments), and the mounted directory must
+  be writable by UID 1000. The segment directory has to be on `ext4`, `xfs`,
+  `btrfs`, `f2fs`, `tmpfs` or `overlayfs`; a FAT mount is refused at startup.
 
 ## Documentation
 

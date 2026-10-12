@@ -99,17 +99,21 @@ for expected in \
     'TG_LISTEN_FAKETLS_DOMAIN=www.google.com' \
     'TG_OUTBOUND_PROXY=socks5h://127.0.0.1:5330' \
     'TG_CF_WORKER_DOMAIN=worker-one.example,worker-two.example' \
-    'RUST_LOG=warn,tg_ws_proxy=trace,tg_ws_proxy_rs=trace' \
+    'TG_TEXT_LEVEL=debug' \
     'TG_CF_PRIORITY=true' \
     'TG_CF_DOMAIN=one.example,two.example'; do
     has_env "$expected" || { printf 'FAIL: missing env %s\n' "$expected" >&2; exit 1; }
 done
 
-for legacy_env in TG_LOG_FILE TG_VERBOSE TG_QUIET; do
+# RUST_LOG no longer carries the console's level: since the text-log rework it
+# only turns on other crates' lines, and the package does not want those.
+for gone in RUST_LOG TG_LOG_FILE TG_VERBOSE TG_QUIET; do
     for item in "${ENVS[@]}"; do
-        [[ "$item" != "$legacy_env="* ]] || { printf 'FAIL: legacy env %s is still passed\n' "$legacy_env" >&2; exit 1; }
+        [[ "$item" != "$gone="* ]] || { printf 'FAIL: %s is still passed\n' "$gone" >&2; exit 1; }
     done
 done
+# `trace` is not a level the text view has; it is mapped to `debug`.
+has_env 'TG_TEXT_LEVEL=debug' || { printf 'FAIL: trace did not map to the text view\n' >&2; exit 1; }
 has_event 'append:command:--dc-ip 2:149.154.167.220' || { printf 'FAIL: missing DC2 command argument\n' >&2; exit 1; }
 has_event 'append:command:--dc-ip 4:149.154.167.220' || { printf 'FAIL: missing DC4 command argument\n' >&2; exit 1; }
 
@@ -130,7 +134,7 @@ CFG[main.enabled]=1
 CFG[main.secret]=0123456789abcdef0123456789abcdef
 CFG[main.verbose]=1
 start_service
-has_env 'RUST_LOG=warn,tg_ws_proxy=debug,tg_ws_proxy_rs=debug' || { printf 'FAIL: legacy verbose=1 did not map to app-only debug\n' >&2; exit 1; }
+has_env 'TG_TEXT_LEVEL=debug' || { printf 'FAIL: legacy verbose=1 did not map to the text log\n' >&2; exit 1; }
 for item in "${EVENTS[@]}"; do
     [[ "$item" != uci:-q\ set* && "$item" != uci:-q\ delete* && "$item" != 'uci:-q commit'* ]] || {
         printf 'FAIL: start_service mutates UCI: %s\n' "$item" >&2; exit 1;
@@ -143,7 +147,10 @@ CFG[main.secret]=0123456789abcdef0123456789abcdef
 CFG[main.verbose]=1
 CFG[main.quiet]=1
 start_service
-has_env 'RUST_LOG=off' || { printf 'FAIL: legacy quiet=1 did not take precedence as off\n' >&2; exit 1; }
+has_env 'TG_TEXT_LOG=off' || { printf 'FAIL: legacy quiet=1 did not take precedence as off\n' >&2; exit 1; }
+for item in "${ENVS[@]}"; do
+    [[ "$item" != 'TG_TEXT_LEVEL='* ]] || { printf 'FAIL: quiet=1 still set a text level\n' >&2; exit 1; }
+done
 
 # A missing secret is an installation error, not a reason to mutate UCI on start.
 EVENTS=(); ENVS=(); CFG=(); LISTS=()

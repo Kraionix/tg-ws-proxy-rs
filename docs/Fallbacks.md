@@ -56,8 +56,9 @@ Pin semantics:
   behind it refuses to start (`--cf-worker-domain` / `--cf-domain` /
   `--default-domains` / `--mtproto-proxy`), because that class would
   otherwise drop every connection at runtime. `ws` is judged per connection
-  instead — it is skipped with a log line for a DC without a `--dc-ip`
-  target, since availability differs per DC.
+  instead — it is skipped for a DC without a `--dc-ip` target, which is an
+  `attempt_skipped` record (and a line at `--text-level debug`), since
+  availability differs per DC.
 - When every listed tier fails, the connection is **dropped** — the tiers
   left out are not quietly re-added as fallbacks. That is deliberate: if you
   pinned media to raw TCP so bulk transfers leave from a particular egress,

@@ -8,14 +8,20 @@ The listen address should be `127.0.0.1` so Telegram on the same phone can
 connect.
 
 Add `--secret <32 hex chars>` if you want the link to stay the same across
-restarts. `--log-file` is ignored; logs go to the on-screen view and logcat
-(`tg-ws-proxy`).
+restarts.
 
-The default arguments carry `--quiet`, so the on-screen **Log** panel stays
-empty until you remove it. That is the default and not a failed start: drop
-`--quiet` (or swap it for `--verbose`) before tapping **Start** to see log
-lines. The `tg://` link appears either way — it reaches the UI from the listen
-callback rather than by scraping the log, so `--quiet` never hides it.
+The default arguments carry `--quiet`, so a run with them logs nothing to the
+device. That is the default and not a failed start: drop it (or pass
+`--text-level debug`) before tapping **Start**. `--quiet` and `--verbose` still
+work — they are aliases for `--text-log off` and `--text-level debug`.
+
+**The on-screen Log panel is behind the text-log rework.** The proxy's own lines
+are records now, and the panel is fed by the `tracing` layer, which carries only
+other crates' lines — so the panel shows nothing of the proxy's own output until
+the app grows a consumer for the record stream. What still works: the proxy
+starts, the `tg://` link arrives through the listen callback (not by scraping
+the log), and `--log-file` is gone — `--text-log` writes the rendered text to a
+path the app can read.
 
 ## Requirements
 

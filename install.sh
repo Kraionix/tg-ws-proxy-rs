@@ -889,8 +889,10 @@ LINK_IP="$link_ip"
 # routing fallbacks.
 DEFAULT_DOMAINS="true"
 
-# quiet | info | verbose -- written to $ENTWARE_ROOT/var/log/tg-ws-proxy-rs.log
-# below here. "quiet" writes nothing at all, so status has no link to print.
+# quiet | info | verbose -- how much the proxy renders to
+# $ENTWARE_ROOT/var/log/tg-ws-proxy-rs.log. This is the *text* log: "quiet"
+# renders nothing there, "verbose" renders the per-rung ladder too. The startup
+# banner (which carries the tg:// link) is printed to stdout either way.
 LOG_LEVEL="info"
 
 # Direct WebSocket target per DC, as DC:IP pairs, comma-separated, e.g.
@@ -1012,11 +1014,12 @@ export_environment() {
 	[ -n "$PORT" ] && export TG_PORT="$PORT"
 	[ -n "$LINK_IP" ] && export TG_LINK_IP="$LINK_IP"
 	export TG_SECRET="$SECRET"
-	export TG_LOG_FILE="$LOGFILE"
+	export TG_TEXT_LOG="$LOGFILE"
 
 	case "$LOG_LEVEL" in
-		quiet) export TG_QUIET=true ;;
-		verbose) export TG_VERBOSE=true ;;
+		quiet) export TG_TEXT_LOG=off ;;
+		verbose) export TG_TEXT_LEVEL=debug ;;
+		*) export TG_TEXT_LEVEL=info ;;
 	esac
 
 	[ -n "$DEFAULT_DOMAINS" ] && export TG_DEFAULT_DOMAINS="$DEFAULT_DOMAINS"
@@ -1054,9 +1057,9 @@ print_link() {
 }
 
 # A bound listener is what readiness means here, not a line in the log: with
-# LOG_LEVEL="quiet" the proxy writes nothing at all, so waiting on a banner
-# would call a healthy proxy failed. The banner is only where the link comes
-# from, which is why a start with no link still succeeds.
+# LOG_LEVEL="quiet" the text log renders nothing at all, so waiting on a log
+# line would call a healthy proxy failed. The banner is only where the link
+# comes from, which is why a start with no link still succeeds.
 listener_ready() {
 	port="$PORT"
 	[ -n "$port" ] || port=1443
@@ -1100,17 +1103,18 @@ start() {
 		IFS="$old_ifs"
 	fi
 
-	# stderr goes to the log file rather than /dev/null: with TG_LOG_FILE set the
-	# binary writes its tracing there and keeps stderr for the startup errors
-	# that happen before any logging exists -- an invalid listen address, an
-	# unreadable config, a bind that failed anyway. Those are exactly the lines
-	# the caller prints from the tail of this file when the start fails.
-	stderr_file=/dev/null
+	# Both streams go to the log file rather than /dev/null. stderr carries the
+	# startup errors that happen before any logging exists -- an invalid listen
+	# address, an unreadable config, a bind that failed anyway -- and the
+	# tg-ws-proxy: lines; stdout carries the startup banner, which is where
+	# print_link reads the tg:// link from. Those are exactly the lines the
+	# caller prints from the tail of this file when the start fails.
+	log_file=/dev/null
 	if [ -d "${LOGFILE%/*}" ]; then
-		stderr_file="$LOGFILE"
+		log_file="$LOGFILE"
 	fi
 	# shellcheck disable=SC2086 # EXTRA_ARGS is a list of arguments, not one.
-	"$PROG" "$@" $EXTRA_ARGS >/dev/null 2>>"$stderr_file" &
+	"$PROG" "$@" $EXTRA_ARGS >>"$log_file" 2>>"$log_file" &
 
 	tries=0
 	while [ "$tries" -lt 15 ]; do

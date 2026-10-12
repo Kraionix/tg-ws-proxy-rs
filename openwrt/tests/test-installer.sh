@@ -553,4 +553,38 @@ fi
     exit 1
 }
 
+# The console text is a projection of the records now, so LOG_LEVEL picks the
+# text view's floor and the file it is rendered into is --text-log's. `quiet`
+# turns the view off rather than setting a level, `verbose` means debug, and
+# nothing sets RUST_LOG: since the rework it only turns on other crates' lines.
+cfg_root="$tmp/text-env"
+mkdir -p "$cfg_root/etc/tg-ws-proxy-rs" "$cfg_root/etc/init.d" "$cfg_root/var/log"
+printf 'SECRET=0123456789abcdef0123456789abcdef\n' > "$cfg_root/etc/tg-ws-proxy-rs/secret.conf"
+ENTWARE_ROOT="$cfg_root"
+ENTWARE_INIT="$cfg_root/etc/init.d/S99tg-ws-proxy-rs"
+write_entware_init
+# The dispatcher at the end of the generated script exits when it is sourced
+# without an action, so it is dropped before the functions are sourced.
+init_functions="$tmp/init-functions.sh"
+sed '/^case "\$ACTION" in$/,$d' "$ENTWARE_INIT" > "$init_functions"
+
+check_text_env() { # level expected_text_log expected_text_level
+    local level="$1" want_log="$2" want_level="$3" got
+    printf 'LOG_LEVEL=%s\n' "$level" > "$cfg_root/etc/tg-ws-proxy-rs/config.conf"
+    got="$(
+        # shellcheck disable=SC1090 # a generated path, not a literal one.
+        . "$init_functions"
+        load_config
+        export_environment
+        printf '%s|%s' "${TG_TEXT_LOG-}" "${TG_TEXT_LEVEL-}"
+    )"
+    [ "$got" = "$want_log|$want_level" ] || {
+        printf 'FAIL: LOG_LEVEL=%s exported %s, wanted %s\n' "$level" "$got" "$want_log|$want_level" >&2
+        exit 1
+    }
+}
+check_text_env quiet off ''
+check_text_env verbose "$cfg_root/var/log/tg-ws-proxy-rs.log" debug
+check_text_env info "$cfg_root/var/log/tg-ws-proxy-rs.log" info
+
 printf 'PASS: installer contract\n'
