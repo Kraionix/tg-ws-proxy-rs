@@ -1315,24 +1315,24 @@ fn rich_batch() -> LogBatch {
             let r = next();
             let event = match r % 5 {
                 0 => Event::SessionClosed(SessionClosed {
-                    dc: 1 + (r % 5) as u32,
-                    is_media: r % 2 == 0,
-                    tier: Tier::Ws as i32,
+                    ctx: Some(Ctx::new(1 + (r % 5) as u32, r % 2 == 0, Tier::Ws)),
                     closed_by: ClosedBy::Client as i32,
                     bytes_up: r % 1_000_000,
                     bytes_down: r % 4_000_000,
                     dur_ms: (r % 600_000) as u32,
+                    via: format!("kws{}.web.telegram.org", 1 + r % 5),
                 }),
                 1 => Event::TierAttempt(TierAttempt {
-                    tier: Tier::Cfproxy as i32,
-                    dc: 1 + (r % 5) as u32,
-                    is_media: r % 2 == 0,
+                    ctx: Some(Ctx::new(1 + (r % 5) as u32, r % 2 == 0, Tier::Cfproxy)),
+                    host: format!("cf{}.example.com", 1 + r % 3),
                     ok: r % 3 == 0,
                     dur_ns: r % 40_000_000_000,
                     err: ErrorCode::TlsTimeout as i32,
                     err_code: (r % 600) as u32,
+                    errno: (r % 120) as i32,
                 }),
                 2 => Event::CooldownArmed(CooldownArmed {
+                    ctx: Some(Ctx::new(1 + (r % 5) as u32, r % 2 == 0, Tier::Ws)),
                     kind: CooldownKind::WsFail as i32,
                     key_display: format!("kws{}.web.telegram.org:443", 1 + r % 5),
                     dur_s: 300,
@@ -1340,13 +1340,15 @@ fn rich_batch() -> LogBatch {
                     err_code: 0,
                 }),
                 3 => Event::PoolHit(PoolHit {
-                    dc: 1 + (r % 5) as u32,
-                    is_media: r % 2 == 0,
-                    tier: Tier::Ws as i32,
+                    ctx: Some(Ctx::new(1 + (r % 5) as u32, r % 2 == 0, Tier::Ws)),
+                    left: (r % 8) as u32,
                 }),
                 _ => Event::TlsHandshake(TlsHandshake {
+                    ctx: Some(Ctx::new(1 + (r % 5) as u32, r % 2 == 0, Tier::Ws)),
                     kind: HandshakeKind::Full as i32,
                     dur_ns: r % 400_000_000,
+                    err: ErrorCode::Unspecified as i32,
+                    errno: 0,
                 }),
             };
 
@@ -1362,6 +1364,44 @@ fn rich_batch() -> LogBatch {
 
 fn open_sink(dir: &Path, options: Options) -> FileSink {
     FileSink::open(dir, options).expect("the sink opens")
+}
+
+#[test]
+fn a_segment_from_another_schema_is_refused_rather_than_appended_to() {
+    use redb::{Database, TableDefinition};
+
+    const META: TableDefinition<&str, &[u8]> = TableDefinition::new("STOR:meta");
+
+    let dir = TempDir::new("schema-guard");
+    let path = dir
+        .path()
+        .join(format!("{}.redb", storage::day_name(storage::today())));
+
+    // A segment this build wrote and then left is the ordinary restart: the
+    // same day's file is reopened and appended to.
+    drop(open_sink(dir.path(), Options::default()));
+    open_sink(dir.path(), Options::default());
+
+    // Rewrite its fingerprint into one no build of this source ever wrote, which
+    // is what a segment from an older schema looks like from here.
+    let db = Database::open(&path).expect("the segment reopens for the edit");
+    let write = db.begin_write().expect("a write transaction");
+    {
+        let mut table = write.open_table(META).expect("the meta table");
+        table
+            .insert("schema_hash", 0u64.to_le_bytes().as_slice())
+            .expect("the fingerprint is written");
+    }
+    write.commit().expect("the edit commits");
+    drop(db);
+
+    let error = match FileSink::open(dir.path(), Options::default()) {
+        Ok(_) => panic!("a segment from another schema must not be appended to"),
+        Err(error) => error,
+    };
+    let message = error.to_string();
+    assert!(message.contains("different log schema"), "{message}");
+    assert!(message.contains("move it out"), "{message}");
 }
 
 #[test]

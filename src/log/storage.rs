@@ -330,20 +330,45 @@ impl Segment {
     }
 
     /// Writes the segment's provenance, once, at creation.
+    ///
+    /// A segment that already carries a fingerprint was opened before: by this
+    /// build, appending to the file it left earlier the same UTC day, or by one
+    /// whose records are encoded under different rules. The second is refused
+    /// rather than appended to, and the reason is the metadata itself —
+    /// `schema_hash` is written once and never corrected, so a v2 build writing
+    /// into a v1 file would produce a day of records that no reader can trust
+    /// and no later build can fix. The operator's half of the fix is to move the
+    /// file out of the directory, which is what the message says.
     fn write_meta(&mut self) -> Result<(), WriterError> {
         let mut transaction = self.db.begin_write().map_err(segment_error)?;
-        let exists = {
+        let ours = fingerprint().to_le_bytes();
+        let existing = {
             let table = transaction.open_table(META).map_err(segment_error)?;
             table
                 .get(META_SCHEMA_HASH)
                 .map_err(segment_error)?
-                .is_some()
+                .map(|value| value.value().to_vec())
         };
-        if !exists {
+
+        let fresh = match existing {
+            None => true,
+            Some(existing) if existing == ours => false,
+            Some(existing) => {
+                return Err(WriterError::Segment(format!(
+                    "the segment was written under a different log schema \
+                     (schema_hash {}, this build writes {}); move it out of the \
+                     log directory instead of appending to it",
+                    hex::encode(&existing),
+                    hex::encode(ours),
+                )));
+            }
+        };
+
+        if fresh {
             let created_ns = super::now_ns();
             let mut table = transaction.open_table(META).map_err(segment_error)?;
             table
-                .insert(META_SCHEMA_HASH, fingerprint().to_le_bytes().as_slice())
+                .insert(META_SCHEMA_HASH, ours.as_slice())
                 .map_err(segment_error)?;
             table
                 .insert(META_APP_VERSION, env!("CARGO_PKG_VERSION").as_bytes())
@@ -364,7 +389,7 @@ impl Segment {
         // segment without its provenance is one a reader has to guess about.
         // redb refuses to lower durability after a persistent change, and this
         // transaction has none, so this is the "keep the default" branch too.
-        if !exists {
+        if fresh {
             let _ = transaction.set_durability(Durability::Immediate);
         }
         transaction.commit().map_err(|error| {
