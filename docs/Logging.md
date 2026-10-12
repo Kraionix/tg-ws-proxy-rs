@@ -208,17 +208,19 @@ Practical choices, from cheap to durable:
 
 ## What it costs
 
-Binary size, measured on this build's release profile:
+Binary size, measured on this build's release profile (`lto`, `codegen-units = 1`, `strip`), with the
+musl targets built against a musl cross toolchain:
 
 | Target | default | `--features log-zstd` |
 |---|---|---|
-| `x86_64-unknown-linux-musl` | 5 646 664 B | 6 200 360 B |
-| `aarch64-unknown-linux-musl` | 4 792 928 B | 5 317 216 B |
+| `x86_64-unknown-linux-musl` | 5 728 448 B | 6 277 312 B |
+| `aarch64-unknown-linux-musl` | 4 773 464 B | 5 228 120 B |
 
-Against the 4 481 040 B of 2.5.4 that is **+26 %**, and the zstd codec adds another ~550 KiB. The
-release workflow builds `log-zstd` in for the musl targets (aarch64, x86_64), the Apple targets (both
-architectures and the universal build) and `x86_64-pc-windows-gnu`; the armv7 and MIPS targets ship
-without it, and `--log-compress` there offers `none` alone. A build without the codec cannot read a
+Against the 4 481 040 B of 2.5.4 that is **+28 %**, and the zstd codec adds another 536 KiB on x86-64
+and 444 KiB on aarch64. The release workflow builds `log-zstd` in for the musl targets (aarch64,
+x86_64), the Apple targets (both architectures and the universal build) and `x86_64-pc-windows-gnu`;
+the armv7 and MIPS targets ship without it, and `--log-compress` there offers `none` alone. A build
+without the codec cannot read a
 compressed segment.
 
 Volume, measured rather than estimated: a record is **~44 B**, a client connection writes about **one**
