@@ -32,6 +32,10 @@ src/
   limits.rs              Connection cap derived from the process file-descriptor budget
   default_domains.rs      Fetches + deobfuscates the community CF-proxy domain list from GitHub
   runtime.rs              Shared runtime state (outbound connector, fronting window, DC metadata)
+  log.rs                 Record pipeline: settings/filters, `LogHandle`, `log_event!`/`direct!`, scope
+  log/                   schema.rs (record types), writer.rs (batching + `BatchSink`),
+                         storage.rs (redb day segments), view.rs (text sink + `SIGUSR1` ring),
+                         render.rs (record → text line) — see docs/Logging.md
   outbound/               Outbound TCP connector: HTTP/SOCKS5(h) proxy support, NO_PROXY matching
   default_domains/http.rs  Minimal HTTPS GET used only to fetch the default domain list
 
@@ -39,7 +43,8 @@ tests/                   Integration tests (one file per subsystem, mirrors src/
 tests/common/mod.rs      Shared integration fixtures (fake HTTP CONNECT proxy, proxy-connection driver)
 docs/                    User-facing guides. README stays an overview and links here rather than growing:
                          Fallbacks.md (routing tiers), Building.md (cross-compiling, UPX), Deployment.md
-                         (Docker, OpenWrt, env vars), CfProxy.md + CfWorker.md (Cloudflare setup),
+                         (Docker, OpenWrt, env vars), Logging.md (the record stream, the text view rendered
+                         from it, segments and `SIGUSR1`), CfProxy.md + CfWorker.md (Cloudflare setup),
                          Android.md (Compose app + NDK build)
 android/                 Jetpack Compose app (Gradle catalog + build-logic convention; see docs/Android.md)
 crates/android-jni/      JNI start/stop + log callback cdylib; built only by the Android Gradle task

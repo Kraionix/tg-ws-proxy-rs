@@ -211,13 +211,15 @@ Practical choices, from cheap to durable:
 Binary size, measured on this build's release profile (`lto`, `codegen-units = 1`, `strip`), with the
 musl targets built against a musl cross toolchain:
 
-| Target | default | `--features log-zstd` |
-|---|---|---|
-| `x86_64-unknown-linux-musl` | 5 728 448 B | 6 277 312 B |
-| `aarch64-unknown-linux-musl` | 4 773 464 B | 5 228 120 B |
+| Target | upstream 2.5.4 | default | `--features log-zstd` |
+|---|---|---|---|
+| `x86_64-unknown-linux-musl` | 4 616 896 B | 5 728 448 B (**+24 %**) | 6 277 312 B (+36 %) |
+| `aarch64-unknown-linux-musl` | 3 862 600 B | 4 773 464 B (**+24 %**) | 5 228 120 B (+35 %) |
 
-Against the 4 481 040 B of 2.5.4 that is **+28 %**, and the zstd codec adds another 536 KiB on x86-64
-and 444 KiB on aarch64. The release workflow builds `log-zstd` in for the musl targets (aarch64,
+Both ends of a row come from the same profile and the same toolchain, and that matters: the same source
+built for `x86_64-unknown-linux-gnu` is ~135 KB smaller than its musl twin, so a gnu baseline against a
+musl build overstates the increase by about four points. The zstd codec adds another 536 KiB on
+x86-64 and 444 KiB on aarch64. The release workflow builds `log-zstd` in for the musl targets (aarch64,
 x86_64), the Apple targets (both architectures and the universal build) and `x86_64-pc-windows-gnu`;
 the armv7 and MIPS targets ship without it, and `--log-compress` there offers `none` alone. A build
 without the codec cannot read a
@@ -302,6 +304,11 @@ Two details that cost time to learn:
 A missing or failed stick should cost the log, not the service: resolve the directory in the init
 script, fall back to `tmpfs` when the mount is absent, and hand the decision to the wrapper (for
 example in a file under the staged runtime directory).
+
+**The packaged LuCI app does none of the above for you.** Its only logging control is the
+`log_level` selector, which sets the text view's floor; neither `--log-dir`/`TG_LOG_DIR` nor
+`--text-log` is exposed, so an operator who wants segments or a text file edits the init script as
+shown here. See [OpenWrtPackage.md](OpenWrtPackage.md).
 
 ## Known gaps
 

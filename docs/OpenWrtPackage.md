@@ -220,8 +220,17 @@ Services → Telegram WS Proxy (Rust)
 
 The page exposes UCI settings, status/control actions and a live filtered view of
 the bounded OpenWrt `logd` ring buffer. The log-level selector maps to
-`off|error|warn|info|debug|trace`; application debug/trace can be enabled without
-turning on dependency-crate noise.
+`off|error|warn|info|debug` and sets the **text** view's floor — `off` becomes
+`TG_TEXT_LOG=off`, anything else `TG_TEXT_LEVEL=<level>`. It does not touch
+`RUST_LOG`, which since the rework only turns on other crates' lines (`rustls`,
+`tungstenite`) and is left alone deliberately. A config that still carries `trace`
+keeps working: the init script maps it to `debug`, the text view's lowest floor,
+but the selector no longer offers a value that would silently mean `debug`.
+
+The package does **not** expose the structured sink: there is no `--log-dir` /
+`TG_LOG_DIR` control here, and no way to point the text log at a file. Both are
+set by editing the init script, and a directory written to under `ujail` has to be
+staged into the jail — see [Logging.md](Logging.md#on-an-openwrt-router).
 
 The status block shows the version `/usr/bin/tg-ws-proxy-rs --version` reports,
 or says that the binary is missing or does not run on this router. A stopped

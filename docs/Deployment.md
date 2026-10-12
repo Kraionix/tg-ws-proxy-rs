@@ -183,7 +183,7 @@ TG_FRONTING_DOMAIN=sprinthost.ru
 TG_OUTBOUND_PROXY=socks5h://user:pass@192.168.1.1:1080
 TG_NO_OUTBOUND_PROXY=false
 TG_NO_PROXY=localhost,127.0.0.1
-TG_TEXT_LOG=/var/log/tg-ws-proxy.log
+# TG_TEXT_LOG=/var/log/tg-ws-proxy.log   # uncomment to send the text to a file instead of stderr
 TG_LOG_DIR=/mnt/usb/tgws-logs
 TG_MTPROTO_PROXY=proxy.example.com:443:ddabcdef1234567890abcdef1234567890
 ```

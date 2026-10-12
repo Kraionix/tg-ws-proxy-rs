@@ -194,8 +194,7 @@ return view.extend({
 			const node = document.getElementById('tg_ws_proxy_live_log');
 			if (!node)
 				return;
-			const lines = String(text || '').trimEnd().split('\n')
-				.map(formatLogLine).filter((line) => line !== null);
+			const lines = String(text || '').trimEnd().split('\n').map(formatLogLine);
 			const visible = lines.slice(-500).join('\n').trim();
 			node.textContent = visible || _('Log is empty.');
 			node.scrollTop = node.scrollHeight;
