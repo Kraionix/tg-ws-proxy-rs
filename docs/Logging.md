@@ -144,6 +144,57 @@ and drops the rest, and `--log-category routing,debug` raises one category back 
 matters most in practice is `info` against `debug`: at `info` a healthy connection leaves one record
 (`session_closed`) and a broken one leaves the whole walk, because every failure is `warn`.
 
+## What the rework buys you, measured
+
+One scenario, both binaries: six synthetic clients speaking the real obfuscated handshake (DC 2 and DC 4,
+ordinary and media classes), each held for a few seconds, the ladder allowed to finish. It is a scenario
+rather than a network, so the claim it supports is about the *format* of the output rather than about
+anyone's traffic.
+
+| | upstream 2.5.4, `--verbose` | this build, `--text-level info` |
+|---|---|---|
+| lines in the file for the run | 254 | 18 before the `SIGUSR1` below, 39 after it |
+| of them other crates' internals | 144 (57 %) | 0 |
+| lines about the pool | 10 — `pool hit` and `failed to pre-connect` only | 0 in the file, 14 records in the segment |
+| how a session ends | `DC4m WS session closed by upstream: ↑1.0KB  ↓8.0B  0.1s` — `WS` whatever the rung, and no host | `DC2m WS session closed via kws2-1.web.telegram.org by upstream: …` |
+
+Those 18 lines are the whole operator-facing story at that level: six `session opened`, six `WS connected
+via …`, six `session closed …`. Everything else the run produced — `pool_refill`, `pool_miss`,
+`tls_handshake`, `tier_attempt`, `warmup_complete`, `startup_summary` — is 42 records in the segment, and
+reaches the file only when asked for: raise `--text-level`, or leave the ring at `debug` and send
+`SIGUSR1` — in that run the dump appended 39 lines to the same file, out of 40 records kept (one of them,
+`startup_summary`, renders no line).
+
+2.5.4's dependency noise is avoidable there with `RUST_LOG=tg_ws_proxy_rs=debug`; here it is not possible
+in the first place, because the record stream never goes through `tracing` — with `RUST_LOG=debug` the
+text file and the segment gain nothing (the console gains `rustls` lines, as the table on the first page
+says).
+
+**The text rounds, the record does not.** Both formats print a size in a human unit with one decimal
+(`516.0B`, `2.0KB`, `5.3MB`), so the file is not a source for "how much went through": summing `↑`/`↓`
+over the run above gives 20 480 B up, while the `bytes_up` fields of the same six `session_closed`
+records sum to 20 504 B. The gap is the rounding, and it grows with the number: a line that reads
+`↓11.3MB` is not a byte count.
+
+What that is worth on a real device, from a 2.5-minute window on the reference router during a CF Worker
+outage — all of it counted out of one segment, none of it available from the text log:
+
+```
+cfworker   44 attempts,  6 failed (14 %)   p50 268 ms, p95 10 085 ms   — every failure TlsTimeout
+cfproxy     9 attempts,  0 failed          p50 339 ms, p95  1 075 ms
+6 × cooldown armed for the worker (60 s each), 4 × a rung skipped because of one
+34 sessions, 26 835 B up, 1 549 250 B down, p50 15.4 s, max 104.8 s, 39/20/5 sessions per client
+```
+
+In 2.5.4 the close line says `WS` for anything that went over a WebSocket — Cloudflare Worker and
+CF-proxy sessions included — and names the host only on the connect line, so which rung carried a
+session cannot be read off its end. The pool's misses and refills are not printed at any level, and every
+size is rounded: the same questions have no answer there, however long the file is.
+
+The price of that is stated once, below: the exact numbers live in the segment, and reading a segment
+means the repository's test reader. The text log is what you read on the device; the segment is what you
+count.
+
 ## Reading a segment back
 
 There is **no CLI reader** in the binary, deliberately: reading a segment is a post-mortem operation,
@@ -166,6 +217,11 @@ the same configuration as the binary that wrote it. Field numbers, event tags an
 are fixed by `src/log/schema.rs`; a later binary reads an older segment. A segment written under a
 different schema version is refused at startup rather than appended to, and the message names both
 hashes — move the old day files aside and restart.
+
+Refusing is not the same as leaving the file alone: the check runs after `redb` has opened it, and about
+2 % of a 500 KB segment's bytes differed afterwards — from offset 10, which is the database header, down
+into the pages. The reader opens the file the same way, so reading a copy is not a promise that the copy
+is untouched, which matters when the copy is the only one and it lives on flash.
 
 ## Clocks, runs and connection ids
 
