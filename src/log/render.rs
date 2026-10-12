@@ -221,12 +221,17 @@ fn write_message(event: &Event, out: &mut String) -> bool {
         Event::SessionClosed(closed) => {
             write_dc_tier(closed.ctx.as_ref(), out);
             out.push_str("session closed");
-            if !closed.via.is_empty() {
-                out.push_str(" via ");
-                out.push_str(&closed.via);
+            // "by client" and "by upstream" name the side that ended the
+            // session; a session with no route was ended by neither, and no
+            // host carried it, so the two clauses would both be empty.
+            if ClosedBy::try_from(closed.closed_by) != Ok(ClosedBy::NoRoute) {
+                if !closed.via.is_empty() {
+                    out.push_str(" via ");
+                    out.push_str(&closed.via);
+                }
+                out.push_str(" by ");
+                out.push_str(closed_by_text(closed.closed_by));
             }
-            out.push_str(" by ");
-            out.push_str(closed_by_text(closed.closed_by));
             out.push_str(": \u{2191}");
             write_bytes(closed.bytes_up, out);
             out.push_str("  \u{2193}");
@@ -320,6 +325,10 @@ fn write_message(event: &Event, out: &mut String) -> bool {
             );
             write_millis(refill.dur_ms, out);
             out.push(')');
+            if refill.err != 0 {
+                out.push_str(" failed: ");
+                write_error(refill.err, 0, refill.errno, out);
+            }
         }
         Event::PoolDiscard(discard) => {
             write_dc_tier(discard.ctx.as_ref(), out);
@@ -329,8 +338,14 @@ fn write_message(event: &Event, out: &mut String) -> bool {
         }
         Event::TlsHandshake(handshake) => {
             write_dc_tier(handshake.ctx.as_ref(), out);
-            out.push_str("TLS handshake ");
-            out.push_str(handshake_kind_text(handshake.kind));
+            out.push_str("TLS handshake");
+            // A handshake that failed before the server's Finished, or one the
+            // dial never observed, has no negotiated kind to name — and naming
+            // it `unspecified` would read as a fact rather than as an absence.
+            if handshake.kind != HandshakeKind::Unspecified as i32 {
+                out.push(' ');
+                out.push_str(handshake_kind_text(handshake.kind));
+            }
             if handshake.err != 0 {
                 out.push_str(" failed: ");
                 write_error(handshake.err, 0, handshake.errno, out);
@@ -473,6 +488,9 @@ fn closed_by_text(closed_by: i32) -> &'static str {
     match ClosedBy::try_from(closed_by) {
         Ok(ClosedBy::Client) => "client",
         Ok(ClosedBy::Upstream) => "upstream",
+        // Named by the message itself: "closed by no route" is not a sentence
+        // anybody writes, and the record's other fields say nothing else.
+        Ok(ClosedBy::NoRoute) => "no route",
         Ok(ClosedBy::Unspecified) | Err(_) => "unknown",
     }
 }

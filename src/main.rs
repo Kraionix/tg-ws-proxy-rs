@@ -16,6 +16,7 @@
 use std::io::IsTerminal as _;
 
 use tg_ws_proxy_rs::config::Config;
+use tg_ws_proxy_rs::log::schema::ShutdownSignal;
 use tg_ws_proxy_rs::server::{self, RunError};
 
 #[tokio::main]
@@ -53,8 +54,12 @@ async fn main() {
 /// segment. Handling the signal turns that into an ordinary stop, which flushes
 /// and syncs on the way out.
 ///
+/// The signal is the future's *value* rather than a line printed here: the
+/// record of the stop is written by the server, which owns the log handle (and
+/// before that, by nothing — this task has no sink to write into).
+///
 /// A *second* signal exits immediately, so a stop that hangs is still a stop.
-async fn shutdown_signal() {
+async fn shutdown_signal() -> ShutdownSignal {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -66,13 +71,17 @@ async fn shutdown_signal() {
             return std::future::pending().await;
         };
 
-        tokio::select! {
-            _ = term.recv() => tracing::info!("SIGTERM received, stopping"),
-            _ = int.recv() => tracing::info!("interrupt received, stopping"),
-        }
+        let received = tokio::select! {
+            _ = term.recv() => ShutdownSignal::Term,
+            _ = int.recv() => ShutdownSignal::Int,
+        };
 
         // Held by this task, which outlives the shutdown future: the sink's
         // drain window is milliseconds, so anything still here is stuck.
+        //
+        // This one line stays a console line even after stage 5 turns the rest
+        // of the log into records: the process is about to exit, and a record
+        // that has not reached the writer task yet would be lost with it.
         tokio::spawn(async move {
             tokio::select! {
                 _ = term.recv() => {}
@@ -81,12 +90,14 @@ async fn shutdown_signal() {
             tracing::warn!("still stopping; second signal exits now");
             std::process::exit(130);
         });
+
+        received
     }
 
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("interrupt received, stopping");
+        ShutdownSignal::Int
     }
 }
 

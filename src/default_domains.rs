@@ -12,8 +12,9 @@
 
 mod http;
 
-use tracing::warn;
+pub use http::FetchError;
 
+use crate::log::schema::DomainSource;
 use crate::outbound::OutboundConnector;
 use http::https_get;
 
@@ -79,6 +80,18 @@ fn fallback_domains() -> Vec<String> {
         .collect()
 }
 
+/// Where the list in use came from, and what stopped the fetch when it did not
+/// come from the community one.
+///
+/// Returned rather than logged: this module has no sink, and the record belongs
+/// to the process-wide startup that asked for the list.
+pub struct Fetched {
+    pub domains: Vec<String>,
+    pub source: DomainSource,
+    /// Why the built-in list is in use, when it is.
+    pub failure: Option<FetchError>,
+}
+
 /// Fetch the default CF-proxy domain list using a direct outbound connection.
 ///
 /// This preserves the original public API. The proxy binary uses
@@ -93,23 +106,37 @@ pub async fn fetch_default_domains() -> Vec<String> {
 /// connector, deobfuscate it, and return the decoded domains. Falls back to
 /// the embedded list on any error.
 pub async fn fetch_default_domains_with_outbound(outbound: &OutboundConnector) -> Vec<String> {
+    fetch_domains_with_source(outbound).await.domains
+}
+
+/// [`fetch_default_domains_with_outbound`] with the provenance the log needs.
+///
+/// An empty list is a failure of the same kind as a refused connection: the
+/// fetch produced nothing usable, so the built-in list is what runs, and the
+/// record has to say so rather than claim a fetch that returned zero domains.
+pub async fn fetch_domains_with_source(outbound: &OutboundConnector) -> Fetched {
+    let fallback = |failure: Option<FetchError>| Fetched {
+        domains: fallback_domains(),
+        source: DomainSource::Builtin,
+        failure,
+    };
+
     match https_get(DOMAINS_URL_HOST, DOMAINS_URL_PATH, outbound).await {
         Ok(body) => {
             let domains = parse_domain_list(&body);
             if domains.is_empty() {
-                warn!("Default domain list from GitHub was empty; using built-in fallback");
-                fallback_domains()
+                fallback(Some(FetchError::protocol(
+                    "the community list came back empty",
+                )))
             } else {
-                domains
+                Fetched {
+                    domains,
+                    source: DomainSource::Github,
+                    failure: None,
+                }
             }
         }
-        Err(e) => {
-            warn!(
-                "Failed to fetch default CF domain list ({}); using built-in fallback",
-                e
-            );
-            fallback_domains()
-        }
+        Err(error) => fallback(Some(error)),
     }
 }
 

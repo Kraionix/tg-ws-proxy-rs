@@ -2,6 +2,9 @@ use super::*;
 
 use clap::Parser;
 
+use crate::log::schema::ErrorCode;
+use tokio_tungstenite::MaybeTlsStream;
+
 #[test]
 fn direct_refill_is_reserved_before_a_task_can_be_spawned() {
     let pool = WsPool::new(4, Duration::from_secs(60));
@@ -130,6 +133,165 @@ async fn a_miss_is_recorded_against_the_pool_rather_than_the_caller() {
     assert_eq!(ctx.dc, 2);
     assert!(!ctx.is_media);
     assert_eq!(ctx.tier, Tier::Ws as i32);
+
+    std::fs::remove_dir_all(&dir).expect("the temp dir is ours");
+}
+
+/// A local WebSocket pair, for the pool entries these tests need a real
+/// connection for: the pool holds `TgWsStream`s, and a `PoolDiscard` is about
+/// what happens to one of them.
+async fn ws_pair() -> (TgWsStream, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let _ = tokio_tungstenite::accept_async(stream).await;
+
+        // Held open until the test drops the client end.
+        std::future::pending::<()>().await;
+    });
+
+    let (ws, _) = tokio_tungstenite::client_async(
+        format!("ws://{addr}/"),
+        MaybeTlsStream::Plain(tokio::net::TcpStream::connect(addr).await.unwrap()),
+    )
+    .await
+    .unwrap();
+
+    (ws, server)
+}
+
+/// The pool's own records, read back out of a segment: an idle connection
+/// thrown away says which one and why, a warm-up says how much the pool is
+/// worth, and a refill that dialled into nothing carries the class it failed
+/// with.
+#[tokio::test]
+async fn discards_warmup_and_refills_are_recorded() {
+    use crate::log::schema::{DiscardReason, WarmupComplete};
+
+    let dir = std::env::temp_dir().join(format!("tgws-pool-shed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let config = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--secret",
+        "00112233445566778899aabbccddeeff",
+        "--pool-size",
+        "0",
+        "--log-dir",
+        dir.to_str().expect("a utf-8 temp path"),
+        "--log-level",
+        "debug",
+        "--log-durability",
+        "immediate",
+    ])
+    .unwrap()
+    .with_defaults();
+
+    let handle = crate::log::init(&dir, config.log_settings(), config.log_options())
+        .expect("a writable temp dir accepts a segment");
+    let pool = Arc::new(
+        WsPool::with_runtime(
+            4,
+            Duration::from_secs(30),
+            Arc::new(Runtime::new(OutboundConnector::direct())),
+        )
+        .with_log(Some(Arc::clone(&handle))),
+    );
+
+    // One entry older than the pool's age limit, and one the server has already
+    // closed: the two reasons an idle connection is thrown away.
+    let (stale, stale_server) = ws_pair().await;
+    let (mut closed, closed_server) = ws_pair().await;
+    closed.close(None).await.unwrap();
+
+    {
+        let mut idle = pool.idle.lock().await;
+        let bucket = idle.entry((2, false)).or_default();
+        bucket.push(PoolEntry {
+            ws: stale,
+            created: Instant::now() - Duration::from_secs(120),
+        });
+        bucket.push(PoolEntry {
+            ws: closed,
+            created: Instant::now(),
+        });
+    }
+
+    // `allow_refill` is false: a refill would dial out on this empty pool.
+    let hit = pool.get(2, false, "127.0.0.1", false, false).await;
+    assert!(hit.is_none(), "both entries were unusable");
+
+    pool.log_warmup(3, Duration::from_millis(241));
+    pool.log_refill(
+        Tier::Ws,
+        2,
+        false,
+        Refill {
+            added: 0,
+            ready: 0,
+            dur: Duration::from_secs(8),
+            failure: Some(RungFailure {
+                err: ErrorCode::TcpConnectTimeout,
+                err_code: 0,
+                errno: 113,
+            }),
+        },
+    );
+
+    stale_server.abort();
+    closed_server.abort();
+    handle.shutdown().await;
+
+    let day = std::fs::read_dir(&dir)
+        .expect("the segment directory")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find_map(|name| name.strip_suffix(".redb").map(str::to_string))
+        .expect("one segment for today");
+
+    let records: Vec<_> = crate::log::storage::iter_batches(&dir, &day)
+        .expect("the segment it just wrote is readable")
+        .into_iter()
+        .flat_map(|batch| batch.records)
+        .collect();
+
+    let discards: Vec<i32> = records
+        .iter()
+        .filter_map(|record| match &record.event {
+            Some(Event::PoolDiscard(discard)) => Some(discard.reason),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        discards,
+        [DiscardReason::Closed as i32, DiscardReason::Stale as i32],
+        "one record per connection thrown away, freshest first: the pool \
+         drains its bucket LIFO"
+    );
+
+    let warmup = records
+        .iter()
+        .find_map(|record| match &record.event {
+            Some(Event::WarmupComplete(WarmupComplete { ready, dur_ms })) => {
+                Some((*ready, *dur_ms))
+            }
+            _ => None,
+        })
+        .expect("the warm-up is one process-wide record");
+    assert_eq!(warmup, (3, 241));
+
+    let refill = records
+        .iter()
+        .find_map(|record| match &record.event {
+            Some(Event::PoolRefill(refill)) if refill.err != 0 => Some(refill),
+            _ => None,
+        })
+        .expect("the refill that produced nothing still says why");
+    assert_eq!(refill.err, ErrorCode::TcpConnectTimeout as i32);
+    assert_eq!(refill.errno, 113);
+    assert_eq!(refill.added, 0);
 
     std::fs::remove_dir_all(&dir).expect("the temp dir is ours");
 }

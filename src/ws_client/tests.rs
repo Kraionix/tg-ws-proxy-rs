@@ -2,6 +2,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+use crate::log::schema::HandshakeKind;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::accept_hdr_async;
 
@@ -128,7 +130,10 @@ async fn the_edge_walk_reports_a_skipped_edge_and_an_armed_one() {
     )
     .await;
 
-    assert!(matches!(outcome, WsConnectResult::ConnectTimedOut(_)));
+    assert!(matches!(
+        outcome.result,
+        WsConnectResult::ConnectTimedOut(_)
+    ));
     assert_eq!(
         spy.skipped,
         [(cooling, false)],
@@ -203,10 +208,18 @@ async fn sni_override_presents_fronted_sni_but_keeps_real_host() {
         .into_client_request()
         .unwrap();
 
-    let (ws, response) = tls_handshake_and_upgrade(tcp, request, false, Some(fronted_sni))
-        .await
+    let upgrade =
+        tls_handshake_and_upgrade(tcp, request, real_domain, false, Some(fronted_sni)).await;
+    let (ws, response) = upgrade
+        .outcome
         .expect("fronted handshake should succeed even though the cert doesn't match the SNI");
     assert_eq!(response.status().as_u16(), 101);
+    // A fronted SNI cannot match the certificate, so verification is skipped
+    // and the handshake that gets there is a full one.
+    assert_eq!(
+        upgrade.tls.map(|tls| tls.kind),
+        Some(HandshakeKind::Full as i32)
+    );
     drop(ws);
 
     tokio::time::timeout(Duration::from_secs(2), server_task)
@@ -250,11 +263,14 @@ async fn no_sni_override_uses_domain_for_both_and_verifies_the_certificate() {
         .into_client_request()
         .unwrap();
 
-    let result = tls_handshake_and_upgrade(tcp, request, false, None).await;
-    assert!(
-        result.is_err(),
-        "expected certificate verification to reject the self-signed cert"
-    );
+    let result = tls_handshake_and_upgrade(tcp, request, real_domain, false, None).await;
+    let failure = result
+        .outcome
+        .expect_err("expected certificate verification to reject the self-signed cert");
+    // The failed handshake is measured too: the record says how far the dial
+    // got before the certificate was rejected.
+    let tls = result.tls.expect("a failed handshake still has a cost");
+    assert_ne!(tls.err, 0, "verification failure: {failure}");
 
     tokio::time::timeout(Duration::from_secs(2), server_task)
         .await
@@ -481,5 +497,37 @@ fn connect_results_map_to_the_error_classes_the_ladder_reports() {
     assert_eq!(
         WsConnectResult::Failed("connection reset by peer".to_string()).error_code(),
         (ErrorCode::Upgrade, 0)
+    );
+}
+
+/// A refused connect keeps the OS error, which is the diagnosis the class
+/// alone cannot give: `tcp_connect` covers both "connection refused" and
+/// "network unreachable", and the number is what tells them apart.
+#[tokio::test]
+async fn a_refused_connect_carries_its_errno() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Nothing listens on that port once the listener is gone.
+    drop(listener);
+
+    let dial = connect_ws_with_outbound_mode(
+        &addr.ip().to_string(),
+        "kws2.web.telegram.org",
+        false,
+        Duration::from_secs(2),
+        &OutboundConnector::direct(),
+        None,
+        false,
+    )
+    .await;
+
+    assert!(
+        matches!(dial.result, WsConnectResult::ConnectFailed(_)),
+        "a refused port is a hard connect failure"
+    );
+    assert_ne!(dial.errno, 0, "the refused connect kept its errno");
+    assert!(
+        dial.tls.is_none(),
+        "nothing was dialled far enough for a handshake"
     );
 }

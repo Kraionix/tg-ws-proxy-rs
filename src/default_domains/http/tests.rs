@@ -37,7 +37,7 @@ async fn read_http_response_body_rejects_conflicting_content_length_with_chunked
 
     let err = read_http_response_body(&mut response).await.unwrap_err();
 
-    assert!(err.contains("conflicting"));
+    assert!(err.reason.contains("conflicting"));
 }
 
 #[tokio::test]
@@ -73,7 +73,7 @@ async fn read_http_response_body_rejects_truncated_chunked_terminator() {
 
     let err = read_http_response_body(&mut response).await.unwrap_err();
 
-    assert!(err.contains("unexpected EOF"));
+    assert!(err.reason.contains("unexpected EOF"));
 }
 
 #[tokio::test]
@@ -97,7 +97,7 @@ async fn read_http_response_body_rejects_non_200_status() {
 
     let err = read_http_response_body(&mut response).await.unwrap_err();
 
-    assert!(err.contains("HTTP status 404"));
+    assert!(err.reason.contains("HTTP status 404"));
 }
 
 #[tokio::test]
@@ -106,7 +106,7 @@ async fn read_http_response_body_rejects_oversized_content_length() {
 
     let err = read_http_response_body(&mut response).await.unwrap_err();
 
-    assert!(err.contains("exceeds limit"));
+    assert!(err.reason.contains("exceeds limit"));
 }
 
 #[tokio::test]

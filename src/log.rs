@@ -2,10 +2,15 @@
 //! to a redb file per UTC day so that "why did this session fall back to the
 //! Cloudflare proxy at 14:03" is a query rather than a guess.
 //!
-//! The `tracing` output this sits beside is for a human reading a terminal: it
-//! is unstructured, it is lost when the process exits, and on a router there is
-//! usually nowhere for it to go. It stays as it is — the structured sink is
-//! additive, and only runs when `--log-dir` is set.
+//! The text a human reads is a *projection* of these records, not a parallel
+//! stream: [`render`] turns one record into one console line and [`view`] writes
+//! them to a terminal or a file, so the two can no longer drift apart. What is
+//! still true of `tracing` is that it has nowhere to go on a router and dies
+//! with the process; what is left of it after stage 4 is the startup banner and
+//! the lines about connections that never became sessions.
+//!
+//! The subsystem is only started when `--log-dir` is set (stage 5 makes the
+//! pipeline unconditional, with an in-memory sink when there is no directory).
 //!
 //! [`schema`] is the wire format, written by hand rather than generated: the
 //! build has no `protoc` and no `build.rs`, and `prost`'s derives give a
@@ -484,6 +489,25 @@ where
     F: Future,
 {
     LOG_CTX.scope(LogCtx { handle, conn_id }, future)
+}
+
+/// [`LogHandle::emit`] for process-wide events, tolerating a caller that has no
+/// handle at all.
+///
+/// The binary starts the subsystem only when there is somewhere to put it —
+/// `--log-dir` today, always after stage 5 — and the process-wide emitters (the
+/// banner record, the accept loop's own errors) run whether or not there is a
+/// sink. A record nobody can receive is not built: the payload's `Vec`s and the
+/// `String`s behind them cost an allocation each on a path that has no reader.
+pub fn emit_global(
+    handle: Option<&Arc<LogHandle>>,
+    category: Category,
+    level: Level,
+    event: Event,
+) {
+    if let Some(handle) = handle {
+        handle.emit(0, category, level, event);
+    }
 }
 
 /// [`scope`] for work that belongs to no session — the accept loop's own

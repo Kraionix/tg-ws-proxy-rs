@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use tg_ws_proxy_rs::config::Config;
+use tg_ws_proxy_rs::log::schema::ShutdownSignal;
 use tg_ws_proxy_rs::server;
 
 fn test_config(port: u16) -> Config {
@@ -33,6 +34,7 @@ async fn run_binds_then_stops_on_shutdown() {
             test_config(0),
             async {
                 let _ = shutdown_rx.await;
+                ShutdownSignal::Term
             },
             move |info| {
                 let _ = listen_tx.send(info);
@@ -106,6 +108,7 @@ async fn port_zero_reports_the_real_bound_port_in_the_link() {
             test_config(0),
             async {
                 let _ = shutdown_rx.await;
+                ShutdownSignal::Term
             },
             move |info| {
                 let _ = listen_tx.send(info);
@@ -195,6 +198,7 @@ async fn a_log_dir_gets_todays_segment() {
             config,
             async {
                 let _ = shutdown_rx.await;
+                ShutdownSignal::Term
             },
             move |info| {
                 let _ = listen_tx.send(info);

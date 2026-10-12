@@ -21,6 +21,7 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, Registry, fmt::MakeWriter, reload};
 
 use tg_ws_proxy_rs::config::Config;
+use tg_ws_proxy_rs::log::schema::ShutdownSignal;
 use tg_ws_proxy_rs::server;
 
 static JVM: OnceLock<jni::JavaVM> = OnceLock::new();
@@ -263,6 +264,10 @@ fn start_proxy(args: &str) -> Result<(), String> {
                             break;
                         }
                     }
+
+                    // Not a signal: the app asked the shim to stop. The record
+                    // says so rather than naming a SIGTERM nobody sent.
+                    ShutdownSignal::Unspecified
                 };
                 server::run_with_listen(config, shutdown, |info| {
                     emit_listening(&info.tg_link);

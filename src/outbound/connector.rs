@@ -20,6 +20,14 @@ use super::config::{OutboundConfig, ProxyConfig, ProxyKind};
 pub struct OutboundError {
     pub reason: String,
     pub timed_out: bool,
+    /// `errno` behind the message, when the failure came from the OS at all.
+    ///
+    /// Kept beside the text for the log: `ENETUNREACH` and `ECONNREFUSED` are
+    /// the same class to the ladder and different problems to whoever reads the
+    /// record, and the wording around the number is not stable across
+    /// platforms. A name that would not resolve never reaches a syscall, which
+    /// is the zero.
+    pub errno: i32,
 }
 
 impl OutboundError {
@@ -27,6 +35,7 @@ impl OutboundError {
         Self {
             reason: reason.into(),
             timed_out: false,
+            errno: 0,
         }
     }
 
@@ -34,6 +43,16 @@ impl OutboundError {
         Self {
             reason: reason.into(),
             timed_out: true,
+            errno: 0,
+        }
+    }
+
+    /// A failure straight from a syscall, whose number is worth keeping.
+    fn from_io(what: &str, error: std::io::Error) -> Self {
+        Self {
+            reason: format!("{what}: {error}"),
+            timed_out: false,
+            errno: error.raw_os_error().unwrap_or(0),
         }
     }
 }
@@ -116,8 +135,9 @@ async fn connect_direct(
     port: u16,
     timeout: Duration,
 ) -> Result<TcpStream, OutboundError> {
-    match tokio::time::timeout(timeout, connect_tcp(host, port)).await {
-        Ok(result) => result.map_err(OutboundError::failed),
+    match tokio::time::timeout(timeout, TcpStream::connect((host, port))).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(error)) => Err(OutboundError::from_io("TCP connect", error)),
         Err(_) => Err(OutboundError::timed_out("TCP connect timed out")),
     }
 }

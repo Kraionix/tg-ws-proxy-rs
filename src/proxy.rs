@@ -35,7 +35,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::debug;
 use tungstenite::Message;
 
 use crate::log::schema::{
@@ -59,7 +59,7 @@ use crate::pool::{CfTarget, CfTier, WsPool};
 use crate::runtime::Runtime;
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{
-    CfDialOpts, CooldownMap, EdgeReporter, RungFailure, TgWsStream, WsAttempt,
+    CfDialOpts, CooldownMap, EdgeReporter, RungFailure, TgWsStream, TlsCost, WsAttempt,
     connect_cf_worker_ws_for_dc_with_outbound_classified,
     connect_cf_ws_for_dc_with_outbound_ordered, connect_ws_for_dc_with_outbound, media_tag,
 };
@@ -344,6 +344,9 @@ pub async fn handle_client_with_runtime(
 ) {
     let label = peer;
     let _ = stream.set_nodelay(true);
+    // Read by the one record that reports a session the ladder could not route;
+    // every other duration in the session is measured from its own start.
+    let session_started = Instant::now();
 
     let secrets = config.normalized_secrets();
     let timeouts = Timeouts::from_config(&config);
@@ -411,14 +414,6 @@ pub async fn handle_client_with_runtime(
         dc_id as i16
     };
 
-    debug!(
-        "[{}] handshake ok: DC{}{} proto={:?}",
-        label,
-        dc_id,
-        media_tag(is_media),
-        proto
-    );
-
     // The session's first record, and the only one that says where the client
     // came from: everything after it is about the route, not the caller.
     //
@@ -426,7 +421,7 @@ pub async fn handle_client_with_runtime(
     // and the media flag and leaves the tier unset.
     log_event!(
         Category::Session,
-        Level::Debug,
+        Level::Info,
         Event::SessionOpened {
             ctx: Some(Ctx::new(dc_id, is_media, LogTier::Unspecified)),
             peer: Some(peer_of(label)),
@@ -441,7 +436,6 @@ pub async fn handle_client_with_runtime(
 
     // ── Step 5: walk the fallback ladder ─────────────────────────────────
     let route = Route {
-        label,
         config: &config,
         runtime: &runtime,
         pool: &pool,
@@ -465,7 +459,6 @@ pub async fn handle_client_with_runtime(
         reader,
         writer,
         BridgeDispatch {
-            label,
             relay_init,
             ciphers,
             proto,
@@ -476,8 +469,25 @@ pub async fn handle_client_with_runtime(
         },
     ))
     .await;
-    if let Some(bridge) = bridge {
-        bridge.await;
+
+    match bridge {
+        Some(bridge) => bridge.await,
+        None => {
+            // The ladder produced nothing to bridge. Without this the segment
+            // shows a session that opened and never closed, which is what a
+            // crashed process looks like; with it, the duration is how long the
+            // ladder spent trying before it gave up.
+            log_session_closed(
+                dc_id,
+                is_media,
+                UpstreamTier::Ws,
+                ClosedBy::NoRoute,
+                0,
+                0,
+                session_started,
+                "",
+            );
+        }
     }
 }
 
@@ -514,9 +524,16 @@ enum Upstream {
         ws: TgWsStream,
         framing: WsFraming,
         tier: UpstreamTier,
+        /// The hostname the session actually runs through: the `kws{N}` name
+        /// Telegram answered on, the Cloudflare domain or Worker host that
+        /// carried it.  The session record prints it because the console line
+        /// did, and a saved segment without it cannot say which way a session
+        /// went.
+        via: String,
     },
-    /// An upstream MTProto proxy, plain or FakeTLS-wrapped.
-    Mtproto(UpstreamConnection),
+    /// An upstream MTProto proxy, plain or FakeTLS-wrapped.  The connection
+    /// carries its own `via`.
+    Mtproto { conn: UpstreamConnection },
     /// Last resort: a direct TCP connection to this Telegram DC IP.
     Tcp(String),
 }
@@ -526,14 +543,23 @@ impl Upstream {
     fn tier(&self) -> UpstreamTier {
         match self {
             Self::Ws { tier, .. } => *tier,
-            Self::Mtproto(_) => UpstreamTier::Mtproto,
+            Self::Mtproto { .. } => UpstreamTier::Mtproto,
             Self::Tcp(_) => UpstreamTier::Tcp,
+        }
+    }
+
+    /// What the session ran through, for `EVT:session_closed.via` — read
+    /// before the match moves the stream out of the variant.
+    fn via(&self) -> String {
+        match self {
+            Self::Ws { via, .. } => via.clone(),
+            Self::Mtproto { conn } => conn.via.clone(),
+            Self::Tcp(dst) => dst.clone(),
         }
     }
 }
 
 struct BridgeDispatch {
-    label: SocketAddr,
     relay_init: [u8; 64],
     ciphers: ConnectionCiphers,
     proto: ProtoTag,
@@ -556,7 +582,6 @@ fn bridge_selected(
     params: BridgeDispatch,
 ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     let BridgeDispatch {
-        label,
         relay_init,
         ciphers,
         proto,
@@ -566,20 +591,20 @@ fn bridge_selected(
         runtime,
     } = params;
 
-    // Read before the match moves the stream out: the WS variant is the only
-    // one whose rung is not implied by its own name.
+    // Both are read before the match moves the stream out: the WS variant is
+    // the only one whose rung and host are not implied by its own name.
     let tier = upstream.tier();
+    let via = upstream.via();
 
     match upstream {
-        // The tier is read above, before the match moves the stream.
         Upstream::Ws { ws, framing, .. } => Box::pin(bridge_ws(
             reader,
             writer,
             WsBridgeParams {
-                label,
                 ws,
                 framing,
                 tier,
+                via,
                 relay_init,
                 ciphers,
                 proto,
@@ -587,7 +612,7 @@ fn bridge_selected(
                 is_media,
             },
         )),
-        Upstream::Mtproto(conn) => {
+        Upstream::Mtproto { conn, .. } => {
             let ConnectionCiphers {
                 clt_dec, clt_enc, ..
             } = ciphers;
@@ -596,7 +621,6 @@ fn bridge_selected(
                 reader,
                 writer,
                 RelayParams {
-                    label,
                     rem_reader: conn.reader,
                     rem_writer: conn.writer,
                     ciphers: ConnectionCiphers {
@@ -608,6 +632,7 @@ fn bridge_selected(
                     faketls: conn.faketls,
                     dc,
                     is_media,
+                    via,
                 },
             ))
         }
@@ -616,12 +641,12 @@ fn bridge_selected(
                 reader,
                 writer,
                 TcpBridgeParams {
-                    label,
                     dst: &dst,
                     relay_init: &relay_init,
                     ciphers,
                     dc,
                     is_media,
+                    via,
                     connect_timeout: tcp_connect_timeout,
                     runtime,
                 },
@@ -655,7 +680,6 @@ enum WsFraming {
 
 /// Everything the fallback ladder needs to route one client connection.
 struct Route<'a> {
-    label: SocketAddr,
     config: &'a Config,
     runtime: &'a Runtime,
     pool: &'a Arc<WsPool>,
@@ -683,29 +707,35 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
     }
 
     let Some(target_ip) = target_ip else {
-        // Every log line already carries the DC, so the reason only has to say
-        // what is missing.
+        // Every record already carries the DC, so the reason only has to say
+        // what is missing. Neither branch dials anything, which is what
+        // `attempt_skipped` is for: a rung the ladder passed over is not a rung
+        // that failed.
         let reason = LogReason::NotInDcIp;
         let Some(fallback) = route.runtime.fallback_ip(route.dc) else {
-            warn!(
-                "[{}] DC{}{} {} — no fallback IP available",
-                route.label,
-                route.dc,
-                route.media,
-                reason.as_str()
+            // No `--dc-ip` for this DC and no built-in address for it either, so
+            // there is no rung left that could carry the connection — including
+            // the terminal one.
+            log_attempt_skipped(route.ctx(UpstreamTier::Ws), UpstreamTier::Ws, reason);
+            log_attempt_skipped(
+                route.ctx(UpstreamTier::Tcp),
+                UpstreamTier::Tcp,
+                LogReason::NoFallback,
             );
+
             return None;
         };
 
         // The direct WebSocket rung is not reachable without a `--dc-ip`
         // target, so the ladder starts below it.
+        log_attempt_skipped(route.ctx(UpstreamTier::Ws), UpstreamTier::Ws, reason);
         route.log_fallback(UpstreamTier::Ws, reason);
 
         return Some(
             route
-                .fallback_chain(fallback, reason)
+                .fallback_chain(fallback)
                 .await
-                .unwrap_or_else(|| route.tcp_fallback(fallback, reason)),
+                .unwrap_or_else(|| route.tcp_fallback(fallback)),
         );
     };
 
@@ -719,29 +749,25 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
     let ip_cooling = IP_FAIL.active(target_ip) && route.has_fallback();
     if ip_cooling {
         let reason = LogReason::IpCooldown;
-        info!(
-            "[{}] DC{}{} {} → skipping direct WS to {}",
-            route.label,
-            route.dc,
-            route.media,
-            reason.as_str(),
-            target_ip
-        );
+        log_attempt_skipped(route.ctx(UpstreamTier::Ws), UpstreamTier::Ws, reason);
         route.log_fallback(UpstreamTier::Ws, reason);
-        log_cooldown_skipped(CooldownKind::IpFail, target_ip);
+        log_cooldown_skipped(route.ctx(UpstreamTier::Ws), CooldownKind::IpFail, target_ip);
 
         // Stepped over, not written off: if every fallback is also gone the
         // address gets its chance back rather than leaving the client on the
         // raw-TCP path for the rest of the cooldown.  That is what makes the
         // cooldown self-healing — a direct connect is the only thing that
         // clears it, so something has to keep asking.
-        if let Some(upstream) = route.fallback_chain(target_ip, reason).await {
+        if let Some(upstream) = route.fallback_chain(target_ip).await {
             return Some(upstream);
         }
 
-        info!(
-            "[{}] DC{}{} every fallback failed → re-probing {}",
-            route.label, route.dc, route.media, target_ip
+        // Every fallback failed, so the address gets its chance back. The walk
+        // below says so: the direct rung is not skipped after all.
+        log_attempt_skipped(
+            route.ctx(UpstreamTier::Tcp),
+            UpstreamTier::Tcp,
+            LogReason::NoFallback,
         );
     }
 
@@ -757,18 +783,23 @@ async fn select_upstream(route: &Route<'_>, target_ip: Option<&str>) -> Option<U
         // already failed on the way in, and nothing since then can have
         // revived them. So this fall is straight to the floor, whatever the
         // ladder's own order would have offered.
-        log_tier_fallback(UpstreamTier::Ws, UpstreamTier::Tcp, LogReason::NoFallback);
+        log_tier_fallback(
+            route.ctx(UpstreamTier::Ws),
+            UpstreamTier::Ws,
+            UpstreamTier::Tcp,
+            LogReason::NoFallback,
+        );
 
-        return Some(route.tcp_last_resort(target_ip, reason));
+        return Some(route.tcp_last_resort(target_ip));
     }
 
     route.log_fallback(UpstreamTier::Ws, reason);
 
     Some(
         route
-            .fallback_chain(target_ip, reason)
+            .fallback_chain(target_ip)
             .await
-            .unwrap_or_else(|| route.tcp_last_resort(target_ip, reason)),
+            .unwrap_or_else(|| route.tcp_last_resort(target_ip)),
     )
 }
 
@@ -787,22 +818,24 @@ impl Route<'_> {
             )
             .await;
         if let Some(ws) = pooled {
-            info!(
-                "[{}] DC{}{} → pool hit via {}",
-                self.label, self.dc, self.media, target_ip
-            );
+            // The pool's own `pool_hit` record says the connection came from
+            // there; this one says that is where the *ladder* stopped.
             return Some(Upstream::Ws {
                 ws,
                 framing: WsFraming::Packets,
                 tier: UpstreamTier::Ws,
+                via: target_ip.to_string(),
             });
         }
 
-        self.direct_ws(target_ip).await.map(|ws| Upstream::Ws {
-            ws,
-            framing: WsFraming::Packets,
-            tier: UpstreamTier::Ws,
-        })
+        self.direct_ws(target_ip)
+            .await
+            .map(|(ws, host)| Upstream::Ws {
+                ws,
+                framing: WsFraming::Packets,
+                tier: UpstreamTier::Ws,
+                via: host,
+            })
     }
 
     /// Walk the user-pinned tier order (`--pinned-upstream` /
@@ -833,16 +866,17 @@ impl Route<'_> {
             // one having failed or been skipped, and the reason is the same
             // whichever it was — the user asked for this order.
             if let Some(previous) = index.checked_sub(1).map(|prior| tiers[prior]) {
-                log_tier_fallback(previous, *tier, LogReason::Pinned);
+                log_tier_fallback(self.ctx(previous), previous, *tier, LogReason::Pinned);
             }
 
             let last_resort = !self.tier_attemptable_after(tiers, index + 1, target_ip);
             match tier {
                 UpstreamTier::Ws => {
                     let Some(target_ip) = target_ip else {
-                        warn!(
-                            "[{}] DC{}{} pinned ws tier has no --dc-ip target, skipping",
-                            self.label, self.dc, self.media
+                        log_attempt_skipped(
+                            self.ctx(UpstreamTier::Ws),
+                            UpstreamTier::Ws,
+                            LogReason::NotInDcIp,
                         );
                         continue;
                     };
@@ -852,51 +886,58 @@ impl Route<'_> {
                 }
                 UpstreamTier::Cfworker => {
                     let Some(dst) = self.runtime.fallback_ip(self.dc).or(target_ip) else {
-                        warn!(
-                            "[{}] DC{}{} pinned cfworker tier has no destination IP, skipping",
-                            self.label, self.dc, self.media
+                        log_attempt_skipped(
+                            self.ctx(UpstreamTier::Cfworker),
+                            UpstreamTier::Cfworker,
+                            LogReason::NotInDcIp,
                         );
                         continue;
                     };
-                    if let Some(ws) = self.cf_worker(dst, LogReason::Pinned, last_resort).await {
+                    if let Some((ws, domain)) = self.cf_worker(dst, last_resort).await {
                         return Some(Upstream::Ws {
                             ws,
                             framing: WsFraming::Tunnel,
                             tier: UpstreamTier::Cfworker,
+                            via: domain,
                         });
                     }
                 }
                 UpstreamTier::Cfproxy => {
-                    if let Some(ws) = self.cf_proxy(LogReason::Pinned).await {
+                    if let Some((ws, domain)) = self.cf_proxy().await {
                         return Some(Upstream::Ws {
                             ws,
                             framing: WsFraming::Packets,
                             tier: UpstreamTier::Cfproxy,
+                            via: domain,
                         });
                     }
                 }
                 UpstreamTier::Mtproto => {
-                    if let Some(conn) = self.upstream_proxies(LogReason::Pinned, last_resort).await
-                    {
-                        return Some(Upstream::Mtproto(conn));
+                    if let Some(conn) = self.upstream_proxies(last_resort).await {
+                        return Some(Upstream::Mtproto { conn });
                     }
                 }
                 UpstreamTier::Tcp => {
                     let Some(dst) = self.runtime.fallback_ip(self.dc).or(target_ip) else {
-                        warn!(
-                            "[{}] DC{}{} pinned tcp tier has no fallback IP, skipping",
-                            self.label, self.dc, self.media
+                        log_attempt_skipped(
+                            self.ctx(UpstreamTier::Tcp),
+                            UpstreamTier::Tcp,
+                            LogReason::NoFallback,
                         );
                         continue;
                     };
-                    return Some(self.tcp_fallback(dst, LogReason::Pinned));
+                    return Some(self.tcp_fallback(dst));
                 }
             }
         }
 
-        warn!(
-            "[{}] DC{}{} every pinned upstream failed",
-            self.label, self.dc, self.media
+        // Every pinned rung failed or was passed over, and a pin has no rung
+        // below it: the terminal fall this ladder would otherwise record is the
+        // one the operator asked not to take.
+        log_attempt_skipped(
+            self.ctx(UpstreamTier::Tcp),
+            UpstreamTier::Tcp,
+            LogReason::Pinned,
         );
         None
     }
@@ -906,10 +947,16 @@ impl Route<'_> {
         format!("DC{}{}", self.dc, self.media)
     }
 
+    /// The context a record about this session carries, naming the rung it is
+    /// about.
+    fn ctx(&self, tier: UpstreamTier) -> Option<Ctx> {
+        Some(Ctx::new(self.dc, self.is_media, LogTier::from(tier)))
+    }
+
     /// `EVT:tier_fallback` for a rung the ladder is leaving: names the next rung
     /// it can actually reach, and the reason it is leaving.
     fn log_fallback(&self, from: UpstreamTier, reason: LogReason) {
-        log_tier_fallback(from, self.next_tier_after(from), reason);
+        log_tier_fallback(self.ctx(from), from, self.next_tier_after(from), reason);
     }
 
     /// The rung the ladder falls to when `from` fails or is skipped.
@@ -971,8 +1018,12 @@ impl Route<'_> {
     ///
     /// `dst` is the Telegram DC IP the Worker should open its TCP tunnel to.
     /// Returns `None` when every configured tier failed or was skipped.
-    async fn fallback_chain(&self, dst: &str, reason: LogReason) -> Option<Upstream> {
-        if let Some(upstream) = self.cf_tiers(dst, reason).await {
+    ///
+    /// The reason the ladder is walking this far down is not a parameter: each
+    /// step down records its own reason where it is taken, so passing it here
+    /// would only be a second copy of the same fact.
+    async fn fallback_chain(&self, dst: &str) -> Option<Upstream> {
+        if let Some(upstream) = self.cf_tiers(dst).await {
             return Some(upstream);
         }
 
@@ -983,8 +1034,8 @@ impl Route<'_> {
             self.log_fallback(UpstreamTier::Cfproxy, LogReason::CfProxyFail);
         }
 
-        if let Some(conn) = self.upstream_proxies(reason, false).await {
-            return Some(Upstream::Mtproto(conn));
+        if let Some(conn) = self.upstream_proxies(false).await {
+            return Some(Upstream::Mtproto { conn });
         }
 
         // Only a rung that was tried can hand over: with no upstream proxies
@@ -1003,23 +1054,25 @@ impl Route<'_> {
     /// the identical ladder — a Worker-only setup used to sit out
     /// `--cf-priority` entirely and pay the full direct-WS timeout on every
     /// connection before reaching its only working path.
-    async fn cf_tiers(&self, dst: &str, reason: LogReason) -> Option<Upstream> {
+    async fn cf_tiers(&self, dst: &str) -> Option<Upstream> {
         if !self.config.cf_worker_domains().is_empty() {
-            if let Some(ws) = self.cf_worker(dst, reason, false).await {
+            if let Some((ws, domain)) = self.cf_worker(dst, false).await {
                 return Some(Upstream::Ws {
                     ws,
                     framing: WsFraming::Tunnel,
                     tier: UpstreamTier::Cfworker,
+                    via: domain,
                 });
             }
 
             self.log_fallback(UpstreamTier::Cfworker, LogReason::CfWorkerFail);
         }
 
-        self.cf_proxy(reason).await.map(|ws| Upstream::Ws {
+        self.cf_proxy().await.map(|(ws, domain)| Upstream::Ws {
             ws,
             framing: WsFraming::Packets,
             tier: UpstreamTier::Cfproxy,
+            via: domain,
         })
     }
 
@@ -1079,7 +1132,10 @@ impl Route<'_> {
     /// `force` dials through the per-domain failure cooldown — the pinned
     /// ladder's last resort, where a skip would drop the connection rather
     /// than reach a next rung.  The default ladder always passes `false`.
-    async fn cf_worker(&self, dst: &str, reason: LogReason, force: bool) -> Option<TgWsStream> {
+    ///
+    /// Returns the stream with the Worker domain that carried it, for the
+    /// session record's `via`.
+    async fn cf_worker(&self, dst: &str, force: bool) -> Option<(TgWsStream, String)> {
         let worker_domains = self.config.cf_worker_domains();
         if worker_domains.is_empty() {
             return None;
@@ -1097,16 +1153,7 @@ impl Route<'_> {
             .cf_get(CfTier::Worker, self.dc, self.is_media)
             .await
         {
-            info!(
-                "[{}] DC{}{} {} → CF Worker pool hit ({})",
-                self.label,
-                self.dc,
-                self.media,
-                reason.as_str(),
-                domain
-            );
-
-            return Some(ws);
+            return Some((ws, domain));
         }
 
         let first_worker = balance_offset(
@@ -1117,26 +1164,16 @@ impl Route<'_> {
 
         for worker_domain in domain_order(worker_domains, first_worker) {
             if !force && CF_WORKER_FAIL.active(worker_domain) {
-                debug!(
-                    "[{}] DC{}{} CF Worker {} in cooldown, skipping",
-                    self.label, self.dc, self.media, worker_domain
+                log_cooldown_skipped(
+                    self.ctx(UpstreamTier::Cfworker),
+                    CooldownKind::CfWorkerFail,
+                    worker_domain,
                 );
-                log_cooldown_skipped(CooldownKind::CfWorkerFail, worker_domain);
                 continue;
             }
 
-            debug!(
-                "[{}] DC{}{} {} → trying CF Worker {} for {}",
-                self.label,
-                self.dc,
-                self.media,
-                reason.as_str(),
-                worker_domain,
-                dst
-            );
-
             let started = Instant::now();
-            let (ws, failure) = connect_cf_worker_ws_for_dc_with_outbound_classified(
+            let (ws, failure, tls) = connect_cf_worker_ws_for_dc_with_outbound_classified(
                 worker_domain,
                 dst,
                 self.dc,
@@ -1149,32 +1186,28 @@ impl Route<'_> {
                     disable_tls: self.config.cf_disable_tls,
                     fail_cooldown: self.timeouts.cf_fail_cooldown,
                 },
-                &mut EdgeCooldowns,
+                &mut EdgeCooldowns::new(self.dc, self.is_media, UpstreamTier::Cfworker),
             )
             .await;
             log_tier_attempt(
-                self.dc,
-                self.is_media,
-                UpstreamTier::Cfworker,
+                self.ctx(UpstreamTier::Cfworker),
+                worker_domain,
                 ws.is_some(),
                 started.elapsed(),
                 failure,
+                tls,
             );
 
             match ws {
                 Some(ws) => {
                     if CF_WORKER_FAIL.active(worker_domain) {
                         CF_WORKER_FAIL.clear(worker_domain);
-                        log_cooldown_cleared(CooldownKind::CfWorkerFail, worker_domain);
+                        log_cooldown_cleared(
+                            self.ctx(UpstreamTier::Cfworker),
+                            CooldownKind::CfWorkerFail,
+                            worker_domain,
+                        );
                     }
-                    info!(
-                        "[{}] DC{}{} {} → CF Worker connected ({})",
-                        self.label,
-                        self.dc,
-                        self.media,
-                        reason.as_str(),
-                        worker_domain
-                    );
                     // This Worker answers, so it is worth holding a spare
                     // tunnel open for the client's next connection — Telegram
                     // opens a new one per media transfer, and each pays the
@@ -1188,23 +1221,16 @@ impl Route<'_> {
                         &CF_WORKER_BALANCE_COUNTER,
                     ));
 
-                    return Some(ws);
+                    return Some((ws, worker_domain.to_string()));
                 }
                 None => {
                     CF_WORKER_FAIL.set(worker_domain.to_string(), self.timeouts.cf_fail_cooldown);
                     log_cooldown_armed(
+                        self.ctx(UpstreamTier::Cfworker),
                         CooldownKind::CfWorkerFail,
                         worker_domain,
                         self.timeouts.cf_fail_cooldown,
                         failure,
-                    );
-                    warn!(
-                        "[{}] DC{}{} CF Worker {} failed, cooldown {}s",
-                        self.label,
-                        self.dc,
-                        self.media,
-                        worker_domain,
-                        self.timeouts.cf_fail_cooldown.as_secs()
                     );
                 }
             }
@@ -1222,7 +1248,7 @@ impl Route<'_> {
     /// `--cf-balance`/`--default-domains`) blocked *all* of them for the whole
     /// cooldown window, forcing every connection in that window down into the
     /// fronting/TCP fallback instead.
-    async fn cf_proxy(&self, reason: LogReason) -> Option<TgWsStream> {
+    async fn cf_proxy(&self) -> Option<(TgWsStream, String)> {
         if self.config.cf_domains.is_empty() {
             return None;
         }
@@ -1238,26 +1264,8 @@ impl Route<'_> {
             .cf_get(CfTier::Proxy, self.dc, self.is_media)
             .await
         {
-            info!(
-                "[{}] DC{}{} {} → CF proxy pool hit ({})",
-                self.label,
-                self.dc,
-                self.media,
-                reason.as_str(),
-                domain
-            );
-
-            return Some(ws);
+            return Some((ws, domain));
         }
-
-        debug!(
-            "[{}] DC{}{} {} → trying CF proxy via {:?}",
-            self.label,
-            self.dc,
-            self.media,
-            reason.as_str(),
-            self.config.cf_domains
-        );
 
         let started = Instant::now();
         let walk = connect_cf_ws_for_dc_with_outbound_ordered(
@@ -1273,56 +1281,47 @@ impl Route<'_> {
                 disable_tls: self.config.cf_disable_tls,
                 fail_cooldown: self.timeouts.cf_fail_cooldown,
             },
-            &mut EdgeCooldowns,
+            &mut EdgeCooldowns::new(self.dc, self.is_media, UpstreamTier::Cfproxy),
         )
         .await;
         log_tier_attempt(
-            self.dc,
-            self.is_media,
-            UpstreamTier::Cfproxy,
+            self.ctx(UpstreamTier::Cfproxy),
+            &walk.host,
             walk.ws.is_some(),
             started.elapsed(),
             walk.failure,
+            walk.tls,
         );
 
         let (ws, domain) = (walk.ws, walk.record);
 
-        if ws.is_some() {
-            info!(
-                "[{}] DC{}{} {} → CF proxy connected",
-                self.label,
-                self.dc,
-                self.media,
-                reason.as_str()
-            );
-            if let Some(domain) = domain {
-                self.pool.cf_prefetch(self.cf_target(
-                    CfTier::Proxy,
-                    "",
-                    &domain,
-                    &self.config.cf_domains,
-                    &CF_BALANCE_COUNTER,
-                ));
-            }
-        } else {
-            warn!(
-                "[{}] DC{}{} CF proxy failed (all configured domains)",
-                self.label, self.dc, self.media
-            );
+        if let Some(domain) = &domain {
+            // This domain answers, so it is worth holding a spare connection
+            // open through it for the client's next one.
+            self.pool.cf_prefetch(self.cf_target(
+                CfTier::Proxy,
+                "",
+                domain,
+                &self.config.cf_domains,
+                &CF_BALANCE_COUNTER,
+            ));
         }
 
-        ws
+        ws.map(|ws| (ws, domain.unwrap_or_default()))
     }
 
     /// Try each configured upstream MTProto proxy in order.
     ///
     /// `force` dials through the failure cooldown — see [`Self::cf_worker`].
-    async fn upstream_proxies(&self, reason: LogReason, force: bool) -> Option<UpstreamConnection> {
+    async fn upstream_proxies(&self, force: bool) -> Option<UpstreamConnection> {
         for upstream in &self.config.mtproto_proxies {
             let key = upstream_key(&upstream.host, upstream.port);
             if !force && UPSTREAM_FAIL.active(key.as_str()) {
-                debug!("[{}] upstream {} in cooldown, skipping", self.label, key);
-                log_cooldown_skipped(CooldownKind::UpstreamFail, &key);
+                log_cooldown_skipped(
+                    self.ctx(UpstreamTier::Mtproto),
+                    CooldownKind::UpstreamFail,
+                    &key,
+                );
                 continue;
             }
 
@@ -1336,44 +1335,38 @@ impl Route<'_> {
             )
             .await;
             log_tier_attempt(
-                self.dc,
-                self.is_media,
-                UpstreamTier::Mtproto,
+                self.ctx(UpstreamTier::Mtproto),
+                &key,
                 conn.is_ok(),
                 started.elapsed(),
                 conn.as_ref().err().copied(),
+                // TLS to an upstream MTProto proxy is FakeTLS the proxy speaks,
+                // not a handshake with a certificate; the rung's own record is
+                // where that shows up.
+                None,
             );
 
             match conn {
                 Ok(conn) => {
                     if UPSTREAM_FAIL.active(key.as_str()) {
                         UPSTREAM_FAIL.clear(key.as_str());
-                        log_cooldown_cleared(CooldownKind::UpstreamFail, &key);
+                        log_cooldown_cleared(
+                            self.ctx(UpstreamTier::Mtproto),
+                            CooldownKind::UpstreamFail,
+                            &key,
+                        );
                     }
-                    info!(
-                        "[{}] DC{}{} {} → upstream {} MTProto {}",
-                        self.label,
-                        self.dc,
-                        self.media,
-                        reason.as_str(),
-                        if conn.faketls { "FakeTLS" } else { "plain" },
-                        key
-                    );
+
                     return Some(conn);
                 }
                 Err(failure) => {
                     UPSTREAM_FAIL.set(key.clone(), self.timeouts.upstream_fail_cooldown);
                     log_cooldown_armed(
+                        self.ctx(UpstreamTier::Mtproto),
                         CooldownKind::UpstreamFail,
                         &key,
                         self.timeouts.upstream_fail_cooldown,
                         Some(failure),
-                    );
-                    warn!(
-                        "[{}] upstream {} failed, cooldown {}s",
-                        self.label,
-                        key,
-                        self.timeouts.upstream_fail_cooldown.as_secs()
                     );
                 }
             }
@@ -1385,7 +1378,11 @@ impl Route<'_> {
     /// Open a fresh direct WebSocket to `target_ip`, always fronted when
     /// `--fronting-domain` is set, and applying the per-DC cooldown on
     /// failure.
-    async fn direct_ws(&self, target_ip: &str) -> Option<TgWsStream> {
+    ///
+    /// Returns the stream with the hostname that carried it, which is what the
+    /// session record's `via` reports: `-1` against the plain name is a retry,
+    /// and a reader who cannot see it cannot tell one domain walk from another.
+    async fn direct_ws(&self, target_ip: &str) -> Option<(TgWsStream, String)> {
         // `--fronting-domain` means the very first ClientHello carries the
         // fronted SNI. A reactive "front only after the direct SNI times out"
         // switch sends the real `telegram.org` SNI first, which networks that
@@ -1400,36 +1397,30 @@ impl Route<'_> {
         let started = Instant::now();
         let attempt = self.connect_ws(target_ip, fronting).await;
         log_tier_attempt(
-            self.dc,
-            self.is_media,
-            UpstreamTier::Ws,
+            self.ctx(UpstreamTier::Ws),
+            &attempt.host,
             attempt.ws.is_some(),
             started.elapsed(),
             attempt.failure,
+            attempt.tls,
         );
 
         if let Some(ws) = attempt.ws {
             let dc_key = (self.dc, self.is_media);
             if WS_FAIL.active(&dc_key) {
                 WS_FAIL.clear(&dc_key);
-                log_cooldown_cleared(CooldownKind::WsFail, &self.dc_key());
+                log_cooldown_cleared(
+                    self.ctx(UpstreamTier::Ws),
+                    CooldownKind::WsFail,
+                    &self.dc_key(),
+                );
             }
             if IP_FAIL.active(target_ip) {
                 IP_FAIL.clear(target_ip);
-                log_cooldown_cleared(CooldownKind::IpFail, target_ip);
-            }
-            match fronting {
-                Some(domain) => info!(
-                    "[{}] DC{}{} → WS connected via {} (fronted SNI {})",
-                    self.label, self.dc, self.media, target_ip, domain
-                ),
-                None => info!(
-                    "[{}] DC{}{} → WS connected via {}",
-                    self.label, self.dc, self.media, target_ip
-                ),
+                log_cooldown_cleared(self.ctx(UpstreamTier::Ws), CooldownKind::IpFail, target_ip);
             }
 
-            return Some(ws);
+            return Some((ws, attempt.host));
         }
 
         self.cool_down_ws(attempt.all_redirects, attempt.failure);
@@ -1478,25 +1469,16 @@ impl Route<'_> {
             self.timeouts.ws_fail_cooldown
         };
         WS_FAIL.set((self.dc, self.is_media), cooldown);
-        log_cooldown_armed(CooldownKind::WsFail, &self.dc_key(), cooldown, failure);
-
-        if all_redirects {
-            warn!(
-                "[{}] DC{}{} WS cooldown {}s (all domains returned redirect)",
-                self.label,
-                self.dc,
-                self.media,
-                cooldown.as_secs()
-            );
-        } else {
-            info!(
-                "[{}] DC{}{} WS cooldown {}s",
-                self.label,
-                self.dc,
-                self.media,
-                cooldown.as_secs()
-            );
-        }
+        // `all_redirects` is not lost by dropping the line: the attempts that
+        // came back as redirects are the records that decided the longer
+        // cooldown, and `err` here names the class the last one ended on.
+        log_cooldown_armed(
+            self.ctx(UpstreamTier::Ws),
+            CooldownKind::WsFail,
+            &self.dc_key(),
+            cooldown,
+            failure,
+        );
     }
 
     /// Back off from a target IP whose TCP connect timed out.
@@ -1509,18 +1491,11 @@ impl Route<'_> {
     fn cool_down_ip(&self, target_ip: &str, failure: Option<RungFailure>) {
         IP_FAIL.set(target_ip.to_string(), self.timeouts.ip_fail_cooldown);
         log_cooldown_armed(
+            self.ctx(UpstreamTier::Ws),
             CooldownKind::IpFail,
             target_ip,
             self.timeouts.ip_fail_cooldown,
             failure,
-        );
-        info!(
-            "[{}] DC{}{} TCP to {} timed out, cooldown {}s",
-            self.label,
-            self.dc,
-            self.media,
-            target_ip,
-            self.timeouts.ip_fail_cooldown.as_secs()
         );
     }
 
@@ -1530,22 +1505,18 @@ impl Route<'_> {
     /// only reached after that override failed, and on the paths that get here
     /// it failed by timing out — the one signal that says the address itself
     /// is unreachable.
-    fn tcp_last_resort(&self, target_ip: &str, reason: LogReason) -> Upstream {
+    fn tcp_last_resort(&self, target_ip: &str) -> Upstream {
         let dst = self.runtime.fallback_ip(self.dc).unwrap_or(target_ip);
 
-        self.tcp_fallback(dst, reason)
+        self.tcp_fallback(dst)
     }
 
-    fn tcp_fallback(&self, dst: &str, reason: LogReason) -> Upstream {
-        info!(
-            "[{}] DC{}{} {} → TCP fallback {}:443",
-            self.label,
-            self.dc,
-            self.media,
-            reason.as_str(),
-            dst
-        );
-
+    /// The terminal rung: a plain TCP connection to the DC's address.
+    ///
+    /// It records nothing here: the dial happens inside the bridge, which
+    /// records its own `tier_attempt` when it connects — the only place that
+    /// knows whether the address answered.
+    fn tcp_fallback(&self, dst: &str) -> Upstream {
         Upstream::Tcp(dst.to_string())
     }
 }
@@ -1560,11 +1531,12 @@ impl Route<'_> {
 /// Telegram  →  WS frame  →  tg_dec  →  plaintext  →  clt_enc  →  client TCP
 /// ```
 struct WsBridgeParams {
-    label: SocketAddr,
     ws: TgWsStream,
     framing: WsFraming,
     /// Which rung this stream came from, for the session record.
     tier: UpstreamTier,
+    /// What the session runs through; see [`Upstream::Ws`].
+    via: String,
     relay_init: [u8; 64],
     ciphers: ConnectionCiphers,
     proto: ProtoTag,
@@ -1574,9 +1546,9 @@ struct WsBridgeParams {
 
 async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeParams) {
     let WsBridgeParams {
-        label,
         ws,
         tier,
+        via,
         framing,
         relay_init,
         ciphers,
@@ -1600,13 +1572,36 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
     let bytes_up = Arc::new(StdMutex::new(0));
     let mut bytes_down = 0;
 
+    // The upload half owns the closure, and this is the one record it writes
+    // itself — so it needs the host the session was routed through, while the
+    // close at the end of the function still needs the original.
+    let via_upload = via.clone();
+
     let upload = tokio::spawn({
         let mut bytes = UploadCounter::new(Arc::clone(&bytes_up));
         async move {
             // Keep every sink operation in this direction so upload and download
             // can be polled independently by `join_bridge`.
-            if let Err(e) = ws_sink.send(Message::Binary(relay_init.to_vec())).await {
-                warn!("[{}] failed to send relay init: {}", label, e);
+            if ws_sink
+                .send(Message::Binary(relay_init.to_vec()))
+                .await
+                .is_err()
+            {
+                // The client was gone before a byte moved. It is still the
+                // client that ended the session, and a session that opens and
+                // never closes is what a crashed process looks like — so this
+                // is recorded like any other close, with zero bytes.
+                log_session_closed(
+                    dc,
+                    is_media,
+                    tier,
+                    ClosedBy::Client,
+                    0,
+                    0,
+                    start,
+                    &via_upload,
+                );
+
                 return;
             }
 
@@ -1698,7 +1693,7 @@ async fn bridge_ws(reader: ClientReader, writer: ClientWriter, params: WsBridgeP
     let bytes_up = *bytes_up.lock().unwrap();
 
     log_session_closed(
-        label, dc, is_media, "WS", tier, closed_by, bytes_up, bytes_down, start,
+        dc, is_media, tier, closed_by, bytes_up, bytes_down, start, &via,
     );
 }
 
@@ -1715,6 +1710,9 @@ struct UpstreamConnection {
     /// Whether the session is wrapped in TLS Application Data records
     /// (`0xee` FakeTLS secrets) rather than sent as raw obfuscated TCP.
     faketls: bool,
+    /// `host:port` of the proxy this connection was dialled at, for the
+    /// session record's `via`.
+    via: String,
 }
 
 /// Connect to an upstream MTProto proxy and perform the client handshake.
@@ -1733,21 +1731,22 @@ async fn connect_mtproto_upstream(
     let host = &proxy.host;
     let port = proxy.port;
     let key_bytes = proxy.secret_key();
+    let via = upstream_key(host, port);
 
     // The one class this rung shares with the rest of the ladder, for a
     // handshake the peer broke off: the socket was open and then it was not.
     let broken_stream = RungFailure {
         err: ErrorCode::Read,
         err_code: 0,
+        errno: 0,
     };
 
     // ── TCP connect ───────────────────────────────────────────────────────
     let stream = match outbound.connect(host, port, timeout).await {
         Ok(s) => s,
-        Err(e) => {
-            warn!("[upstream] {}:{} connect error: {}", host, port, e);
-            return Err(connect_failure(&e));
-        }
+        // The class and the errno travel to the rung's `tier_attempt` record,
+        // which is where this failure is written down.
+        Err(e) => return Err(connect_failure(&e)),
     };
     let _ = stream.set_nodelay(true);
 
@@ -1756,8 +1755,7 @@ async fn connect_mtproto_upstream(
 
     let Some(hostname) = proxy.faketls_hostname() else {
         // ── Plain MTProto path ────────────────────────────────────────────
-        if let Err(e) = writer.write_all(&handshake).await {
-            warn!("[upstream] {}:{} send handshake error: {}", host, port, e);
+        if writer.write_all(&handshake).await.is_err() {
             return Err(broken_stream);
         }
 
@@ -1767,6 +1765,7 @@ async fn connect_mtproto_upstream(
             enc,
             dec,
             faketls: false,
+            via,
         });
     };
 
@@ -1775,32 +1774,21 @@ async fn connect_mtproto_upstream(
     let mut client_hello = build_faketls_client_hello(hostname);
     sign_faketls_client_hello(&mut client_hello, key_bytes);
 
-    if let Err(e) = writer.write_all(&client_hello).await {
-        warn!(
-            "[upstream] {}:{} FakeTLS send ClientHello error: {}",
-            host, port, e
-        );
+    if writer.write_all(&client_hello).await.is_err() {
         return Err(broken_stream);
     }
 
     // Drain the server's fake TLS handshake response.
     if !drain_faketls_server_hello(&mut reader).await {
-        warn!(
-            "[upstream] {}:{} FakeTLS server handshake failed",
-            host, port
-        );
         return Err(RungFailure {
             err: ErrorCode::Tls,
             err_code: 0,
+            errno: 0,
         });
     }
 
     // Send the 64-byte MTProto init as the first Application Data record.
-    if let Err(e) = write_tls_appdata(&mut writer, &handshake).await {
-        warn!(
-            "[upstream] {}:{} FakeTLS send MTProto init error: {}",
-            host, port, e
-        );
+    if write_tls_appdata(&mut writer, &handshake).await.is_err() {
         return Err(broken_stream);
     }
 
@@ -1810,6 +1798,7 @@ async fn connect_mtproto_upstream(
         enc,
         dec,
         faketls: true,
+        via,
     })
 }
 
@@ -1827,24 +1816,25 @@ async fn connect_mtproto_upstream(
 /// session ciphers returned by [`connect_mtproto_upstream`].  No relay init is
 /// sent here — the client handshake was the only setup packet.
 struct RelayParams {
-    label: SocketAddr,
     rem_reader: TcpReader,
     rem_writer: TcpWriter,
     ciphers: ConnectionCiphers,
     faketls: bool,
     dc: u32,
     is_media: bool,
+    /// `host:port` of the upstream proxy; see [`Upstream::Mtproto`].
+    via: String,
 }
 
 async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayParams) {
     let RelayParams {
-        label,
         rem_reader,
         rem_writer,
         ciphers,
         faketls,
         dc,
         is_media,
+        via,
     } = params;
 
     let ConnectionCiphers {
@@ -1934,21 +1924,15 @@ async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayP
     let closed_by = join_bridge(upload, download).await;
     let bytes_up = *bytes_up.lock().unwrap();
 
-    let kind = if faketls {
-        "upstream FakeTLS"
-    } else {
-        "upstream"
-    };
     log_session_closed(
-        label,
         dc,
         is_media,
-        kind,
         UpstreamTier::Mtproto,
         closed_by,
         bytes_up,
         bytes_down,
         start,
+        &via,
     );
 }
 
@@ -1958,12 +1942,13 @@ async fn bridge_relay(reader: ClientReader, writer: ClientWriter, params: RelayP
 ///
 /// Logs a session-close line on return (matching the `bridge_ws` format).
 struct TcpBridgeParams<'a> {
-    label: SocketAddr,
     dst: &'a str,
     relay_init: &'a [u8; 64],
     ciphers: ConnectionCiphers,
     dc: u32,
     is_media: bool,
+    /// The address the session runs through; see [`Upstream::Tcp`].
+    via: String,
     connect_timeout: Duration,
     runtime: Arc<Runtime>,
 }
@@ -1974,10 +1959,10 @@ async fn bridge_tcp(
     params: TcpBridgeParams<'_>,
 ) {
     let TcpBridgeParams {
-        label,
         dst,
         relay_init,
         ciphers,
+        via,
         dc,
         is_media,
         connect_timeout,
@@ -1988,26 +1973,39 @@ async fn bridge_tcp(
     let remote = match runtime.outbound().connect(dst, 443, connect_timeout).await {
         Ok(s) => {
             log_tier_attempt(
-                dc,
-                is_media,
-                UpstreamTier::Tcp,
+                Some(Ctx::new(dc, is_media, LogTier::Tcp)),
+                dst,
                 true,
                 started.elapsed(),
+                None,
                 None,
             );
 
             s
         }
         Err(e) => {
-            warn!("[{}] TCP fallback connect failed: {}", label, e);
             log_tier_attempt(
-                dc,
-                is_media,
-                UpstreamTier::Tcp,
+                Some(Ctx::new(dc, is_media, LogTier::Tcp)),
+                dst,
                 false,
                 started.elapsed(),
                 Some(connect_failure(&e)),
+                None,
             );
+            // The rung was chosen and could not carry the session, so the
+            // session ends with nothing bridged — the same fact `no_route`
+            // reports when the ladder picks nothing at all.
+            log_session_closed(
+                dc,
+                is_media,
+                UpstreamTier::Tcp,
+                ClosedBy::NoRoute,
+                0,
+                0,
+                started,
+                &via,
+            );
+
             return;
         }
     };
@@ -2016,8 +2014,20 @@ async fn bridge_tcp(
     let (mut rem_reader, mut rem_writer) = remote.into_split();
 
     // Send relay init to the remote Telegram server.
-    if let Err(e) = rem_writer.write_all(relay_init).await {
-        warn!("[{}] TCP fallback: send relay init failed: {}", label, e);
+    if rem_writer.write_all(relay_init).await.is_err() {
+        // The peer took the connection and then dropped it before the relay
+        // init; nothing moved, and no route carried the session after all.
+        log_session_closed(
+            dc,
+            is_media,
+            UpstreamTier::Tcp,
+            ClosedBy::NoRoute,
+            0,
+            0,
+            started,
+            &via,
+        );
+
         return;
     }
 
@@ -2082,15 +2092,14 @@ async fn bridge_tcp(
     let bytes_up = *bytes_up.lock().unwrap();
 
     log_session_closed(
-        label,
         dc,
         is_media,
-        "TCP",
         UpstreamTier::Tcp,
         closed_by,
         bytes_up,
         bytes_down,
         start,
+        &via,
     );
 }
 
@@ -2134,21 +2143,20 @@ where
 enum ClosedBy {
     Client,
     Upstream,
+    /// Nothing carried the session: the rung the ladder chose died before it
+    /// could be bridged.  [`join_bridge`] never returns this — a bridge that
+    /// got as far as running has a side that ended it — so it is only ever
+    /// built on the way out of a setup that failed.
+    NoRoute,
 }
 
 impl ClosedBy {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Client => "client",
-            Self::Upstream => "upstream",
-        }
-    }
-
-    /// The same two cases in the schema's vocabulary.
+    /// The same three cases in the schema's vocabulary.
     fn to_schema(self) -> LogClosedBy {
         match self {
             Self::Client => LogClosedBy::Client,
             Self::Upstream => LogClosedBy::Upstream,
+            Self::NoRoute => LogClosedBy::NoRoute,
         }
     }
 }
@@ -2174,46 +2182,46 @@ impl Drop for UploadCounter {
     }
 }
 
+/// `EVT:session_closed` — the end of a bridge session, whatever ended it.
+///
+/// `via` is the host the session actually ran through — the `kws{N}` name, the
+/// Cloudflare domain, the Worker host, `host:port` for the other two rungs. The
+/// console line printed the address the client dialled instead, which the peer
+/// prefix already says.
+///
+/// The level is the one event level that depends on the event's own content: a
+/// close is an outcome at `info`, except when `closed_by` is `no_route`, where
+/// it is the failure that says the client got nothing.
 #[allow(clippy::too_many_arguments)]
 fn log_session_closed(
-    label: SocketAddr,
     dc: u32,
     is_media: bool,
-    kind: &str,
     tier: UpstreamTier,
     closed_by: ClosedBy,
     bytes_up: u64,
     bytes_down: u64,
     start: Instant,
+    via: &str,
 ) {
-    info!(
-        "[{}] DC{}{} {} session closed by {}: ↑{}  ↓{}  {:.1}s",
-        label,
-        dc,
-        media_tag(is_media),
-        kind,
-        closed_by.as_str(),
-        human_bytes(bytes_up),
-        human_bytes(bytes_down),
-        start.elapsed().as_secs_f32()
-    );
-
-    // The structured half of the same fact. Which rung carried the session and
-    // which side ended it are the two questions a segment exists to answer, and
-    // neither survives in the console line once the terminal is gone.
     let dur_ms = start.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    // A session with no route is the one close that is a failure: the client
+    // got nothing, and an `info` floor has to keep it. Every other close is an
+    // outcome, however the session went.
+    let level = match closed_by {
+        ClosedBy::NoRoute => Level::Warn,
+        ClosedBy::Client | ClosedBy::Upstream => Level::Info,
+    };
+
     log_event!(
         Category::Session,
-        Level::Info,
+        level,
         Event::SessionClosed {
             ctx: Some(Ctx::new(dc, is_media, LogTier::from(tier))),
             closed_by: closed_by.to_schema() as i32,
             bytes_up,
             bytes_down,
             dur_ms,
-            // The domain the session ran through, which the console line prints
-            // beside the address. Filled by the caller that knows it.
-            via: String::new(),
+            via: via.to_string(),
         }
     );
 }
@@ -2226,34 +2234,58 @@ fn log_session_closed(
 /// inside its bridge, and a rung that a cooldown skipped connects not at all.
 /// That leaves exactly one record per connection attempt, which is what makes
 /// the durations add up to the connection's setup time.
+///
+/// The level is the event's own rule rather than the caller's: a dial that
+/// failed is a warning and one that carried the connection is info, so an
+/// `info` floor keeps every session's outcome and `debug` adds the successful
+/// dials on top.
+///
+/// The TLS handshake behind the dial travels with it, because the two are one
+/// measurement of one attempt: it is emitted here, at `debug`, rather than by
+/// `ws_client.rs`, which has no session (C11).
+#[allow(clippy::too_many_arguments)]
 fn log_tier_attempt(
-    dc: u32,
-    is_media: bool,
-    tier: UpstreamTier,
+    ctx: Option<Ctx>,
+    host: &str,
     ok: bool,
     dur: Duration,
     failure: Option<RungFailure>,
+    tls: Option<TlsCost>,
 ) {
     // A successful dial carries no classification, and neither does one whose
     // rung failed without one — the enum's zero is both.
-    let (err, err_code) = match failure {
-        Some(failure) if !ok => (failure.err as i32, failure.err_code),
-        _ => (ErrorCode::Unspecified as i32, 0),
+    let (err, err_code, errno) = match failure {
+        Some(failure) if !ok => (failure.err as i32, failure.err_code, failure.errno),
+        _ => (ErrorCode::Unspecified as i32, 0, 0),
     };
 
     log_event!(
         Category::Routing,
-        Level::Debug,
+        if ok { Level::Info } else { Level::Warn },
         Event::TierAttempt {
-            ctx: Some(Ctx::new(dc, is_media, LogTier::from(tier))),
-            host: String::new(),
+            ctx: ctx.clone(),
+            host: host.to_string(),
             ok,
             dur_ns: dur.as_nanos().min(u64::MAX as u128) as u64,
             err,
             err_code,
-            errno: 0,
+            errno,
         }
     );
+
+    if let Some(tls) = tls {
+        log_event!(
+            Category::Tls,
+            Level::Debug,
+            Event::TlsHandshake {
+                ctx,
+                kind: tls.kind,
+                dur_ns: tls.dur_ns,
+                err: tls.err,
+                errno: tls.errno,
+            }
+        );
+    }
 }
 
 /// `EVT:tier_fallback` — the ladder leaving one rung for the next one it can
@@ -2263,14 +2295,32 @@ fn log_tier_attempt(
 /// was: `tier_attempt` says what each rung's dial cost, and these say why the
 /// ladder moved on. A rung that a cooldown skipped is a step too — it is named
 /// by the reason rather than by a failed attempt.
-fn log_tier_fallback(from: UpstreamTier, to: UpstreamTier, reason: LogReason) {
+fn log_tier_fallback(ctx: Option<Ctx>, from: UpstreamTier, to: UpstreamTier, reason: LogReason) {
     log_event!(
         Category::Routing,
         Level::Info,
         Event::TierFallback {
-            ctx: None,
+            ctx,
             from_tier: LogTier::from(from) as i32,
             to_tier: LogTier::from(to) as i32,
+            reason: reason as i32,
+        }
+    );
+}
+
+/// `EVT:attempt_skipped` — a rung the ladder never dialled, and why.
+///
+/// Distinct from a failed attempt on purpose: nothing was tried, so there is no
+/// duration and no error, only the reason the rung was passed over. The console
+/// printed these as ladder notes ("pinned ws tier has no --dc-ip target,
+/// skipping"), and without them a segment cannot reconstruct the walk.
+fn log_attempt_skipped(ctx: Option<Ctx>, tier: UpstreamTier, reason: LogReason) {
+    log_event!(
+        Category::Routing,
+        Level::Debug,
+        Event::AttemptSkipped {
+            ctx,
+            tier: LogTier::from(tier) as i32,
             reason: reason as i32,
         }
     );
@@ -2283,6 +2333,7 @@ fn log_tier_fallback(from: UpstreamTier, to: UpstreamTier, reason: LogReason) {
 /// nothing an operator can act on, "300 s because the handshake timed out"
 /// does.
 fn log_cooldown_armed(
+    ctx: Option<Ctx>,
     kind: CooldownKind,
     key_display: &str,
     dur: Duration,
@@ -2295,9 +2346,9 @@ fn log_cooldown_armed(
 
     log_event!(
         Category::Cooldown,
-        Level::Info,
+        Level::Warn,
         Event::CooldownArmed {
-            ctx: None,
+            ctx,
             kind: kind as i32,
             key_display: key_display.to_string(),
             dur_s: dur.as_secs().min(u32::MAX as u64) as u32,
@@ -2311,12 +2362,12 @@ fn log_cooldown_armed(
 ///
 /// Emitted only when there was an entry to take out: a successful connection is
 /// an ordinary event, and one that says it had nothing to clear is noise.
-fn log_cooldown_cleared(kind: CooldownKind, key_display: &str) {
+fn log_cooldown_cleared(ctx: Option<Ctx>, kind: CooldownKind, key_display: &str) {
     log_event!(
         Category::Cooldown,
         Level::Debug,
         Event::CooldownCleared {
-            ctx: None,
+            ctx,
             kind: kind as i32,
             key_display: key_display.to_string(),
         }
@@ -2324,12 +2375,12 @@ fn log_cooldown_cleared(kind: CooldownKind, key_display: &str) {
 }
 
 /// `EVT:cooldown_skipped` — a rung not dialled because of a cooldown.
-fn log_cooldown_skipped(kind: CooldownKind, key_display: &str) {
+fn log_cooldown_skipped(ctx: Option<Ctx>, kind: CooldownKind, key_display: &str) {
     log_event!(
         Category::Cooldown,
         Level::Debug,
         Event::CooldownSkipped {
-            ctx: None,
+            ctx,
             kind: kind as i32,
             key_display: key_display.to_string(),
         }
@@ -2352,13 +2403,25 @@ fn edge_cooldown_kind(plaintext: bool) -> CooldownKind {
 /// Writes a Cloudflare edge walk's cooldown decisions into the log.
 ///
 /// The walk itself is in `ws_client.rs`, which is session-free by design
-/// (C11); this is the session-side half of C28, and it is a unit struct
-/// because the walk hands over everything the record needs.
-struct EdgeCooldowns;
+/// (C11); this is the session-side half of C28, and the walk hands over
+/// everything the record needs but the session's own context — which is why
+/// this carries the DC, the media flag and the rung it is walking for.
+struct EdgeCooldowns {
+    ctx: Option<Ctx>,
+}
+
+impl EdgeCooldowns {
+    fn new(dc: u32, is_media: bool, tier: UpstreamTier) -> Self {
+        Self {
+            ctx: Some(Ctx::new(dc, is_media, LogTier::from(tier))),
+        }
+    }
+}
 
 impl EdgeReporter for EdgeCooldowns {
     fn armed(&mut self, ip: IpAddr, plaintext: bool, cooldown: Duration, failure: RungFailure) {
         log_cooldown_armed(
+            self.ctx.clone(),
             edge_cooldown_kind(plaintext),
             &ip.to_string(),
             cooldown,
@@ -2367,7 +2430,11 @@ impl EdgeReporter for EdgeCooldowns {
     }
 
     fn skipped(&mut self, ip: IpAddr, plaintext: bool) {
-        log_cooldown_skipped(edge_cooldown_kind(plaintext), &ip.to_string());
+        log_cooldown_skipped(
+            self.ctx.clone(),
+            edge_cooldown_kind(plaintext),
+            &ip.to_string(),
+        );
     }
 }
 
@@ -2384,6 +2451,9 @@ fn connect_failure(error: &OutboundError) -> RungFailure {
             ErrorCode::TcpConnect
         },
         err_code: 0,
+        // The diagnosis behind the class: `ENETUNREACH` and `ECONNREFUSED` are
+        // both `tcp_connect` and different problems.
+        errno: error.errno,
     }
 }
 
@@ -2437,20 +2507,6 @@ pub fn split_mtproto_init_and_pending(data: &[u8]) -> Option<([u8; 64], Vec<u8>)
     handshake_buf.copy_from_slice(&data[..64]);
 
     Some((handshake_buf, data[64..].to_vec()))
-}
-
-fn human_bytes(n: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
-
-    let mut v = n as f64;
-    for unit in UNITS {
-        if v < 1024.0 {
-            return format!("{:.1}{}", v, unit);
-        }
-        v /= 1024.0;
-    }
-
-    format!("{:.1}PB", v)
 }
 
 #[cfg(test)]

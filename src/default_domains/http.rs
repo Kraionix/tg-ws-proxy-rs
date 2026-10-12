@@ -5,11 +5,90 @@ use rustls::pki_types::ServerName;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::TlsConnector;
 
-use crate::outbound::OutboundConnector;
+use crate::log::schema::ErrorCode;
+use crate::outbound::{OutboundConnector, OutboundError};
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 256 * 1024;
+
+/// Why the fetch failed, in the vocabulary a record can carry.
+///
+/// The class is kept apart from the message on purpose: a record must not read
+/// a transport failure back out of its own prose, and "GitHub was unreachable"
+/// is a different fact from "the list came back empty".
+#[derive(Debug)]
+pub struct FetchError {
+    pub err: ErrorCode,
+    /// The HTTP status when that is what failed, zero otherwise.
+    pub err_code: u32,
+    /// What the console line used to say, for the caller that prints it.
+    pub reason: String,
+}
+
+impl FetchError {
+    pub fn connect(error: &OutboundError) -> Self {
+        Self {
+            err: if error.timed_out {
+                ErrorCode::TcpConnectTimeout
+            } else {
+                ErrorCode::TcpConnect
+            },
+            err_code: 0,
+            reason: error.reason.clone(),
+        }
+    }
+
+    pub fn http(status: u16) -> Self {
+        Self {
+            err: ErrorCode::HttpStatus,
+            err_code: u32::from(status),
+            reason: format!("HTTP status {status}"),
+        }
+    }
+
+    /// The default class for everything else: the response was not the one the
+    /// protocol calls for, whether it was cut short, malformed, or not UTF-8.
+    pub fn protocol(reason: impl Into<String>) -> Self {
+        Self {
+            err: ErrorCode::Protocol,
+            err_code: 0,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn tls(reason: impl Into<String>) -> Self {
+        Self {
+            err: ErrorCode::Tls,
+            err_code: 0,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn tls_timeout() -> Self {
+        Self {
+            err: ErrorCode::TlsTimeout,
+            err_code: 0,
+            reason: "TLS handshake timed out".to_string(),
+        }
+    }
+
+    pub fn dns(reason: impl Into<String>) -> Self {
+        Self {
+            err: ErrorCode::Dns,
+            err_code: 0,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn read(reason: impl Into<String>) -> Self {
+        Self {
+            err: ErrorCode::Read,
+            err_code: 0,
+            reason: reason.into(),
+        }
+    }
+}
 
 /// Build a `rustls` `ClientConfig` using the bundled WebPKI root store.
 fn build_tls_config() -> rustls::ClientConfig {
@@ -25,7 +104,7 @@ pub(super) async fn https_get(
     host: &str,
     path: &str,
     outbound: &OutboundConnector,
-) -> Result<String, String> {
+) -> Result<String, FetchError> {
     https_get_with_tls_config(host, path, outbound, Arc::new(build_tls_config())).await
 }
 
@@ -34,69 +113,79 @@ async fn https_get_with_tls_config(
     path: &str,
     outbound: &OutboundConnector,
     tls_config: Arc<rustls::ClientConfig>,
-) -> Result<String, String> {
+) -> Result<String, FetchError> {
     let connector = TlsConnector::from(tls_config);
 
     let tcp = outbound
         .connect(host, 443, FETCH_TIMEOUT)
         .await
-        .map_err(|e| e.reason)?;
+        .map_err(|e| FetchError::connect(&e))?;
     let _ = tcp.set_nodelay(true);
 
-    let server_name =
-        ServerName::try_from(host.to_string()).map_err(|e| format!("invalid server name: {e}"))?;
+    let server_name = ServerName::try_from(host.to_string())
+        .map_err(|e| FetchError::dns(format!("invalid server name: {e}")))?;
     let mut tls = tokio::time::timeout(FETCH_TIMEOUT, connector.connect(server_name, tcp))
         .await
-        .map_err(|_| "TLS handshake timed out".to_string())?
-        .map_err(|e| format!("TLS handshake: {e}"))?;
+        .map_err(|_| FetchError::tls_timeout())?
+        .map_err(|e| FetchError::tls(format!("TLS handshake: {e}")))?;
 
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: tg-ws-proxy\r\n\r\n",
     );
     tls.write_all(request.as_bytes())
         .await
-        .map_err(|e| format!("write: {e}"))?;
+        .map_err(|e| FetchError::read(format!("write: {e}")))?;
 
     tokio::time::timeout(FETCH_TIMEOUT, read_http_response_body(&mut tls))
         .await
-        .map_err(|_| "read timed out".to_string())?
+        .map_err(|_| FetchError::read("read timed out"))?
 }
 
-async fn read_http_response_body<R>(reader: &mut R) -> Result<String, String>
+async fn read_http_response_body<R>(reader: &mut R) -> Result<String, FetchError>
 where
     R: AsyncRead + Unpin,
 {
     let mut buf = Vec::new();
-    let header_len = read_until_headers(reader, &mut buf).await?;
+    let header_len = read_until_headers(reader, &mut buf)
+        .await
+        .map_err(FetchError::read)?;
 
     let header_count = http_header_count(&buf[..header_len]);
     let mut headers = vec![httparse::EMPTY_HEADER; header_count];
     let mut response = httparse::Response::new(&mut headers);
     match response
         .parse(&buf[..header_len])
-        .map_err(|e| format!("HTTP parse error: {e}"))?
+        .map_err(|e| FetchError::protocol(format!("HTTP parse error: {e}")))?
     {
         httparse::Status::Complete(_) => {}
-        httparse::Status::Partial => return Err("incomplete HTTP response headers".to_string()),
+        httparse::Status::Partial => {
+            return Err(FetchError::protocol("incomplete HTTP response headers"));
+        }
     };
 
     let code = response
         .code
-        .ok_or_else(|| "response status line has no status code".to_string())?;
+        .ok_or_else(|| FetchError::protocol("response status line has no status code"))?;
     if code != 200 {
-        return Err(format!("HTTP status {code}"));
+        return Err(FetchError::http(code));
     }
 
-    let declared_len = content_length(response.headers)?;
+    let declared_len = content_length(response.headers).map_err(FetchError::protocol)?;
     let body = if is_chunked(response.headers) {
-        read_chunked_body(reader, buf[header_len..].to_vec()).await?
+        read_chunked_body(reader, buf[header_len..].to_vec())
+            .await
+            .map_err(FetchError::read)?
     } else if let Some(len) = declared_len {
-        read_content_length_body(reader, buf[header_len..].to_vec(), len).await?
+        read_content_length_body(reader, buf[header_len..].to_vec(), len)
+            .await
+            .map_err(FetchError::read)?
     } else {
-        read_until_eof_limited(reader, buf[header_len..].to_vec()).await?
+        read_until_eof_limited(reader, buf[header_len..].to_vec())
+            .await
+            .map_err(FetchError::read)?
     };
 
-    String::from_utf8(body).map_err(|_| "response body is not valid UTF-8".to_string())
+    String::from_utf8(body).map_err(|_| FetchError::protocol("response body is not valid UTF-8"))
 }
 
 async fn read_until_headers<R>(reader: &mut R, buf: &mut Vec<u8>) -> Result<usize, String>

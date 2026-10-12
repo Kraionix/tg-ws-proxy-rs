@@ -35,11 +35,9 @@ use rustls::{
 };
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
-    client_async_with_config,
+    MaybeTlsStream, WebSocketStream, client_async_with_config,
     tungstenite::{client::IntoClientRequest, http::HeaderValue},
 };
-use tracing::{debug, warn};
 
 use crate::log::schema::ErrorCode;
 use tungstenite::Error as WsError;
@@ -48,6 +46,83 @@ use tungstenite::protocol::WebSocketConfig;
 
 /// A live WebSocket connection to a Telegram DC.
 pub type TgWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// What one TLS handshake cost, for `EVT:tls_handshake`.
+///
+/// Reported upwards rather than written here: this module has no session
+/// (C11), so it hands the measurement to the ladder, which knows the DC and
+/// the rung the handshake was made for.
+///
+/// The kind is the negotiated one — `full` for a handshake that carried a
+/// certificate, `resumed` for one that came back on a session ticket the
+/// shared `rustls` config kept. Whether resumption is working is the
+/// difference between a ~1 ms and a ~60 ms WebSocket dial, which is why it is
+/// worth reading out of the connection rather than assuming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TlsCost {
+    /// [`HandshakeKind`](crate::log::schema::HandshakeKind) discriminant, or
+    /// zero when the handshake failed before the server's Finished.
+    pub kind: i32,
+    pub dur_ns: u64,
+    /// [`ErrorCode`] discriminant, zero on success.
+    pub err: i32,
+    /// `errno` behind `err`, zero where there was none.
+    pub errno: i32,
+}
+
+/// One dial: its outcome, what its TLS handshake cost, and the OS error behind
+/// a failed connect.
+///
+/// One value rather than an out-parameter because every caller wants all three
+/// for the same record, and a successful dial is the only case where the
+/// handshake exists at all.
+pub(crate) struct Dial {
+    result: WsConnectResult,
+    tls: Option<TlsCost>,
+    errno: i32,
+}
+
+impl Dial {
+    /// A dial that never reached TLS — a refused connect, a bad URL.
+    fn without_tls(result: WsConnectResult, errno: i32) -> Self {
+        Self {
+            result,
+            tls: None,
+            errno,
+        }
+    }
+}
+
+/// Reads the negotiated kind out of a finished `rustls` client connection.
+fn handshake_kind(connection: &rustls::ClientConnection) -> i32 {
+    use crate::log::schema::HandshakeKind;
+
+    match connection.handshake_kind() {
+        // A retry request is a full handshake with one extra round trip; the
+        // record's question is whether a session ticket was reused.
+        Some(rustls::HandshakeKind::Full | rustls::HandshakeKind::FullWithHelloRetryRequest) => {
+            HandshakeKind::Full as i32
+        }
+        Some(rustls::HandshakeKind::Resumed) => HandshakeKind::Resumed as i32,
+        None => HandshakeKind::Unspecified as i32,
+    }
+}
+
+/// The class and the OS error behind a failed TLS handshake or upgrade.
+fn tls_error(error: &WsError) -> (i32, i32) {
+    let errno = match error {
+        WsError::Io(io) => io.raw_os_error().unwrap_or(0),
+        _ => 0,
+    };
+
+    let code = match error {
+        WsError::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => ErrorCode::TlsTimeout,
+        WsError::Io(_) => ErrorCode::Tls,
+        _ => ErrorCode::Upgrade,
+    };
+
+    (code as i32, errno)
+}
 
 /// Suffix that marks a media DC in log lines (`DC2` vs `DC2m`).
 ///
@@ -288,8 +363,9 @@ impl WsConnectResult {
 /// One value per rung rather than per candidate hostname: a rung is one step of
 /// the ladder, and the record answers "did this step carry the connection, and
 /// what did the step cost".  The *last* failure is the one the step ended on,
-/// so it is the one the next step is being taken because of — the earlier
-/// candidates in the same walk are already in the `tracing` lines.
+/// so it is the one the next step is being taken because of; the walk's earlier
+/// candidates are in the same record's `host` only as far as the last one goes,
+/// which is the price of one record per step rather than per hostname.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RungFailure {
     /// [`ErrorCode`] discriminant.
@@ -297,13 +373,20 @@ pub struct RungFailure {
     /// The number behind `err`; the HTTP status for the two status-carrying
     /// codes, and zero where there is none.
     pub err_code: u32,
+    /// The OS error behind `err`, filled by the walk that saw it. Zero where
+    /// the failure never reached a syscall.
+    pub errno: i32,
 }
 
 impl From<&WsConnectResult> for RungFailure {
     fn from(result: &WsConnectResult) -> Self {
         let (err, err_code) = result.error_code();
 
-        Self { err, err_code }
+        Self {
+            err,
+            err_code,
+            errno: 0,
+        }
     }
 }
 
@@ -337,16 +420,24 @@ pub struct WsAttempt {
     /// `EVT:tier_attempt` wants the class and the status, which the flags have
     /// already thrown away.
     pub failure: Option<RungFailure>,
+    /// The hostname the walk ended on — the one that carried the connection, or
+    /// the last one it tried.  The record names it because the console line did:
+    /// `kws2` against `kws2-1` is what tells a retry from a first try.
+    pub host: String,
+    /// The TLS handshake of the dial the walk ended on, for `EVT:tls_handshake`.
+    pub tls: Option<TlsCost>,
 }
 
 impl WsAttempt {
-    fn connected(ws: TgWsStream) -> Self {
+    fn connected(ws: TgWsStream, host: &str, tls: Option<TlsCost>) -> Self {
         Self {
             ws: Some(ws),
             all_redirects: false,
             upgrade_timed_out: false,
             connect_timed_out: false,
             failure: None,
+            host: host.to_string(),
+            tls,
         }
     }
 }
@@ -396,12 +487,17 @@ pub async fn connect_ws_with_outbound(
         false,
     )
     .await
+    .result
 }
 
 /// Same as [`connect_ws_with_outbound`], optionally using plaintext `ws://` on
 /// port 80. Only Cloudflare tiers should pass `disable_tls = true`; Telegram's
 /// direct WebSocket endpoint requires TLS.
-pub async fn connect_ws_with_outbound_mode(
+///
+/// Returns the whole [`Dial`] — the one-connection entry point for tests and
+/// for callers outside the ladder, which want the outcome and nothing else,
+/// reads `.result` off it.
+pub(crate) async fn connect_ws_with_outbound_mode(
     ip: &str,
     domain: &str,
     skip_tls_verify: bool,
@@ -409,7 +505,7 @@ pub async fn connect_ws_with_outbound_mode(
     outbound: &OutboundConnector,
     sni_override: Option<&str>,
     disable_tls: bool,
-) -> WsConnectResult {
+) -> Dial {
     connect_ws_with_path(
         ip,
         domain,
@@ -452,13 +548,15 @@ async fn connect_ws_with_path(
     outbound: &OutboundConnector,
     sni_override: Option<&str>,
     disable_tls: bool,
-) -> WsConnectResult {
+) -> Dial {
     // ── TCP connection to the configured IP ──────────────────────────────
     let port = if disable_tls { 80 } else { 443 };
     let tcp = match outbound.connect(ip, port, timeout).await {
         Ok(s) => s,
-        Err(e) if e.timed_out => return WsConnectResult::ConnectTimedOut(e.reason),
-        Err(e) => return WsConnectResult::ConnectFailed(e.reason),
+        Err(e) if e.timed_out => {
+            return Dial::without_tls(WsConnectResult::ConnectTimedOut(e.reason), e.errno);
+        }
+        Err(e) => return Dial::without_tls(WsConnectResult::ConnectFailed(e.reason), e.errno),
     };
 
     // Disable Nagle algorithm for lower latency.
@@ -469,7 +567,9 @@ async fn connect_ws_with_path(
     let url = format!("{}://{}{}", scheme, domain, path);
     let mut request = match url.into_client_request() {
         Ok(r) => r,
-        Err(e) => return WsConnectResult::Failed(format!("bad URL: {}", e)),
+        Err(e) => {
+            return Dial::without_tls(WsConnectResult::Failed(format!("bad URL: {}", e)), 0);
+        }
     };
     {
         let h = request.headers_mut();
@@ -492,46 +592,75 @@ async fn connect_ws_with_path(
     }
 
     // ── TLS handshake + WebSocket upgrade ─────────────────────────────────
+    // The handshake is timed and its negotiated kind read on both paths — the
+    // fronted one has always done the TLS work manually, and the plain one
+    // does it here so that a resumed session and a full one are told apart in
+    // the record rather than assumed.
     let upgrade = async {
         if disable_tls {
             // Plaintext ws:// — no TLS handshake at all, just the HTTP
             // upgrade. Wrapping in MaybeTlsStream::Plain keeps the
             // connection type identical for the bridge.
-            client_async_with_config(request, MaybeTlsStream::Plain(tcp), Some(ws_config())).await
+            Upgrade {
+                outcome: client_async_with_config(
+                    request,
+                    MaybeTlsStream::Plain(tcp),
+                    Some(ws_config()),
+                )
+                .await,
+                tls: None,
+            }
         } else {
-            tls_handshake_and_upgrade(tcp, request, skip_tls_verify, sni_override).await
+            tls_handshake_and_upgrade(tcp, request, domain, skip_tls_verify, sni_override).await
         }
     };
-    let result = tokio::time::timeout(timeout, upgrade).await;
 
-    match result {
-        Ok(Ok((ws, response))) => {
-            let status = response.status().as_u16();
+    let (outcome, tls) = match tokio::time::timeout(timeout, upgrade).await {
+        // The handshake and the upgrade ran out an unbroken clock, so which of
+        // the two stalled is not observable from here; the attempt says the
+        // rung timed out, and there is no separate handshake to report.
+        Err(_) => (WsConnectResult::TimedOut, None),
+        Ok(upgrade) => {
+            let tls = upgrade.tls;
 
-            if status == 101 {
-                WsConnectResult::Connected(ws)
-            } else if matches!(status, 301 | 302 | 303 | 307 | 308) {
-                WsConnectResult::Redirect(status)
-            } else {
-                WsConnectResult::Failed(format!("unexpected HTTP status {}", status))
-            }
-        }
-        Ok(Err(e)) => {
-            // tungstenite returns `Error::Http(response)` when the server
-            // sends a non-101 HTTP response.  Extract the status code from
-            // the structured error rather than doing fragile string matching.
-            if let WsError::Http(ref resp) = e {
-                let status = resp.status().as_u16();
-                if matches!(status, 301 | 302 | 303 | 307 | 308) {
-                    return WsConnectResult::Redirect(status);
+            let outcome = match upgrade.outcome {
+                Ok((ws, response)) => {
+                    let status = response.status().as_u16();
+
+                    if status == 101 {
+                        WsConnectResult::Connected(ws)
+                    } else if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                        WsConnectResult::Redirect(status)
+                    } else {
+                        WsConnectResult::Failed(format!("unexpected HTTP status {}", status))
+                    }
                 }
+                Err(e) => {
+                    // tungstenite returns `Error::Http(response)` when the
+                    // server sends a non-101 HTTP response.  Extract the status
+                    // code from the structured error rather than doing fragile
+                    // string matching.
+                    if let WsError::Http(ref resp) = e {
+                        let status = resp.status().as_u16();
+                        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                            WsConnectResult::Redirect(status)
+                        } else {
+                            WsConnectResult::Failed(format!("HTTP {} from server", status))
+                        }
+                    } else {
+                        WsConnectResult::Failed(e.to_string())
+                    }
+                }
+            };
 
-                WsConnectResult::Failed(format!("HTTP {} from server", status))
-            } else {
-                WsConnectResult::Failed(e.to_string())
-            }
+            (outcome, tls)
         }
-        Err(_) => WsConnectResult::TimedOut,
+    };
+
+    Dial {
+        result: outcome,
+        tls,
+        errno: 0,
     }
 }
 
@@ -551,7 +680,7 @@ async fn connect_cf_with_path(
     outbound: &OutboundConnector,
     opts: CfDialOpts<'_>,
     edges: &mut dyn EdgeReporter,
-) -> WsConnectResult {
+) -> Dial {
     if opts.cf_ips.is_empty() {
         // No preferred edges, so no edge cooldowns to report on.
         return connect_ws_with_path(
@@ -575,8 +704,8 @@ async fn connect_cf_with_path(
     } else {
         &CF_EDGE_TLS_FAIL
     };
-    let mut last_non_redirect = None;
-    let mut last_redirect = None;
+    let mut last_non_redirect: Option<Dial> = None;
+    let mut last_redirect: Option<(u16, Dial)> = None;
 
     let (attempted, skipped) = cf_ip_attempts(opts.cf_ips, first, cooldowns, |ip| {
         outbound.connects_directly(&ip.to_string(), port)
@@ -588,8 +717,7 @@ async fn connect_cf_with_path(
     for ip in attempted {
         let target = ip.to_string();
         let direct = outbound.connects_directly(&target, port);
-        debug!("CF edge trying {} for {}", ip, domain);
-        match connect_ws_with_path(
+        let Dial { result, tls, errno } = connect_ws_with_path(
             &target,
             domain,
             path,
@@ -600,23 +728,43 @@ async fn connect_cf_with_path(
             None,
             opts.disable_tls,
         )
-        .await
-        {
+        .await;
+
+        match result {
             WsConnectResult::Connected(ws) => {
                 cooldowns.clear(&ip);
-                return WsConnectResult::Connected(ws);
+                return Dial {
+                    result: WsConnectResult::Connected(ws),
+                    tls,
+                    errno,
+                };
             }
             WsConnectResult::Redirect(code) => {
                 cooldowns.clear(&ip);
-                last_redirect = Some(code);
+                last_redirect = Some((
+                    code,
+                    Dial {
+                        result: WsConnectResult::Redirect(code),
+                        tls,
+                        errno,
+                    },
+                ));
             }
             WsConnectResult::Failed(reason) | WsConnectResult::ConnectFailed(reason) => {
                 cooldowns.clear(&ip);
-                last_non_redirect = Some(WsConnectResult::Failed(reason));
+                last_non_redirect = Some(Dial {
+                    result: WsConnectResult::Failed(reason),
+                    tls,
+                    errno,
+                });
             }
             WsConnectResult::TimedOut => {
                 cooldowns.clear(&ip);
-                last_non_redirect = Some(WsConnectResult::TimedOut);
+                last_non_redirect = Some(Dial {
+                    result: WsConnectResult::TimedOut,
+                    tls,
+                    errno,
+                });
             }
             WsConnectResult::ConnectTimedOut(reason) => {
                 if direct {
@@ -625,57 +773,129 @@ async fn connect_cf_with_path(
                         ip,
                         opts.disable_tls,
                         opts.fail_cooldown,
-                        RungFailure::from(&WsConnectResult::ConnectTimedOut(reason.clone())),
+                        RungFailure {
+                            err: ErrorCode::TcpConnectTimeout,
+                            err_code: 0,
+                            errno,
+                        },
                     );
                 }
-                last_non_redirect = Some(WsConnectResult::ConnectTimedOut(reason));
+                last_non_redirect = Some(Dial {
+                    result: WsConnectResult::ConnectTimedOut(reason),
+                    tls,
+                    errno,
+                });
             }
         }
     }
 
-    last_non_redirect.unwrap_or_else(|| {
-        WsConnectResult::Redirect(last_redirect.expect("non-empty CF IP list attempted"))
-    })
+    match last_non_redirect {
+        Some(dial) => dial,
+        None => {
+            let (code, dial) = last_redirect.expect("non-empty CF IP list attempted");
+
+            Dial {
+                result: WsConnectResult::Redirect(code),
+                tls: dial.tls,
+                errno: dial.errno,
+            }
+        }
+    }
 }
 
-/// Perform the TLS handshake (with optional SNI override) and the WebSocket
-/// upgrade over an already-connected TCP stream.
+/// What the upgrade half of a dial produced, and the TLS handshake behind it.
+///
+/// The measurement is kept outside the result so that a failed handshake can
+/// report its own cost: a handshake that took five seconds and then timed out
+/// is the diagnosis, and the failed upgrade is only the symptom.
+struct Upgrade {
+    outcome: Result<(TgWsStream, tungstenite::handshake::client::Response), WsError>,
+    tls: Option<TlsCost>,
+}
+
+/// Perform the TLS handshake and the WebSocket upgrade over an already-connected
+/// TCP stream.
 ///
 /// Split out from `connect_ws_with_path` so it can be exercised in tests
 /// against a stream connected to an arbitrary local port — the public
 /// connect functions always dial `:443`, Telegram's real WS port.
+///
+/// The TLS layer is driven here rather than by `client_async_tls_with_config`
+/// for one reason: `rustls` knows whether the handshake was resumed or full,
+/// and the connector that owns the stream does not hand that back. Everything
+/// else — the SNI choice, the certificate configuration — is what the connector
+/// would have done. `sni` is the fronted hostname when one is configured,
+/// because the request's own host cannot be overridden through the connector.
 async fn tls_handshake_and_upgrade<R>(
     tcp: TcpStream,
     request: R,
+    domain: &str,
     skip_tls_verify: bool,
     sni_override: Option<&str>,
-) -> Result<(TgWsStream, tungstenite::handshake::client::Response), WsError>
+) -> Upgrade
 where
     R: IntoClientRequest + Unpin,
 {
-    if let Some(sni) = sni_override {
-        // Domain fronting: TLS SNI = `sni`, Host stays whatever `request`
-        // already carries. Manual TLS is required here because
-        // `client_async_tls_with_config` always derives the SNI from the
-        // request's own host, with no way to override it.
-        let server_name = ServerName::try_from(sni)
-            .map_err(|_| WsError::Url(tungstenite::error::UrlError::NoHostName))?
-            .to_owned();
-        let tls_connector = tokio_rustls::TlsConnector::from(no_verify_rustls_config());
-        let tls_stream = tls_connector
-            .connect(server_name, tcp)
-            .await
-            .map_err(WsError::Io)?;
-        client_async_with_config(
+    let started = Instant::now();
+    let Ok(server_name) = ServerName::try_from(sni_override.unwrap_or(domain)) else {
+        return Upgrade {
+            outcome: Err(WsError::Url(tungstenite::error::UrlError::NoHostName)),
+            tls: None,
+        };
+    };
+
+    // A fronted SNI can never match the certificate the server presents, so
+    // verification is skipped for it regardless of the flag.
+    let config = if skip_tls_verify || sni_override.is_some() {
+        no_verify_rustls_config()
+    } else {
+        verifying_rustls_config()
+    };
+
+    let tls_stream = match tokio_rustls::TlsConnector::from(config)
+        .connect(server_name.to_owned(), tcp)
+        .await
+    {
+        Ok(stream) => stream,
+        Err(error) => {
+            let error = WsError::Io(error);
+            let (err, errno) = tls_error(&error);
+
+            return Upgrade {
+                outcome: Err(error),
+                tls: Some(TlsCost {
+                    // The handshake never finished, so nothing was negotiated:
+                    // the record says how long it ran and how it ended.
+                    kind: crate::log::schema::HandshakeKind::Unspecified as i32,
+                    dur_ns: nanos(started.elapsed()),
+                    err,
+                    errno,
+                }),
+            };
+        }
+    };
+
+    let tls = TlsCost {
+        kind: handshake_kind(tls_stream.get_ref().1),
+        dur_ns: nanos(started.elapsed()),
+        err: 0,
+        errno: 0,
+    };
+
+    Upgrade {
+        outcome: client_async_with_config(
             request,
             MaybeTlsStream::Rustls(tls_stream),
             Some(ws_config()),
         )
-        .await
-    } else {
-        let connector = build_tls_connector(skip_tls_verify);
-        client_async_tls_with_config(request, tcp, Some(ws_config()), Some(connector)).await
+        .await,
+        tls: Some(tls),
     }
+}
+
+/// A span in nanoseconds, saturating rather than wrapping.
+fn nanos(span: Duration) -> u64 {
+    span.as_nanos().min(u64::MAX as u128) as u64
 }
 
 /// Ceiling for one incoming WebSocket frame and its reassembled message.
@@ -758,16 +978,19 @@ pub async fn connect_ws_for_dc_with_outbound(
     sni_override: Option<&str>,
 ) -> WsAttempt {
     let domains = ws_domains(dc, is_media);
-    let media = media_tag(is_media);
     let mut all_redirects = true;
     let mut any_upgrade_timed_out = false;
     let mut any_connect_timed_out = false;
     let mut failure = None;
+    let mut host = String::new();
+    let mut tls = None;
 
     for domain in &domains {
-        debug!("WS trying DC{}{} → {} via {}", dc, media, domain, ip);
-
-        let outcome = connect_ws_with_outbound_mode(
+        let Dial {
+            result,
+            tls: dial_tls,
+            errno,
+        } = connect_ws_with_outbound_mode(
             ip,
             domain,
             skip_tls_verify,
@@ -777,33 +1000,30 @@ pub async fn connect_ws_for_dc_with_outbound(
             false,
         )
         .await;
-        let classed = RungFailure::from(&outcome);
 
-        match outcome {
+        host = domain.clone();
+        tls = dial_tls;
+
+        // Classified before the match moves the stream out of `result`.
+        let mut classed = RungFailure::from(&result);
+        classed.errno = errno;
+
+        match result {
             WsConnectResult::Connected(ws) => {
-                return WsAttempt::connected(ws);
+                return WsAttempt::connected(ws, domain, dial_tls);
             }
-            WsConnectResult::Redirect(code) => {
-                warn!(
-                    "WS DC{}{} got {} from {} (redirect)",
-                    dc, media, code, domain
-                );
-                // Keep trying next domain; still counts as all_redirects.
-            }
-            WsConnectResult::Failed(reason) | WsConnectResult::ConnectFailed(reason) => {
-                warn!("WS DC{}{} failed on {}: {}", dc, media, domain, reason);
-
+            // Every hostname that answered with a redirect is still a hostname
+            // that answered: the walk keeps going, and the caller sees
+            // `all_redirects` when none of them did anything else.
+            WsConnectResult::Redirect(_) => {}
+            WsConnectResult::Failed(_) | WsConnectResult::ConnectFailed(_) => {
                 all_redirects = false; // a real failure, not just a redirect
             }
             WsConnectResult::TimedOut => {
-                warn!("WS DC{}{} timed out on {}", dc, media, domain);
-
                 all_redirects = false;
                 any_upgrade_timed_out = true;
             }
-            WsConnectResult::ConnectTimedOut(reason) => {
-                warn!("WS DC{}{} failed on {}: {}", dc, media, domain, reason);
-
+            WsConnectResult::ConnectTimedOut(_) => {
                 all_redirects = false;
                 any_connect_timed_out = true;
             }
@@ -818,6 +1038,8 @@ pub async fn connect_ws_for_dc_with_outbound(
         upgrade_timed_out: any_upgrade_timed_out,
         connect_timed_out: any_connect_timed_out,
         failure,
+        host,
+        tls,
     }
 }
 
@@ -1043,13 +1265,19 @@ pub(crate) struct CfWalk {
     pub all_redirects: bool,
     /// The last domain's failure, or `None` when one answered.
     pub failure: Option<RungFailure>,
+    /// The domain the walk ended on; see [`WsAttempt::host`].
+    pub host: String,
+    /// The TLS handshake of the dial the walk ended on.
+    pub tls: Option<TlsCost>,
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
     dc: u32,
     cf_domains: &[String],
-    is_media: bool,
+    // The media flag reaches the caller's record through its own context; the
+    // walk itself dials the same hostnames either way.
+    _is_media: bool,
     skip_tls_verify: bool,
     timeout: Duration,
     outbound: &OutboundConnector,
@@ -1057,15 +1285,18 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
     opts: CfDialOpts<'_>,
     edges: &mut dyn EdgeReporter,
 ) -> CfWalk {
-    let media = media_tag(is_media);
     let mut all_redirects = true;
     let mut attempts = CfAttempts::with_offset(dc, cf_domains, first_domain);
     let mut failure = None;
+    let mut host = String::new();
+    let mut tls = None;
 
     while let Some(domain) = attempts.next_domain() {
-        debug!("CF WS trying DC{}{} → {}", dc, media, domain);
-
-        let outcome = connect_cf_with_path(
+        let Dial {
+            result,
+            tls: dial_tls,
+            errno,
+        } = connect_cf_with_path(
             &domain,
             "/apiws",
             true,
@@ -1076,29 +1307,30 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
             edges,
         )
         .await;
-        let classed = RungFailure::from(&outcome);
 
-        match outcome {
+        host = domain.clone();
+        tls = dial_tls;
+
+        // Classified before the match moves the stream out of `result`.
+        let mut classed = RungFailure::from(&result);
+        classed.errno = errno;
+
+        match result {
             WsConnectResult::Connected(ws) => {
                 return CfWalk {
                     ws: Some(ws),
                     record: Some(domain),
                     all_redirects: false,
                     failure: None,
+                    host,
+                    tls: dial_tls,
                 };
             }
-            WsConnectResult::Redirect(code) => {
-                warn!(
-                    "CF WS DC{}{} got {} from {} (redirect)",
-                    dc, media, code, domain
-                );
-            }
-            WsConnectResult::Failed(reason) | WsConnectResult::ConnectFailed(reason) => {
-                warn!("CF WS DC{}{} failed on {}: {}", dc, media, domain, reason);
+            WsConnectResult::Redirect(_) => {}
+            WsConnectResult::Failed(_) | WsConnectResult::ConnectFailed(_) => {
                 all_redirects = false;
             }
             WsConnectResult::TimedOut | WsConnectResult::ConnectTimedOut(_) => {
-                warn!("CF WS DC{}{} timed out on {}", dc, media, domain);
                 attempts.note_timed_out();
                 all_redirects = false;
             }
@@ -1112,6 +1344,8 @@ pub(crate) async fn connect_cf_ws_for_dc_with_outbound_ordered(
         record: None,
         all_redirects,
         failure,
+        host,
+        tls,
     }
 }
 
@@ -1166,7 +1400,7 @@ pub async fn connect_cf_record_with_outbound_opts(
     outbound: &OutboundConnector,
     opts: CfDialOpts<'_>,
 ) -> Option<TgWsStream> {
-    match connect_cf_with_path(
+    let dial = connect_cf_with_path(
         record,
         "/apiws",
         true,
@@ -1176,8 +1410,9 @@ pub async fn connect_cf_record_with_outbound_opts(
         opts,
         &mut NoEdgeReport,
     )
-    .await
-    {
+    .await;
+
+    match dial.result {
         WsConnectResult::Connected(ws) => Some(ws),
         _ => None,
     }
@@ -1276,7 +1511,7 @@ pub async fn connect_cf_worker_ws_for_dc_with_outbound_opts(
     outbound: &OutboundConnector,
     opts: CfDialOpts<'_>,
 ) -> Option<TgWsStream> {
-    let (ws, _) = connect_cf_worker_ws_for_dc_with_outbound_classified(
+    let (ws, _, _) = connect_cf_worker_ws_for_dc_with_outbound_classified(
         worker_domain,
         dst,
         dc,
@@ -1305,15 +1540,10 @@ pub(crate) async fn connect_cf_worker_ws_for_dc_with_outbound_classified(
     outbound: &OutboundConnector,
     opts: CfDialOpts<'_>,
     edges: &mut dyn EdgeReporter,
-) -> (Option<TgWsStream>, Option<RungFailure>) {
+) -> (Option<TgWsStream>, Option<RungFailure>, Option<TlsCost>) {
     let path = cf_worker_path(dst, dc, is_media);
-    let media = media_tag(is_media);
-    debug!(
-        "CF Worker trying DC{}{} → {} via {}",
-        dc, media, dst, worker_domain
-    );
 
-    let outcome = connect_cf_with_path(
+    let Dial { result, tls, errno } = connect_cf_with_path(
         worker_domain,
         &path,
         false,
@@ -1324,28 +1554,18 @@ pub(crate) async fn connect_cf_worker_ws_for_dc_with_outbound_classified(
         edges,
     )
     .await;
-    let classed = RungFailure::from(&outcome);
 
-    match outcome {
-        WsConnectResult::Connected(ws) => (Some(ws), None),
-        WsConnectResult::Redirect(code) => {
-            warn!(
-                "CF Worker DC{}{} got {} from {} (redirect)",
-                dc, media, code, worker_domain
-            );
-            (None, Some(classed))
-        }
-        WsConnectResult::Failed(reason) | WsConnectResult::ConnectFailed(reason) => {
-            warn!(
-                "CF Worker DC{}{} failed on {}: {}",
-                dc, media, worker_domain, reason
-            );
-            (None, Some(classed))
-        }
-        WsConnectResult::TimedOut | WsConnectResult::ConnectTimedOut(_) => {
-            warn!("CF Worker DC{}{} timed out on {}", dc, media, worker_domain);
-            (None, Some(classed))
-        }
+    // Classified before the match moves the stream out of `result`.
+    let mut classed = RungFailure::from(&result);
+    classed.errno = errno;
+
+    match result {
+        WsConnectResult::Connected(ws) => (Some(ws), None, tls),
+        WsConnectResult::Redirect(_)
+        | WsConnectResult::Failed(_)
+        | WsConnectResult::ConnectFailed(_)
+        | WsConnectResult::TimedOut
+        | WsConnectResult::ConnectTimedOut(_) => (None, Some(classed), tls),
     }
 }
 
@@ -1409,16 +1629,6 @@ static NO_VERIFY_CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
 /// the cache is the worst outcome available: the memory is still spent, and
 /// entries get evicted before they can be reused, so the handshakes come back.
 const TLS_SESSION_CACHE_SIZE: usize = 256;
-
-fn build_tls_connector(skip_verify: bool) -> Connector {
-    let config = if skip_verify {
-        no_verify_rustls_config()
-    } else {
-        verifying_rustls_config()
-    };
-
-    Connector::Rustls(config)
-}
 
 /// The shared certificate-verifying client config, using the bundled WebPKI
 /// root store.

@@ -304,7 +304,7 @@ async fn probe_cf_worker(
     };
 
     let start = Instant::now();
-    let (ws, failure) = connect_cf_worker_ws_for_dc_with_outbound_classified(
+    let (ws, failure, _tls) = connect_cf_worker_ws_for_dc_with_outbound_classified(
         domain,
         dst,
         2,

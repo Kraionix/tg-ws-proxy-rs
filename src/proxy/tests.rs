@@ -162,15 +162,6 @@ fn upstream_key_joins_host_and_port() {
     assert_eq!(upstream_key("proxy.example", 443), "proxy.example:443");
 }
 
-#[test]
-fn human_bytes_scales_through_the_units() {
-    assert_eq!(human_bytes(0), "0.0B");
-    assert_eq!(human_bytes(1023), "1023.0B");
-    assert_eq!(human_bytes(1024), "1.0KB");
-    assert_eq!(human_bytes(1024 * 1024), "1.0MB");
-    assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0GB");
-}
-
 #[tokio::test]
 async fn an_aborted_direction_still_reports_the_bytes_it_moved() {
     let bytes_up = Arc::new(StdMutex::new(0));
@@ -265,10 +256,10 @@ async fn upstream_frame_sizes(framing: WsFraming, payload: &[u8]) -> Vec<usize> 
             ClientReader::Plain(reader),
             ClientWriter::Plain(writer),
             WsBridgeParams {
-                label: "127.0.0.1:1".parse().unwrap(),
                 ws,
                 framing,
                 tier: UpstreamTier::Ws,
+                via: "kws2.web.telegram.org".to_string(),
                 relay_init,
                 ciphers,
                 proto: ProtoTag::PaddedIntermediate,
@@ -350,7 +341,6 @@ async fn a_ladder_walk_lands_in_the_segment_as_attempts_and_fallbacks() {
         Arc::clone(&runtime),
     ));
     let route = Route {
-        label: "127.0.0.1:1".parse().unwrap(),
         config: &config,
         runtime: &runtime,
         pool: &pool,
@@ -413,7 +403,11 @@ async fn a_ladder_walk_lands_in_the_segment_as_attempts_and_fallbacks() {
         attempt.0.category,
         crate::log::schema::Category::Routing as i32
     );
-    assert_eq!(attempt.0.level, crate::log::schema::Level::Debug as i32);
+    // A dial that failed is a warning and one that carried the connection is
+    // info, which is the level alignment the event catalog asks for: an `info`
+    // floor keeps every session's outcome and `debug` adds the successful
+    // dials on top.
+    assert_eq!(attempt.0.level, crate::log::schema::Level::Warn as i32);
     let ctx = attempt
         .1
         .ctx
@@ -424,6 +418,15 @@ async fn a_ladder_walk_lands_in_the_segment_as_attempts_and_fallbacks() {
     assert!(!attempt.1.ok);
     assert_eq!(attempt.1.err, ErrorCode::TcpConnect as i32);
     assert_eq!(attempt.1.err_code, 0);
+    assert!(
+        attempt.1.host.starts_with("kws2"),
+        "the record names the host the walk ended on: {:?}",
+        attempt.1.host
+    );
+    assert_ne!(
+        attempt.1.errno, 0,
+        "a refused connect is an OS error, and the record keeps the number"
+    );
 
     let attempts = records
         .iter()
@@ -462,6 +465,306 @@ async fn a_ladder_walk_lands_in_the_segment_as_attempts_and_fallbacks() {
     assert_eq!(
         fallback.1.reason,
         crate::log::schema::Reason::NotInDcIp as i32
+    );
+
+    std::fs::remove_dir_all(&dir).expect("the temp dir is ours");
+}
+
+/// The aligned level policy, read back out of a segment.
+///
+/// The levels are the event catalog's, not the caller's taste: a dial that
+/// failed is a warning and one that carried the connection is info, a rung the
+/// ladder passed over is a debug note, and the cooldown an outage arms is a
+/// warning while the success that clears it is a debug note. `info` is the
+/// disk floor, so this is also the difference between "the ladder is visible in
+/// a segment" and "only the failures are".
+#[tokio::test]
+async fn the_aligned_levels_land_in_the_segment() {
+    use crate::log::schema::{AttemptSkipped, CooldownArmed, CooldownCleared, Event, TlsHandshake};
+
+    let dir = std::env::temp_dir().join(format!("tgws-levels-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let config = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--secret",
+        "00112233445566778899aabbccddeeff",
+        "--pool-size",
+        "0",
+        "--log-dir",
+        dir.to_str().expect("a utf-8 temp path"),
+        "--log-level",
+        "debug",
+        "--log-durability",
+        "immediate",
+    ])
+    .unwrap()
+    .with_defaults();
+
+    let handle = crate::log::init(&dir, config.log_settings(), config.log_options())
+        .expect("a writable temp dir accepts a segment");
+    let ctx = || Some(Ctx::new(2, false, LogTier::Ws));
+
+    crate::log::scope(1, Arc::clone(&handle), async {
+        let connect_failure = RungFailure {
+            err: ErrorCode::TcpConnect,
+            err_code: 0,
+            errno: 111,
+        };
+        let tls = TlsCost {
+            kind: crate::log::schema::HandshakeKind::Full as i32,
+            dur_ns: 1_200_000,
+            err: 0,
+            errno: 0,
+        };
+
+        log_tier_attempt(
+            ctx(),
+            "kws2.web.telegram.org",
+            false,
+            Duration::from_millis(305),
+            Some(connect_failure),
+            Some(tls),
+        );
+        log_tier_attempt(
+            ctx(),
+            "kws2.web.telegram.org",
+            true,
+            Duration::from_millis(312),
+            None,
+            None,
+        );
+        log_attempt_skipped(ctx(), UpstreamTier::Ws, LogReason::IpCooldown);
+        log_cooldown_armed(
+            ctx(),
+            CooldownKind::WsFail,
+            "DC2",
+            Duration::from_secs(30),
+            Some(connect_failure),
+        );
+        log_cooldown_cleared(ctx(), CooldownKind::WsFail, "DC2");
+    })
+    .await;
+    handle.shutdown().await;
+
+    let day = std::fs::read_dir(&dir)
+        .expect("the segment directory")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find_map(|name| name.strip_suffix(".redb").map(str::to_string))
+        .expect("one segment for today");
+
+    let records: Vec<_> = crate::log::storage::iter_batches(&dir, &day)
+        .expect("the segment it just wrote is readable")
+        .into_iter()
+        .flat_map(|batch| batch.records)
+        .collect();
+
+    let levels: Vec<(i32, &'static str)> = records
+        .iter()
+        .map(|record| {
+            let name = match &record.event {
+                Some(Event::TierAttempt(_)) => "tier_attempt",
+                Some(Event::TlsHandshake(_)) => "tls_handshake",
+                Some(Event::AttemptSkipped(_)) => "attempt_skipped",
+                Some(Event::CooldownArmed(_)) => "cooldown_armed",
+                Some(Event::CooldownCleared(_)) => "cooldown_cleared",
+                _ => "other",
+            };
+
+            (record.level, name)
+        })
+        .collect();
+
+    assert_eq!(
+        levels,
+        [
+            (Level::Warn as i32, "tier_attempt"),
+            (Level::Debug as i32, "tls_handshake"),
+            (Level::Info as i32, "tier_attempt"),
+            (Level::Debug as i32, "attempt_skipped"),
+            (Level::Warn as i32, "cooldown_armed"),
+            (Level::Debug as i32, "cooldown_cleared"),
+        ],
+        "the catalog's levels, in the order they were emitted"
+    );
+
+    // The fields the alignment was for: a failed attempt carries the host it
+    // ended on, the class, the OS error behind it — and the handshake that got
+    // that far.
+    let attempt = records
+        .iter()
+        .find_map(|record| match &record.event {
+            Some(Event::TierAttempt(attempt)) if !attempt.ok => Some(attempt),
+            _ => None,
+        })
+        .expect("the failed dial");
+    assert_eq!(attempt.host, "kws2.web.telegram.org");
+    assert_eq!(attempt.errno, 111);
+    assert_eq!(attempt.dur_ns, 305_000_000);
+
+    let handshake = records
+        .iter()
+        .find_map(|record| match &record.event {
+            Some(Event::TlsHandshake(TlsHandshake { kind, dur_ns, .. })) => Some((*kind, *dur_ns)),
+            _ => None,
+        })
+        .expect("the handshake behind the dial");
+    assert_eq!(
+        handshake,
+        (crate::log::schema::HandshakeKind::Full as i32, 1_200_000)
+    );
+
+    let skipped = records
+        .iter()
+        .find_map(|record| match &record.event {
+            Some(Event::AttemptSkipped(AttemptSkipped { tier, reason, .. })) => {
+                Some((*tier, *reason))
+            }
+            _ => None,
+        })
+        .expect("the rung that was passed over");
+    assert_eq!(skipped, (LogTier::Ws as i32, LogReason::IpCooldown as i32));
+
+    let armed = records
+        .iter()
+        .find_map(|record| match &record.event {
+            Some(Event::CooldownArmed(CooldownArmed { err, dur_s, .. })) => Some((*err, *dur_s)),
+            _ => None,
+        })
+        .expect("the cooldown the failure armed");
+    assert_eq!(
+        armed,
+        (ErrorCode::TcpConnect as i32, 30),
+        "the penalty and the offence that earned it"
+    );
+
+    let cleared = records
+        .iter()
+        .find_map(|record| match &record.event {
+            Some(Event::CooldownCleared(CooldownCleared { key_display, .. })) => {
+                Some(key_display.clone())
+            }
+            _ => None,
+        })
+        .expect("the cleared entry");
+    assert_eq!(cleared, "DC2");
+
+    std::fs::remove_dir_all(&dir).expect("the temp dir is ours");
+}
+
+/// A session the ladder cannot route closes with `no_route` instead of simply
+/// stopping.
+///
+/// DC 6 has no built-in address and the fixture passes no `--dc-ip`, so there
+/// is no rung to dial. An opened session with no close record is what a crashed
+/// process looks like in a segment; this is the record that tells the two
+/// apart.
+#[tokio::test]
+async fn a_session_with_nowhere_to_route_closes_as_no_route() {
+    use crate::log::schema::{ClosedBy, Event};
+
+    let dir = std::env::temp_dir().join(format!("tgws-no-route-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let config = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--secret",
+        "00112233445566778899aabbccddeeff",
+        "--pool-size",
+        "0",
+        "--log-dir",
+        dir.to_str().expect("a utf-8 temp path"),
+        "--log-level",
+        "info",
+        "--log-durability",
+        "immediate",
+    ])
+    .unwrap()
+    .with_defaults();
+
+    let handle = crate::log::init(&dir, config.log_settings(), config.log_options())
+        .expect("a writable temp dir accepts a segment");
+
+    let config = Arc::new(config);
+    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(60),
+        Arc::clone(&runtime),
+    ));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = tokio::net::TcpStream::connect(addr);
+    let accept = listener.accept();
+    let (client, accepted) = tokio::join!(client, accept);
+    let (mut client, (server, peer)) = (client.unwrap(), accepted.unwrap());
+
+    const CONN: u64 = 1;
+    let client_task = handle_client_with_runtime(
+        server,
+        peer,
+        Arc::clone(&config),
+        pool,
+        Arc::clone(&runtime),
+    );
+    let handler = tokio::spawn(crate::log::scope(CONN, Arc::clone(&handle), client_task));
+
+    let (handshake, _, _) = crate::crypto::generate_client_handshake(
+        &config.secret_bytes(),
+        6,
+        ProtoTag::PaddedIntermediate,
+    );
+    client.write_all(&handshake).await.unwrap();
+    drop(client);
+    handler
+        .await
+        .expect("the handler runs the ladder to its end");
+    handle.shutdown().await;
+
+    let day = std::fs::read_dir(&dir)
+        .expect("the segment directory")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find_map(|name| name.strip_suffix(".redb").map(str::to_string))
+        .expect("one segment for today");
+
+    let records: Vec<_> = crate::log::storage::iter_batches(&dir, &day)
+        .expect("the segment it just wrote is readable")
+        .into_iter()
+        .flat_map(|batch| batch.records)
+        .collect();
+
+    let session: Vec<_> = records
+        .iter()
+        .filter(|record| record.conn_id == CONN)
+        .filter_map(|record| record.event.as_ref())
+        .collect();
+
+    assert_eq!(
+        session
+            .iter()
+            .filter(|event| matches!(event, Event::SessionOpened(_)))
+            .count(),
+        1,
+        "the session opened: the client's handshake was valid"
+    );
+
+    let closed = session
+        .iter()
+        .find_map(|event| match event {
+            Event::SessionClosed(closed) => Some(closed),
+            _ => None,
+        })
+        .expect("a session with nowhere to go still closes");
+
+    assert_eq!(closed.closed_by, ClosedBy::NoRoute as i32);
+    assert_eq!(closed.bytes_up, 0);
+    assert_eq!(closed.bytes_down, 0);
+    assert!(
+        closed.via.is_empty(),
+        "no host carried the session, so there is none to name"
     );
 
     std::fs::remove_dir_all(&dir).expect("the temp dir is ours");

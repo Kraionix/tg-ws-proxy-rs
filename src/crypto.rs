@@ -189,11 +189,7 @@ fn log_relay_init_retries(n: u32) {
         return;
     }
 
-    log_event!(
-        Category::Crypto,
-        Level::Debug,
-        Event::RelayInitRetries { n }
-    );
+    log_event!(Category::Crypto, Level::Warn, Event::RelayInitRetries { n });
 }
 
 /// Generate a 64-byte obfuscation init packet for the Telegram backend.

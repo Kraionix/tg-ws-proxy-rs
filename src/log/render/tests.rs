@@ -122,6 +122,22 @@ fn the_corpus_renders_the_console_lines() {
              \u{2191}0.0B  \u{2193}0.0B  0.0s",
         ),
         (
+            "session closed because nothing could carry it",
+            session(
+                Level::Warn,
+                Event::SessionClosed(SessionClosed {
+                    ctx: ctx(2, false, Tier::Unspecified),
+                    closed_by: ClosedBy::NoRoute as i32,
+                    bytes_up: 0,
+                    bytes_down: 0,
+                    dur_ms: 3_204,
+                    via: String::new(),
+                }),
+            ),
+            " WARN [192.168.1.60:51719] DC2 session closed: \
+             \u{2191}0.0B  \u{2193}0.0B  3.2s",
+        ),
+        (
             "a rung that connected",
             session(
                 Level::Info,
@@ -287,9 +303,27 @@ fn the_corpus_renders_the_console_lines() {
                     added: 4,
                     ready: 4,
                     dur_ms: 241,
+                    err: ErrorCode::Unspecified as i32,
+                    errno: 0,
                 }),
             ),
             "DEBUG [192.168.1.60:51719] DC2m CF Worker pool refilled: +4 (4 ready, 241ms)",
+        ),
+        (
+            "a refill that produced nothing",
+            session(
+                Level::Debug,
+                Event::PoolRefill(PoolRefill {
+                    ctx: ctx(2, false, Tier::Ws),
+                    added: 0,
+                    ready: 2,
+                    dur_ms: 8001,
+                    err: ErrorCode::TcpConnectTimeout as i32,
+                    errno: 113,
+                }),
+            ),
+            "DEBUG [192.168.1.60:51719] DC2 WS pool refilled: +0 (2 ready, 8.0s) \
+             failed: tcp_connect_timeout (os error 113)",
         ),
         (
             "an idle connection thrown away",
@@ -330,6 +364,20 @@ fn the_corpus_renders_the_console_lines() {
             ),
             " WARN [192.168.1.60:51719] DC2 WS TLS handshake resumed failed: \
              tls_timeout (5.00s)",
+        ),
+        (
+            "a handshake that never got far enough to be resumed or full",
+            session(
+                Level::Debug,
+                Event::TlsHandshake(TlsHandshake {
+                    ctx: ctx(2, false, Tier::Ws),
+                    kind: HandshakeKind::Unspecified as i32,
+                    dur_ns: 900_000_000,
+                    err: ErrorCode::Tls as i32,
+                    errno: 0,
+                }),
+            ),
+            "DEBUG [192.168.1.60:51719] DC2 WS TLS handshake failed: tls (900ms)",
         ),
         (
             "a rung the ladder never dialled",
@@ -873,4 +921,26 @@ fn the_worst_case_line_fits_a_terminal() {
         rendered.contains("4294967.3s"),
         "the longest session there is"
     );
+}
+
+/// The byte units are the console's own, to the character: the format moved
+/// from a `String`-returning helper in `proxy.rs` into the renderer, and a
+/// segment that reads differently from the log it replaces is a diff nobody
+/// asked for.
+#[test]
+fn bytes_scale_through_the_units() {
+    let mut out = String::new();
+
+    for (bytes, expected) in [
+        (0_u64, "0.0B"),
+        (1023, "1023.0B"),
+        (1024, "1.0KB"),
+        (1024 * 1024, "1.0MB"),
+        (3 * 1024 * 1024 * 1024, "3.0GB"),
+    ] {
+        out.clear();
+        write_bytes(bytes, &mut out);
+
+        assert_eq!(out, expected, "{bytes} bytes");
+    }
 }

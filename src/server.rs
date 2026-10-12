@@ -16,9 +16,12 @@ use tracing::{error, info, warn};
 
 use crate::check;
 use crate::config::{Config, UpstreamTier};
-use crate::default_domains;
+use crate::default_domains::{self, Fetched};
 use crate::limits::{auto_max_connections, open_fds, soft_nofile_limit};
-use crate::log::schema::{Category, DcIp, ErrorCode, Level};
+use crate::log::schema::{
+    Category, DcIp, DomainListFetched, DomainSource, ErrorCode, Event, Level, Shutdown,
+    ShutdownPhase, ShutdownSignal,
+};
 use crate::log::{self, LogHandle};
 use crate::log_event;
 use crate::outbound::OutboundConnector;
@@ -107,7 +110,7 @@ pub fn install_crypto_provider() {
 /// the Tokio runtime that called this.
 pub async fn run(
     config: Config,
-    shutdown: impl Future<Output = ()> + Send,
+    shutdown: impl Future<Output = ShutdownSignal> + Send,
 ) -> Result<(), RunError> {
     run_with_listen(config, shutdown, |_| {}).await
 }
@@ -136,7 +139,7 @@ async fn check_verdict(rx: &mut Option<tokio::sync::oneshot::Receiver<bool>>) ->
 /// including the early returns for `--check` and a failed bind.
 pub async fn run_with_listen(
     config: Config,
-    shutdown: impl Future<Output = ()> + Send,
+    shutdown: impl Future<Output = ShutdownSignal> + Send,
     on_listen: impl FnOnce(ListenInfo) + Send,
 ) -> Result<(), RunError> {
     let log = match &config.log_dir {
@@ -169,6 +172,9 @@ fn log_start_error(error: log::LogError, dir: &Path) -> RunError {
         error => RunError::InvalidLogDir(error.to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 /// The upstream ladder this configuration can route through, in the order the
 /// fallback tries it: `ws` and `tcp` are always there, the Cloudflare and
@@ -218,7 +224,7 @@ async fn run_check_logged(
 
 async fn serve(
     mut config: Config,
-    shutdown: impl Future<Output = ()> + Send,
+    shutdown: impl Future<Output = ShutdownSignal> + Send,
     on_listen: impl FnOnce(ListenInfo) + Send,
     log: Option<&Arc<LogHandle>>,
 ) -> Result<(), RunError> {
@@ -243,16 +249,28 @@ async fn serve(
     // the same fetched list.  The fetch selects on `shutdown` so an embedder
     // can cancel a slow fetch instead of blocking a stop for the full timeout.
     if config.default_domains {
-        info!("Fetching default CF proxy domain list from GitHub…");
         let fetched = tokio::select! {
-            _ = &mut shutdown => {
-                info!("proxy stopped");
+            signal = &mut shutdown => {
+                // A stop during the fetch is a stop before anything was served,
+                // so there is no "proxy stopped" to record — the run never got
+                // that far.
+                log::emit_global(
+                    log,
+                    Category::Config,
+                    Level::Info,
+                    Event::Shutdown(Shutdown {
+                        phase: ShutdownPhase::Requested as i32,
+                        signal: signal as i32,
+                    }),
+                );
+
                 return Ok(());
             }
-            fetched = default_domains::fetch_default_domains_with_outbound(runtime.outbound()) => fetched,
+            fetched = default_domains::fetch_domains_with_source(runtime.outbound()) => fetched,
         };
-        info!("  Got {} default CF domain(s)", fetched.len());
-        config.cf_domains.extend(fetched);
+
+        log_domain_list(log, &fetched);
+        config.cf_domains.extend(fetched.domains);
     }
 
     // ── Pinned upstream sanity ───────────────────────────────────────────
@@ -563,20 +581,18 @@ async fn serve(
         let listen = format!("{bind_host}:{listen_port}");
         let tiers = configured_tiers(&config, cf_worker_domains);
 
-        log::scope_global(Arc::clone(handle), async {
-            log_event!(
-                Category::Config,
-                Level::Info,
-                Event::StartupSummary {
-                    version,
-                    listen,
-                    dc_ips,
-                    tiers,
-                    categories,
-                }
-            );
-        })
-        .await;
+        log::emit_global(
+            Some(handle),
+            Category::Config,
+            Level::Info,
+            Event::StartupSummary(crate::log::schema::StartupSummary {
+                version,
+                listen,
+                dc_ips,
+                tiers,
+                categories,
+            }),
+        );
     }
 
     on_listen(ListenInfo {
@@ -670,11 +686,19 @@ async fn serve(
         }))
     });
 
+    // Which signal ended the run, when one did: the record of the stop is
+    // written after the loop, because a stop is two facts — it was asked for,
+    // and it finished — and only the second one can be recorded from inside.
+    let mut stop_signal = None;
+
     loop {
         // Block here when we are already at the connection limit.  Pending
         // TCP connections queue in the kernel backlog until capacity frees up.
         let permit = tokio::select! {
-            _ = &mut shutdown => break,
+            signal = &mut shutdown => {
+                stop_signal = Some(signal);
+                break;
+            }
             all_ok = check_verdict(&mut check_rx) => {
                 check_ok = Some(all_ok);
                 break;
@@ -685,7 +709,10 @@ async fn serve(
         };
 
         tokio::select! {
-            _ = &mut shutdown => break,
+            signal = &mut shutdown => {
+                stop_signal = Some(signal);
+                break;
+            }
             all_ok = check_verdict(&mut check_rx) => {
                 check_ok = Some(all_ok);
                 break;
@@ -739,13 +766,20 @@ async fn serve(
                             })
                             .await;
                         }
-                        if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
-                            warn!("accept error: {} — backing off to allow FDs to free", e);
-                            tokio::time::sleep(Duration::from_millis(u64::from(backoff_ms))).await;
-                        } else {
-                            error!("accept error: {}", e);
-                            tokio::time::sleep(Duration::from_millis(u64::from(backoff_ms))).await;
+                        // The record above is the line an operator reads. Until
+                        // the pipeline exists without `--log-dir` (stage 5) a run
+                        // with no sink would otherwise swallow the accept loop's
+                        // own errors entirely, so the console line stays for that
+                        // case only.
+                        if log.is_none() {
+                            if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
+                                warn!("accept error: {} — backing off to allow FDs to free", e);
+                            } else {
+                                error!("accept error: {}", e);
+                            }
                         }
+
+                        tokio::time::sleep(Duration::from_millis(u64::from(backoff_ms))).await;
                     }
                 }
             }
@@ -764,6 +798,58 @@ async fn serve(
         };
     }
 
-    info!("proxy stopped");
+    if let Some(signal) = stop_signal {
+        log::emit_global(
+            log.as_ref(),
+            Category::Config,
+            Level::Info,
+            Event::Shutdown(Shutdown {
+                phase: ShutdownPhase::Requested as i32,
+                signal: signal as i32,
+            }),
+        );
+    }
+
+    log::emit_global(
+        log.as_ref(),
+        Category::Config,
+        Level::Info,
+        Event::Shutdown(Shutdown {
+            phase: ShutdownPhase::Complete as i32,
+            signal: ShutdownSignal::Unspecified as i32,
+        }),
+    );
+
     Ok(())
+}
+
+/// `EVT:domain_list_fetched` — where the process-wide route list came from.
+///
+/// A warning when the built-in list is what runs: `--default-domains` asks for
+/// the community list, and a fallback quietly in use is how a proxy ends up
+/// dialling domains nobody maintains. The failure class says which it was —
+/// GitHub unreachable, or a list that parsed to nothing.
+fn log_domain_list(log: Option<&Arc<LogHandle>>, fetched: &Fetched) {
+    let (err, err_code) = match &fetched.failure {
+        Some(failure) => (failure.err as i32, failure.err_code),
+        None => (ErrorCode::Unspecified as i32, 0),
+    };
+
+    let level = if fetched.source == DomainSource::Builtin {
+        Level::Warn
+    } else {
+        Level::Info
+    };
+
+    log::emit_global(
+        log,
+        Category::Config,
+        level,
+        Event::DomainListFetched(DomainListFetched {
+            source: fetched.source as i32,
+            count: fetched.domains.len().min(u32::MAX as usize) as u32,
+            err,
+            err_code,
+        }),
+    );
 }

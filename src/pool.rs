@@ -23,18 +23,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
-use tracing::{debug, warn};
 
 use futures_util::{FutureExt, StreamExt, stream};
 
 use crate::config::{Config, UpstreamTier};
 use crate::log::LogHandle;
-use crate::log::schema::{Category, Ctx, Event, Level, PoolHit, PoolMiss, PoolRefill, Tier};
+use crate::log::schema::{
+    Category, Ctx, DiscardReason, Event, Level, PoolDiscard, PoolHit, PoolMiss, PoolRefill, Tier,
+    WarmupComplete,
+};
 use crate::outbound::OutboundConnector;
 use crate::runtime::Runtime;
 use crate::ws_client::{
-    CfDialOpts, TgWsStream, connect_cf_record_with_outbound_opts,
-    connect_cf_worker_ws_for_dc_with_outbound_opts, connect_ws_for_dc_with_outbound, media_tag,
+    CfDialOpts, RungFailure, TgWsStream, connect_cf_record_with_outbound_opts,
+    connect_cf_worker_ws_for_dc_with_outbound_opts, connect_ws_for_dc_with_outbound,
 };
 
 /// Idle Cloudflare connections kept per `(tier, dc, is_media)`.
@@ -52,6 +54,17 @@ const CF_POOL_MAX: usize = 1;
 const POOL_CONNECT_CONCURRENCY: usize = 2;
 const WARMUP_BUCKET_CONCURRENCY: usize = 2;
 
+/// What one refill produced, and what stopped it when it stopped short.
+///
+/// A value rather than four parameters because the three call sites answer the
+/// same question and the record is built in one place.
+struct Refill {
+    added: u32,
+    ready: u32,
+    dur: Duration,
+    failure: Option<RungFailure>,
+}
+
 /// Which Cloudflare tier a pooled connection belongs to.  Pooled separately
 /// because the two are not interchangeable at the far end: a Worker is a raw
 /// TCP tunnel, a `--cf-domain` fronts Telegram's own WebSocket endpoint.
@@ -62,14 +75,7 @@ pub enum CfTier {
 }
 
 impl CfTier {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Worker => "CF Worker",
-            Self::Proxy => "CF proxy",
-        }
-    }
-
-    /// The same two buckets in the schema's vocabulary, so a pool record can
+    /// The two buckets in the schema's vocabulary, so a pool record can
     /// say which path the connection in it was for.
     fn to_schema(self) -> Tier {
         match self {
@@ -229,6 +235,7 @@ impl WsPool {
         while let Some(mut entry) = bucket.pop() {
             if now.saturating_duration_since(entry.created) > self.max_age {
                 // Entry is stale; drop it (close happens on drop via tungstenite).
+                self.log_discard(Tier::Ws, dc, is_media, DiscardReason::Stale);
                 continue;
             }
 
@@ -238,23 +245,13 @@ impl WsPool {
             // connection (close, error, or unexpected data) is treated as a sign
             // that the connection is in an invalid state and should be discarded.
             if entry.ws.next().now_or_never().is_some() {
-                debug!(
-                    "pool: discarding stale DC{}{} connection",
-                    dc,
-                    media_tag(is_media)
-                );
+                self.log_discard(Tier::Ws, dc, is_media, DiscardReason::Closed);
                 continue;
             }
 
             let remaining = bucket.len();
             drop(lock);
 
-            debug!(
-                "pool hit DC{}{} ({} left)",
-                dc,
-                media_tag(is_media),
-                remaining
-            );
             self.log_hit(
                 Tier::Ws,
                 dc,
@@ -299,33 +296,29 @@ impl WsPool {
         let bucket = lock.get_mut(&(tier, dc, is_media))?;
 
         while let Some(mut entry) = bucket.pop() {
-            if now.saturating_duration_since(entry.created) > self.max_age
-                || entry.ws.next().now_or_never().is_some()
-            {
-                debug!(
-                    "{} pool: discarding stale DC{}{} connection",
-                    tier.label(),
+            let reason = if now.saturating_duration_since(entry.created) > self.max_age {
+                DiscardReason::Stale
+            } else if entry.ws.next().now_or_never().is_some() {
+                DiscardReason::Closed
+            } else {
+                let remaining = bucket.len().min(u32::MAX as usize) as u32;
+                drop(lock);
+                self.log_hit(tier.to_schema(), dc, is_media, remaining);
+                self.cf_prefetch(CfTarget {
+                    tier,
                     dc,
-                    media_tag(is_media)
-                );
-                continue;
-            }
+                    is_media,
+                    dst: entry.dst,
+                    domain: entry.domain.clone(),
+                    skip_tls_verify: entry.skip_tls_verify,
+                    connect_timeout: entry.connect_timeout,
+                    disable_tls: entry.disable_tls,
+                });
 
-            let remaining = bucket.len().min(u32::MAX as usize) as u32;
-            drop(lock);
-            self.log_hit(tier.to_schema(), dc, is_media, remaining);
-            self.cf_prefetch(CfTarget {
-                tier,
-                dc,
-                is_media,
-                dst: entry.dst,
-                domain: entry.domain.clone(),
-                skip_tls_verify: entry.skip_tls_verify,
-                connect_timeout: entry.connect_timeout,
-                disable_tls: entry.disable_tls,
-            });
+                return Some((entry.ws, entry.domain));
+            };
 
-            return Some((entry.ws, entry.domain));
+            self.log_discard(tier.to_schema(), dc, is_media, reason);
         }
 
         self.log_miss(tier.to_schema(), dc, is_media);
@@ -359,6 +352,7 @@ impl WsPool {
 
     /// Warm up the pool for all configured DCs on startup.
     pub async fn warmup(&self, config: &Config) {
+        let started = Instant::now();
         let dc_redirects = config.dc_redirects();
         let skip_tls = config.skip_tls_verify;
         let pool_size = self.pool_size;
@@ -382,14 +376,18 @@ impl WsPool {
         let mut batches = stream::iter(jobs)
             .map(|(dc, ip, is_media)| async move {
                 let started = Instant::now();
-                let connections = self
+                let (connections, failure) = self
                     .connect_batch(&ip, dc, is_media, skip_tls, pool_size)
                     .await;
-                (dc, is_media, connections, started.elapsed())
+                (dc, is_media, connections, failure, started.elapsed())
             })
             .buffer_unordered(WARMUP_BUCKET_CONCURRENCY);
 
-        while let Some((dc, is_media, new_conns, elapsed)) = batches.next().await {
+        // Every connection the pool holds once the warm-up is done, across
+        // every bucket: the one number the console line answered.
+        let mut warm = 0_u32;
+
+        while let Some((dc, is_media, new_conns, failure, elapsed)) = batches.next().await {
             let mut lock = self.idle.lock().await;
             let bucket = lock.entry((dc, is_media)).or_default();
 
@@ -410,11 +408,24 @@ impl WsPool {
             // none it was asked for is noise.
             if self.pool_size > 0 {
                 let ready = bucket.len().min(u32::MAX as usize) as u32;
-                self.log_refill(Tier::Ws, dc, is_media, added, ready, elapsed);
+                warm = warm.saturating_add(ready);
+                self.log_refill(
+                    Tier::Ws,
+                    dc,
+                    is_media,
+                    Refill {
+                        added,
+                        ready,
+                        dur: elapsed,
+                        failure,
+                    },
+                );
             }
         }
 
-        debug!("WS pool warmup complete");
+        if self.pool_size > 0 {
+            self.log_warmup(warm, started.elapsed());
+        }
     }
 
     // ── Internal ─────────────────────────────────────────────────────────
@@ -440,6 +451,24 @@ impl WsPool {
         }
     }
 
+    /// One idle connection thrown away instead of handed to a client.
+    ///
+    /// The console line this replaces said the pool was shedding; the record
+    /// says which connection and why, which is the half an operator can act on.
+    fn log_discard(&self, tier: Tier, dc: u32, is_media: bool, reason: DiscardReason) {
+        if let Some(handle) = self.logging(Level::Debug) {
+            handle.emit(
+                0,
+                Category::Pool,
+                Level::Debug,
+                Event::PoolDiscard(PoolDiscard {
+                    ctx: Some(Ctx::new(dc, is_media, tier)),
+                    reason: reason as i32,
+                }),
+            );
+        }
+    }
+
     fn log_miss(&self, tier: Tier, dc: u32, is_media: bool) {
         if let Some(handle) = self.logging(Level::Debug) {
             handle.emit(
@@ -453,23 +482,43 @@ impl WsPool {
         }
     }
 
-    fn log_refill(
-        &self,
-        tier: Tier,
-        dc: u32,
-        is_media: bool,
-        added: u32,
-        ready: u32,
-        dur: Duration,
-    ) {
+    /// One finished refill: what it added, what the bucket holds now, and — when
+    /// the dial stopped short — the class of failure that stopped it.
+    fn log_refill(&self, tier: Tier, dc: u32, is_media: bool, refill: Refill) {
         if let Some(handle) = self.logging(Level::Debug) {
+            let (err, errno) = match refill.failure {
+                Some(failure) => (failure.err as i32, failure.errno),
+                None => (0, 0),
+            };
+
             handle.emit(
                 0,
                 Category::Pool,
                 Level::Debug,
                 Event::PoolRefill(PoolRefill {
                     ctx: Some(Ctx::new(dc, is_media, tier)),
-                    added,
+                    added: refill.added,
+                    ready: refill.ready,
+                    dur_ms: refill.dur.as_millis().min(u32::MAX as u128) as u32,
+                    err,
+                    errno,
+                }),
+            );
+        }
+    }
+
+    /// The process-wide end of the startup warm-up, once every bucket is done.
+    ///
+    /// Process-wide rather than per bucket because that is the question the
+    /// console line answered — "is the pool up?" — and each bucket's own
+    /// `pool_refill` already says how its dial went.
+    fn log_warmup(&self, ready: u32, dur: Duration) {
+        if let Some(handle) = self.logging(Level::Debug) {
+            handle.emit(
+                0,
+                Category::Pool,
+                Level::Debug,
+                Event::WarmupComplete(WarmupComplete {
                     ready,
                     dur_ms: dur.as_millis().min(u32::MAX as u128) as u32,
                 }),
@@ -520,10 +569,10 @@ impl WsPool {
             self.pool_size - current
         };
 
-        let new_conns = self
+        let (new_conns, failure) = self
             .connect_batch(&target_ip, dc, is_media, skip_tls, needed)
             .await;
-        if !new_conns.is_empty() {
+        if !new_conns.is_empty() || failure.is_some() {
             let mut lock = self.idle.lock().await;
             let bucket = lock.entry((dc, is_media)).or_default();
 
@@ -541,19 +590,16 @@ impl WsPool {
             }
 
             let ready = lock.get(&(dc, is_media)).map_or(0, |b| b.len());
-            debug!(
-                "pool refilled DC{}{}: {} ready",
-                dc,
-                media_tag(is_media),
-                ready
-            );
             self.log_refill(
                 Tier::Ws,
                 dc,
                 is_media,
-                added,
-                ready.min(u32::MAX as usize) as u32,
-                started.elapsed(),
+                Refill {
+                    added,
+                    ready: ready.min(u32::MAX as usize) as u32,
+                    dur: started.elapsed(),
+                    failure,
+                },
             );
         }
     }
@@ -582,9 +628,12 @@ impl WsPool {
                 target.tier.to_schema(),
                 target.dc,
                 target.is_media,
-                0,
-                ready.min(u32::MAX as usize) as u32,
-                started.elapsed(),
+                Refill {
+                    added: 0,
+                    ready: ready.min(u32::MAX as usize) as u32,
+                    dur: started.elapsed(),
+                    failure: None,
+                },
             );
             return;
         };
@@ -595,13 +644,6 @@ impl WsPool {
         // The bucket may have been filled while this connect was in flight;
         // dropping the surplus here closes its FD immediately.
         if bucket.len() < budget {
-            debug!(
-                "{} pool refilled DC{}{} via {}",
-                target.tier.label(),
-                target.dc,
-                media_tag(target.is_media),
-                target.domain
-            );
             bucket.push(CfEntry {
                 ws,
                 created: Instant::now(),
@@ -615,9 +657,12 @@ impl WsPool {
                 target.tier.to_schema(),
                 target.dc,
                 target.is_media,
-                1,
-                bucket.len().min(u32::MAX as usize) as u32,
-                started.elapsed(),
+                Refill {
+                    added: 1,
+                    ready: bucket.len().min(u32::MAX as usize) as u32,
+                    dur: started.elapsed(),
+                    failure: None,
+                },
             );
         }
     }
@@ -671,8 +716,9 @@ impl WsPool {
         is_media: bool,
         skip_tls: bool,
         count: usize,
-    ) -> Vec<TgWsStream> {
+    ) -> (Vec<TgWsStream>, Option<RungFailure>) {
         let mut results = Vec::new();
+        let mut failure = None;
         // Limit pool fill timeout to avoid blocking for too long.
         let timeout = Duration::from_secs(8);
         // Warm the pool fronted when --fronting-domain is set: a pooled
@@ -698,17 +744,17 @@ impl WsPool {
             match attempt.ws {
                 Some(ws) => results.push(ws),
                 None => {
-                    warn!(
-                        "pool: failed to pre-connect DC{}{}",
-                        dc,
-                        media_tag(is_media)
-                    );
+                    // The class of the first failure is what the refill's record
+                    // carries: one unreachable DC IP fails every dial in the
+                    // batch, and the batch stops at the first.
+                    failure = attempt.failure;
 
                     break;
                 }
             }
         }
-        results
+
+        (results, failure)
     }
 }
 

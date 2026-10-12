@@ -265,6 +265,12 @@ pub enum ClosedBy {
     Unspecified = 0,
     Client = 1,
     Upstream = 2,
+    /// The proxy gave up before it bridged anything: every rung of the ladder
+    /// failed or was skipped, so there was never an upstream to close it. The
+    /// bytes are zero and the duration is the time spent trying, which is what
+    /// makes a session that opened and never closed readable as a failure
+    /// rather than as a crash.
+    NoRoute = 3,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -586,6 +592,13 @@ pub struct PoolRefill {
     pub ready: u32,
     #[prost(uint32, tag = "4")]
     pub dur_ms: u32,
+    /// Why the dial stopped short, when it did — a refill that added nothing is
+    /// told apart by this from one the pool no longer had room for.
+    #[prost(enumeration = "ErrorCode", tag = "5")]
+    pub err: i32,
+    /// The OS error behind `err`; see [`TierAttempt::errno`].
+    #[prost(int32, tag = "6")]
+    pub errno: i32,
 }
 
 /// `EVT:tls_handshake` — the TLS cost of one upstream WebSocket connect.
@@ -926,6 +939,7 @@ fn enum_values() -> [&'static [i32]; 13] {
             ClosedBy::Unspecified as i32,
             ClosedBy::Client as i32,
             ClosedBy::Upstream as i32,
+            ClosedBy::NoRoute as i32,
         ],
         &[
             HandshakeKind::Unspecified as i32,
@@ -1081,6 +1095,8 @@ pub(crate) fn canonical_records() -> [LogRecord; 22] {
             added: 1,
             ready: 1,
             dur_ms: 1,
+            err: ErrorCode::TlsTimeout as i32,
+            errno: 1,
         })),
         record(Event::TlsHandshake(TlsHandshake {
             ctx: Some(Ctx::new(1, true, Tier::Ws)),

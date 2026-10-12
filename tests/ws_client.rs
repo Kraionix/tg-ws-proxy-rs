@@ -137,7 +137,8 @@ async fn telegram_ws_dc_connector_uses_outbound_proxy() {
         attempt.failure,
         Some(RungFailure {
             err: ErrorCode::TcpConnect,
-            err_code: 0
+            err_code: 0,
+            errno: 0
         })
     );
     let request = await_proxy_request(proxy_task).await;

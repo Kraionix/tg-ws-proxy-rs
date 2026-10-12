@@ -126,6 +126,8 @@ fn samples() -> Vec<(&'static str, LogRecord)> {
                 added: 4,
                 ready: 4,
                 dur_ms: 850,
+                err: ErrorCode::TlsTimeout as i32,
+                errno: 113,
             })),
         ),
         (
@@ -1922,7 +1924,7 @@ fn the_fingerprint_follows_the_schema() {
     // land without someone noticing that it moved.
     assert_eq!(
         fingerprint(),
-        0xfcde_72a6_61a5_28b2_u64,
+        0x6a72_5f4f_33ea_d554_u64,
         "the wire format changed"
     );
 }
