@@ -136,13 +136,21 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-      # `--log-compress=zstd-l1` is behind the `log-zstd` feature, and the
-      # default runs above compile none of it — the dependency is optional, so
-      # without this leg the mode would rot untested until someone built it.
-      - name: Clippy and test with log-zstd
+      # `log-disk` is what compiles the on-disk sink in, `log-zstd` adds the
+      # codec, and the default runs above have neither: 51 of the tests exist
+      # only with the sink. Both dependencies are optional, so without this leg
+      # the sink, its reader verbs and the codec would rot untested until
+      # someone built them.
+      #
+      # One leg rather than two because `log-zstd` implies `log-disk`, so this is
+      # what the release binaries are built with. The OpenWrt targets ship
+      # `log-disk` alone, which differs by the codec's absence — and by the one
+      # test that asserts a build without it names the build that could read a
+      # compressed batch.
+      - name: Clippy and test with log-disk and log-zstd
         run: |
-          cargo clippy --all-targets --locked --features log-zstd
-          cargo test --locked --features log-zstd
+          cargo clippy --all-targets --locked --features log-disk,log-zstd
+          cargo test --locked --features log-disk,log-zstd
 
       - name: Release build
         run: cargo build --release --locked

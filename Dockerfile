@@ -21,7 +21,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     printf 'fn main() {}\n' > src/main.rs && \
     printf '// lib\n' > src/lib.rs && \
     printf '// lib\n' > crates/android-jni/src/lib.rs && \
-    cargo build --release --locked && \
+    cargo build --release --locked --features log-disk && \
     rm -rf src crates/android-jni/src
 
 COPY src ./src
@@ -42,7 +42,7 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=target-${TARGETPLATFORM},target=/app/target \
     find src crates -name '*.rs' -exec touch {} + && \
-    cargo build --release --locked && \
+    cargo build --release --locked --features log-disk && \
     cp target/release/tg-ws-proxy /usr/local/bin/tg-ws-proxy
 
 # The stub is a valid binary that exits 0, so no later step -- not the COPY into

@@ -66,22 +66,28 @@ jobs:
                     - target: mipsel-unknown-linux-musl
                       qemu: qemu-mipsel-static
                       build_std: true
+                      # Every target ships the sink; the OpenWrt ones ship it
+                      # without the codec. These mirror release.yml's row for the
+                      # same target, so the rehearsal builds what the release will.
+                      features: log-disk
                     - target: mips-unknown-linux-musl
                       qemu: qemu-mips-static
                       build_std: true
+                      features: log-disk
                     - target: armv7-unknown-linux-musleabihf
                       qemu: qemu-arm-static
+                      features: log-disk
                     # The same CPU release.yml's compress-assets leg runs it on.
                     - target: armv7-unknown-linux-musleabi
                       qemu: qemu-arm-static
                       qemu_cpu: cortex-a9,vfp=off,vfp-d32=off,neon=off
+                      features: log-disk
                     - target: aarch64-unknown-linux-musl
                       qemu: qemu-aarch64-static
-                      # Rehearses the feature release.yml ships on this target.
-                      features: log-zstd
+                      features: log-disk,log-zstd
                     - target: x86_64-unknown-linux-musl
                       qemu: qemu-x86_64-static
-                      features: log-zstd
+                      features: log-disk,log-zstd
         steps:
             - uses: actions/checkout@v6
 
@@ -117,7 +123,10 @@ jobs:
               if: matrix.build_std
               env:
                   RUSTFLAGS: -C target-feature=+crt-static -C link-self-contained=no
-              run: cross +nightly build --release --bin tg-ws-proxy --target ${{ matrix.target }} -Z build-std=std,panic_abort
+                  # `${VAR:+…}` rather than an expression, because a bare
+                  # `--features` with an empty value is a cargo usage error.
+                  FEATURES: ${{ matrix.features }}
+              run: cross +nightly build --release --bin tg-ws-proxy --target ${{ matrix.target }} ${FEATURES:+--features $FEATURES} -Z build-std=std,panic_abort
 
             - name: Build
               if: ${{ !matrix.build_std }}

@@ -42,37 +42,44 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    # `log-zstd` is on wherever half a megabyte is affordable —
-                    # it is what keeps a week of segments inside the RAM or the
-                    # flash of a small box. The OpenWrt targets (armv7, mips,
-                    # mipsel) are built without it, and their `--log-compress`
-                    # offers `none` alone; see docs/Logging.md.
+                    # Every target ships the on-disk sink: a release binary whose
+                    # `--log-dir` does not exist would be a regression for the
+                    # people running this on a router. `log-zstd` is on wherever
+                    # half a megabyte is affordable — it is what keeps a week of
+                    # segments inside the RAM or the flash of a small box — so it
+                    # is the OpenWrt targets (armv7, mips, mipsel) that are built
+                    # without it and offer `none` alone in `--log-compress`; see
+                    # docs/Logging.md.
                     - target: aarch64-unknown-linux-musl
                       os: ubuntu-latest
-                      features: log-zstd
+                      features: log-disk,log-zstd
                     - target: aarch64-apple-darwin
                       os: macos-latest
-                      features: log-zstd
+                      features: log-disk,log-zstd
                     - target: x86_64-unknown-linux-musl
                       os: ubuntu-latest
-                      features: log-zstd
+                      features: log-disk,log-zstd
                     - target: mipsel-unknown-linux-musl
                       os: ubuntu-latest
+                      features: log-disk
                     - target: armv7-unknown-linux-musleabihf
                       os: ubuntu-latest
+                      features: log-disk
                     - target: armv7-unknown-linux-musleabi
                       os: ubuntu-latest
+                      features: log-disk
                     - target: x86_64-apple-darwin
                       os: macos-latest
-                      features: log-zstd
+                      features: log-disk,log-zstd
                     - target: x86_64-pc-windows-gnu
                       os: windows-latest
-                      features: log-zstd
+                      features: log-disk,log-zstd
                     - target: universal-apple-darwin
                       os: macos-latest
-                      features: log-zstd
+                      features: log-disk,log-zstd
                     - target: mips-unknown-linux-musl
                       os: ubuntu-latest
+                      features: log-disk
         runs-on: ${{ matrix.os }}
         steps:
             - uses: actions/checkout@v6
@@ -129,13 +136,13 @@ jobs:
               if: matrix.target == 'mipsel-unknown-linux-musl'
               env:
                   RUSTFLAGS: -C target-feature=+crt-static -C link-self-contained=no
-              run: cross +nightly build --release --bin tg-ws-proxy --target mipsel-unknown-linux-musl -Z build-std=std,panic_abort
+              run: cross +nightly build --release --bin tg-ws-proxy --target mipsel-unknown-linux-musl --features log-disk -Z build-std=std,panic_abort
 
             - name: Build (mips, build-std)
               if: matrix.target == 'mips-unknown-linux-musl'
               env:
                   RUSTFLAGS: -C target-feature=+crt-static -C link-self-contained=no
-              run: cross +nightly build --release --bin tg-ws-proxy --target mips-unknown-linux-musl -Z build-std=std,panic_abort
+              run: cross +nightly build --release --bin tg-ws-proxy --target mips-unknown-linux-musl --features log-disk -Z build-std=std,panic_abort
 
             - name: Inspect build output (mips variants)
               if: matrix.target == 'mipsel-unknown-linux-musl' || matrix.target == 'mips-unknown-linux-musl'
