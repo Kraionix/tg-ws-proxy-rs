@@ -329,15 +329,15 @@ compressed segment.
 **The reader verbs have their own price**, and it is paid whether or not anyone runs them: a binary
 that only *wrote* segments never linked the decode half of `prost` or of zstd, and `--gc-sections`
 pruned both. Measured with this profile, the same source built with and without `probe-segment` and
-`dump-segment`:
+`dump-segment` (and with the retention fix that followed them):
 
 | Target | without the verbs | with them | difference |
 |---|---|---|---|
-| `x86_64-unknown-linux-gnu`, `--features log-zstd` | 6 146 776 B | 6 732 504 B | **+586 KB (+9.5 %)** |
-| `x86_64-unknown-linux-gnu`, no codec | 5 592 816 B | 5 785 184 B | +192 KB (+3.4 %) |
-| `aarch64-unknown-linux-musl`, `--features log-zstd` | 5 228 120 B | 5 707 360 B | **+479 KB (+9.2 %)** |
+| `x86_64-unknown-linux-gnu`, `--features log-zstd` | 6 146 776 B | 6 735 256 B | **+588 KB (+9.6 %)** |
+| `x86_64-unknown-linux-gnu`, no codec | 5 592 816 B | 5 788 000 B | +195 KB (+3.5 %) |
+| `aarch64-unknown-linux-musl`, `--features log-zstd` | 5 228 120 B | 5 703 264 B | **+475 KB (+9.1 %)** |
 
-Almost all of the difference on a codec build is the zstd **decompressor** (≈ 394 KB of the 586 KB on
+Almost all of the difference on a codec build is the zstd **decompressor** (≈393 KB of the 588 KB on
 x86-64): a segment written with `zstd-l1` cannot be counted without it. The rest is the `prost` decode
 of all 22 events, the JSON writer (hand-written — `serde_json` would have been another dependency tree
 in the shipped binary) and clap's subcommand machinery. A build without the codec pays a third of that
