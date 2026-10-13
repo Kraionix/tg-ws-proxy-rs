@@ -156,3 +156,32 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# Debug and test builds are the ones that fill a disk. Cargo's defaults put full
+# DWARF into every crate of the graph, dependency chains included, and keep a
+# second copy of each in the incremental cache: measured on this tree, one
+# `cargo test --no-run` costs 3.0 GB (2.0 GB in `debug/deps`, 795 MB in
+# `debug/incremental`). Multiplied by the cross targets this project builds for,
+# that is the difference between a few gigabytes and fifty.
+#
+# `line-tables-only` keeps file:line in a backtrace for our own code, which is
+# what debugging this proxy actually uses; a dependency is not where a bug gets
+# read from, so it carries no debug info at all. Incremental is off because its
+# cache duplicates the crate graph — the largest single directory under
+# `target/` — to speed up rebuilds this project does not make often enough to
+# pay for it.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.dev.package."*"]
+debug = false
+
+# `test` inherits `dev`, but spelled out: an edit to one profile should not be
+# able to leave the other quietly on the old defaults.
+[profile.test]
+debug = "line-tables-only"
+incremental = false
+
+[profile.test.package."*"]
+debug = false
