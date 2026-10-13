@@ -153,6 +153,9 @@ pub(crate) struct FileSink {
     options: Options,
     segment: Option<Segment>,
     day: Option<i64>,
+    /// The days this run has written a segment for. The retention sweep never
+    /// deletes one of them: see [`sweep_retention`].
+    written: Vec<i64>,
     backoff: usize,
     retry_at: Option<Instant>,
 }
@@ -169,6 +172,7 @@ impl FileSink {
             options,
             segment: None,
             day: None,
+            written: Vec::new(),
             backoff: 0,
             retry_at: None,
         };
@@ -177,6 +181,7 @@ impl FileSink {
         let path = sink.segment_path(day);
         sink.segment = Some(Segment::open(&path).map_err(|error| start_error(error, &path))?);
         sink.day = Some(day);
+        sink.written.push(day);
         sink.sweep_retention(day);
         Ok(sink)
     }
@@ -192,46 +197,16 @@ impl FileSink {
         let path = self.segment_path(day);
         self.segment = Some(Segment::open(&path)?);
         self.day = Some(day);
+        if !self.written.contains(&day) {
+            self.written.push(day);
+        }
         self.sweep_retention(day);
         Ok(())
     }
 
-    /// Deletes segments older than the retention window.
-    ///
-    /// Names, not modification times: the date in the file name is the date the
-    /// records belong to, and an `mtime` moves whenever a file is copied or a
-    /// clock is wrong. Anything whose name is not a `YYYY-MM-DD.redb` date is
-    /// left alone — this directory may not be ours exclusively.
+    /// Deletes the segments that have fallen out of the retention window.
     fn sweep_retention(&self, day: i64) {
-        if self.options.retention_days == 0 {
-            return;
-        }
-        let keep_from = day - i64::from(self.options.retention_days) + 1;
-        let cutoff = day_name(keep_from);
-
-        let entries = match fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(error) => {
-                crate::direct!(
-                    "cannot sweep log retention in {}: {error}",
-                    self.dir.display()
-                );
-                return;
-            }
-        };
-
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if segment_day(name).is_some_and(|segment| segment < cutoff.as_str())
-                && let Err(error) = fs::remove_file(entry.path())
-            {
-                crate::direct!(
-                    "cannot delete the expired segment {}: {error}",
-                    entry.path().display()
-                );
-            }
-        }
+        sweep_retention(&self.dir, self.options.retention_days, day, &self.written);
     }
 
     fn on_failure(&mut self, error: WriterError) -> WriterError {
@@ -962,8 +937,7 @@ pub(super) fn day_name(day: i64) -> String {
     format!("{year:04}-{month:02}-{day_of_month:02}")
 }
 
-/// The date part of a segment file name, if it has one. Deliberately not a date
-/// parser: `YYYY-MM-DD` sorts lexicographically, which is all retention needs.
+/// The date part of a segment file name, if it has one.
 fn segment_day(name: &str) -> Option<&str> {
     let stem = name.strip_suffix(SEGMENT_SUFFIX)?;
     let bytes = stem.as_bytes();
@@ -978,4 +952,126 @@ fn segment_day(name: &str) -> Option<&str> {
         }
     });
     shaped.then_some(stem)
+}
+
+/// The day number a `YYYY-MM-DD` name spells, or `None` when it is not one.
+///
+/// The inverse of [`day_name`], needed where retention does arithmetic on what
+/// a file is called: the cutoff is a name, and it is a number of days behind the
+/// newest segment in the directory.
+pub(super) fn day_of_name(name: &str) -> Option<i64> {
+    let bytes = name.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        let mut value = 0i64;
+        for byte in &bytes[range] {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            value = value * 10 + i64::from(byte - b'0');
+        }
+        Some(value)
+    };
+    let year = number(0..4)?;
+    let month = number(5..7)?;
+    let day = number(8..10)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
+/// `YYYY-MM-DD` to days since the unix epoch — Howard Hinnant's
+/// `days_from_civil`, the arithmetic [`day_name`] undoes.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month_position = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month_position + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+/// Deletes the segments that have fallen out of the retention window.
+///
+/// The window is counted from whichever is earlier: the day the clock says, or
+/// the day after the newest segment in `dir` that this run did not write. And
+/// nothing this run wrote is deleted, whatever its name says.
+///
+/// Both rules are there because the clock is the least reliable thing on the
+/// devices this ships to. A router has no RTC: `sysfixtime` sets the time from
+/// the newest file in `/etc` and `ntpd` corrects it later, measured on the
+/// reference router at +4 h 55 m, +8 h 18 m and +10 h 30 m. Counted from the
+/// clock alone, a run that boots reading 1970 deletes the segment it just wrote
+/// on the first rotation — the records of that very boot — and a run that boots
+/// reading next year sweeps the whole directory at startup, before it has
+/// recorded anything. Counted this way, the worst a wrong clock can do is keep
+/// an old segment one run longer. The other half of the same reasoning is that
+/// a *correct* clock after a long outage does not delete the archive either: the
+/// window moves with the data, one run behind.
+///
+/// Names, not modification times: the date in the file name is the date the
+/// records belong to, and an `mtime` moves whenever a file is copied or a clock
+/// is wrong. Anything whose name is not a `YYYY-MM-DD.redb` date is left alone —
+/// this directory may not be ours exclusively.
+pub(super) fn sweep_retention(dir: &Path, retention_days: u32, clock_day: i64, written: &[i64]) {
+    if retention_days == 0 {
+        return;
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            crate::direct!("cannot sweep log retention in {}: {error}", dir.display());
+            return;
+        }
+    };
+
+    // One pass over the directory: the segments this run did not write, and the
+    // newest day among them — the archive's own idea of "now".
+    let mut foreign: Vec<(String, i64)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(segment) = segment_day(&name) else {
+            continue;
+        };
+        if written.iter().any(|day| day_name(*day) == segment) {
+            continue;
+        }
+        if let Some(day) = day_of_name(segment) {
+            foreign.push((name, day));
+        }
+    }
+    let Some(newest) = foreign.iter().map(|(_, day)| *day).max() else {
+        // Nothing here that this run did not write, so there is nothing older
+        // than it to delete either.
+        return;
+    };
+
+    // A segment dated `d` means the log knows about day `d`, and the day after
+    // it is where "now" is as far as the archive is concerned; the window ends
+    // on whichever of that and the clock's day comes first.
+    let base = (newest + 1).min(clock_day);
+    if (clock_day - newest).abs() > i64::from(retention_days) {
+        crate::direct!(
+            "log retention: the clock says {} but the newest segment is {}; \
+             counting the window from the segment",
+            day_name(clock_day),
+            day_name(newest)
+        );
+    }
+
+    let cutoff = base - i64::from(retention_days) + 1;
+    for (name, day) in foreign {
+        if day < cutoff
+            && let Err(error) = fs::remove_file(dir.join(&name))
+        {
+            crate::direct!("cannot delete the expired segment {name}: {error}");
+        }
+    }
 }

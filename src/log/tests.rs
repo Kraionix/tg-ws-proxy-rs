@@ -1976,6 +1976,95 @@ fn retention_zero_keeps_everything() {
 }
 
 #[test]
+fn a_segment_name_round_trips_through_its_day_number() {
+    // Retention does arithmetic on what a file is called, so the name parser has
+    // to agree with the name writer exactly: a day of disagreement is a segment
+    // deleted a day early, or one that never expires.
+    for day in [0, 1, 19_000, 20_451, -1, storage::today()] {
+        let name = storage::day_name(day);
+        assert_eq!(storage::day_of_name(&name), Some(day), "{name}");
+    }
+    assert_eq!(storage::day_name(0), "1970-01-01");
+    assert_eq!(storage::day_of_name("1970-01-01"), Some(0));
+    assert_eq!(storage::day_of_name("2026-13-01"), None);
+    assert_eq!(storage::day_of_name("2026-10-32"), None);
+    assert_eq!(storage::day_of_name("not-a-date"), None);
+}
+
+#[test]
+fn a_clock_in_the_future_does_not_sweep_the_archive() {
+    // A router with no RTC can come up reading next year: the clock is set from
+    // the newest file in /etc, which is a date, not a promise. Counted from the
+    // clock, the startup sweep deletes every segment in the directory before a
+    // record is written; counted from the archive, the newest segment is what
+    // the window hangs on.
+    let dir = TempDir::new("future-clock");
+    let today = storage::today();
+    for age in [1, 5, 40] {
+        fs::write(
+            dir.path()
+                .join(format!("{}.redb", storage::day_name(today - age))),
+            b"",
+        )
+        .expect("a placeholder segment");
+    }
+
+    storage::sweep_retention(dir.path(), 7, today + 4_000, &[]);
+
+    let kept = dir.entries();
+    assert!(
+        kept.contains(&format!("{}.redb", storage::day_name(today - 1))),
+        "a clock from the future swept the newest segment: {kept:?}"
+    );
+    assert!(
+        kept.contains(&format!("{}.redb", storage::day_name(today - 5))),
+        "a segment inside the window was swept: {kept:?}"
+    );
+    assert!(
+        !kept.contains(&format!("{}.redb", storage::day_name(today - 40))),
+        "a segment outside the window was kept: {kept:?}"
+    );
+}
+
+#[test]
+fn a_clock_that_boots_in_the_past_does_not_delete_this_runs_segment() {
+    // The other direction, and the one that nearly cost a boot its records on
+    // the reference router: the clock reads a past day, the sink opens and
+    // writes a segment named after it, and the sweep runs again once ntpd has
+    // corrected the clock. The file this run is writing is not expired, whatever
+    // its name says — deleting it would delete the records of that very boot.
+    let dir = TempDir::new("past-clock");
+    let today = storage::today();
+    let ours = today - 5_000;
+    fs::write(
+        dir.path().join(format!("{}.redb", storage::day_name(ours))),
+        b"",
+    )
+    .expect("the segment this run would have written");
+    for age in [1, 30] {
+        fs::write(
+            dir.path()
+                .join(format!("{}.redb", storage::day_name(today - age))),
+            b"",
+        )
+        .expect("a placeholder segment");
+    }
+
+    storage::sweep_retention(dir.path(), 7, today, &[ours]);
+
+    let kept = dir.entries();
+    assert!(
+        kept.contains(&format!("{}.redb", storage::day_name(ours))),
+        "the sweep deleted the segment this run wrote: {kept:?}"
+    );
+    assert!(kept.contains(&format!("{}.redb", storage::day_name(today - 1))));
+    assert!(
+        !kept.contains(&format!("{}.redb", storage::day_name(today - 30))),
+        "a segment outside the window was kept: {kept:?}"
+    );
+}
+
+#[test]
 fn rotation_moves_to_the_next_day_without_losing_the_previous_one() {
     let dir = TempDir::new("rotation");
     let today = storage::today();

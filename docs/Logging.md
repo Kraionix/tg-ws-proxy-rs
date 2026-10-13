@@ -270,9 +270,14 @@ Three facts about a router that the log cannot fix, only record:
   day's file, stamped 15:00:57–15:01:00 on the 12th. Read a day file by `probe-segment`, not by its name:
   the object carries the time span it really covers (`first_ns`/`last_ns`).
 
-  What that costs in the other direction is worth knowing: the retention sweep is by file name, so a
-  clock far enough *behind* deletes the segment this run just wrote on the first rotation, and a clock
-  in the *future* sweeps the whole directory at startup.
+  The same wrong clock is what the retention window is measured against, so it is deliberately *not*
+  counted from the clock alone: the window ends on whichever is earlier, the clock's day or the day
+  after the newest segment in the directory, and a segment this run wrote is never deleted whatever
+  its name says. Counted from the clock alone, a boot that reads 1970 would delete the segment it is
+  writing on the first rotation — the records of that very boot — and a boot that reads next year
+  would sweep the whole directory at startup, before recording anything. Counted this way, the worst
+  a wrong clock can do is keep an old segment one run longer, and the sweep says so on stderr when the
+  clock and the archive disagree by more than the window.
 - **Two runs in one day file are not distinguishable by the file.** `conn_id` numbers sessions from
   one at every start, so `conn_id = 7` exists in both. `startup_summary` is what separates them: it is
   written once per run, and the text view uses it to forget the client addresses of the previous run.
