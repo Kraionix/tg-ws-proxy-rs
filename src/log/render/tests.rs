@@ -829,7 +829,7 @@ fn the_banner_and_the_probe_report_have_no_line() {
         0,
         Level::Info,
         Event::StartupSummary(StartupSummary {
-            version: "2.5.4-struct-logging".into(),
+            version: "2.6.0".into(),
             listen: "0.0.0.0:1443".into(),
             dc_ips: Vec::new(),
             tiers: Vec::new(),

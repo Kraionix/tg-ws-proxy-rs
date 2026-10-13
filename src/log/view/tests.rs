@@ -265,7 +265,7 @@ fn a_new_run_forgets_the_previous_run_s_peers() {
         0,
         Level::Info,
         Event::StartupSummary(StartupSummary {
-            version: "2.5.4-struct-logging".into(),
+            version: "2.6.0".into(),
             listen: "0.0.0.0:1443".into(),
             dc_ips: Vec::new(),
             tiers: Vec::new(),
