@@ -477,18 +477,17 @@ impl Drop for Segment {
 
 // ── Reading back ───────────────────────────────────────────────────────────
 //
-// Nothing in the binary reads a segment: `--log-dir` only writes, and the
-// reader that would consume these is a later iteration (S1). Their callers are
-// the tests that check a segment decodes record-for-record, so the allow is per
-// item — anything else that goes unused in here is still a warning.
+// Nothing in the binary reads a segment: `--log-dir` only writes. The
+// whole-day reader is public all the same, because the program that reads a
+// segment back is an operator's tool rather than this binary — the rest of this
+// file stays crate-private, and anything unused in here is still a warning.
 
 /// Reads a whole day back, in time order.
 ///
 /// Loads the day into memory, which is the right shape for a post-mortem of one
 /// segment and the wrong one for a reader that scans a month — the reading
 /// iteration is where that gets fixed.
-#[allow(dead_code)]
-pub(crate) fn iter_batches(dir: &Path, date: &str) -> Result<Vec<LogBatch>, LogError> {
+pub fn iter_batches(dir: &Path, date: &str) -> Result<Vec<LogBatch>, LogError> {
     let (db, transaction) = open_for_read(dir, date)?;
     let table = match transaction.open_table(MAIN) {
         Ok(table) => table,
