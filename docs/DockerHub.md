@@ -145,7 +145,7 @@ Every flag except `--dc-ip` also has a `TG_*` environment variable. Booleans acc
 | `TG_TEXT_LEVEL` | `--text-level` | `info` | Floor for the text log; `debug` adds the per-rung ladder |
 | `TG_RING_LEVEL` | `--ring-level` | `info` | Floor for the RAM ring that `SIGUSR1` dumps to the text log |
 | `TG_RING_CAPACITY` | `--ring-capacity` | `512` | Records the ring holds (64…4096) |
-| `TG_LOG_DIR` | `--log-dir` | — | Store the records as one segment per UTC day in this directory (needs a writable volume with a supported filesystem, not FAT) |
+| `TG_LOG_DIR` | `--log-dir` | — | Store the records as one segment per UTC day in this directory (needs a writable volume with a supported filesystem, not FAT). The image is built with the `log-disk` feature, so this and the other `TG_LOG_*` variables are always available here |
 | `TG_VERBOSE` | `-v` / `--verbose` | `false` | Legacy alias for `TG_TEXT_LEVEL=debug` |
 | `TG_QUIET` | `-q` / `--quiet` | `false` | Legacy alias for `TG_TEXT_LOG=off`; the startup banner is not affected |
 | `TG_SKIP_TLS_VERIFY` | `--danger-accept-invalid-certs` | `false` | Skip TLS verification |

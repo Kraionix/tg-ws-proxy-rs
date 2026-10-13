@@ -20,6 +20,13 @@ cargo build --release --target x86_64-unknown-linux-musl
 The binary lands in `target/release/tg-ws-proxy`, or
 `target/<target>/release/tg-ws-proxy` when cross-compiling.
 
+Add `--features log-disk` to any of those to get the on-disk sink: without it the
+binary has no `--log-dir` flags, no `probe-segment`/`dump-segment`, and the
+records reach the text log and the `SIGUSR1` ring only. `log-disk,log-zstd` adds
+`zstd-l1` segment compression on top (the codec is ~0.5 MB, which is why it is
+not on by default). The released binaries, the Docker image and the OpenWrt
+packages are all built with `log-disk`.
+
 ## Cross-platform builds with `cargo-zigbuild`
 
 [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild) uses the Zig

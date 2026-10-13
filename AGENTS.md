@@ -34,8 +34,9 @@ src/
   runtime.rs              Shared runtime state (outbound connector, fronting window, DC metadata)
   log.rs                 Record pipeline: settings/filters, `LogHandle`, `log_event!`/`direct!`, scope
   log/                   schema.rs (record types), writer.rs (batching + `BatchSink`),
-                         storage.rs (redb day segments), view.rs (text sink + `SIGUSR1` ring),
-                         render.rs (record → text line) — see docs/Logging.md
+                         storage.rs (redb day segments — `log-disk` only), view.rs (text sink +
+                         `SIGUSR1` ring), render.rs (record → text line) — see docs/Logging.md
+  dump.rs                The reader verbs `probe-segment`/`dump-segment` — `log-disk` only
   outbound/               Outbound TCP connector: HTTP/SOCKS5(h) proxy support, NO_PROXY matching
   default_domains/http.rs  Minimal HTTPS GET used only to fetch the default domain list
 
@@ -66,6 +67,20 @@ cargo clippy --all-targets         # CI runs this; keep it clean of new warnings
 cargo fmt                          # run before committing — CI does not auto-format
 cargo build --release              # CI also does a release build with LTO (see Cargo.toml profile)
 ```
+
+**The default feature set has no on-disk sink.** `log-disk` is off by default: without it there is no
+`log/storage.rs`, no `dump.rs`, no `--log-dir` flag family and no `probe-segment`/`dump-segment`, and
+51 of the tests — every one that drives a real segment — are compiled out. CI builds and tests both
+legs, so run both when touching the log:
+
+```bash
+cargo test --features log-disk,log-zstd   # the sink and its reader, with the codec
+cargo test --features log-disk            # the sink, without a codec
+cargo test                                # the default build: text view and ring only
+```
+
+`log-zstd` requires `log-disk`; a `#[cfg]` that gates a test on the sink must not leave a helper
+behind it unused, or `clippy --all-targets` fails the thin leg.
 
 **Those cover the root package only.** `Cargo.toml` sets `default-members = ["."]`, which keeps
 `crates/android-jni` out of every bare `cargo build` / `test` / `clippy` at the repository root —

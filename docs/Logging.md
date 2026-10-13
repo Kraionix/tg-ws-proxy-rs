@@ -6,6 +6,11 @@ log (`--text-log`). The text is a *projection* of the records, not a second stre
 describe the same connection — which is what makes "the console said X but the file says Y" impossible
 rather than unlikely.
 
+The disk consumer is the one part behind a build feature. `log-disk` is off by default, so a plain
+`cargo build` carries no storage engine and offers none of the `--log-dir` flags; every binary the
+project releases, the Docker image and the OpenWrt packages are built with it, and [What a build
+has](#what-a-build-has) is the table. The text log and the `SIGUSR1` ring are in every build.
+
 The records exist for the one thing a text line cannot do: answer *why* a connection took the path it
 took. The console prints the decision the ladder made; the record carries the decision *and* its
 inputs — which rung was dialled, what class of failure ended it, how long it took, which cooldown that
@@ -101,7 +106,7 @@ record the segment keeps is built even when the text view is at `info`, and vice
 | `--log-level <LEVEL>` | `info` | `TG_LOG_LEVEL` | Floor for the segment, per category |
 | `--log-category <CAT,LEVEL>` | — | `TG_LOG_CATEGORY` | Per-category exception to `--log-level`, repeatable; the env value joins several with `+` |
 | `--log-retention <DAYS>` | `7` | `TG_LOG_RETENTION` | Segments to keep, counting today; `0` keeps every segment. Enforced by file name at rotation |
-| `--log-compress <MODE>` | `none` | `TG_LOG_COMPRESS` | `none` or `zstd-l1`; the latter needs a build with `--features log-zstd` |
+| `--log-compress <MODE>` | `none` | `TG_LOG_COMPRESS` | `none` or `zstd-l1`; `zstd-l1` needs a build with `log-zstd` on top of `log-disk` |
 | `--log-durability <MODE>` | `eventual` | `TG_LOG_DURABILITY` | `eventual` syncs every 30 s, `immediate` syncs before every flush returns |
 | `--log-flush-interval <SEC>` | `2` | `TG_LOG_FLUSH_INTERVAL` | How long a record may sit unwritten before a flush — the window a process that dies takes with it. It is *not* the power-cut window: that one is `--log-durability` |
 | `--log-batch-max <N>` | `256` | `TG_LOG_BATCH_MAX` | Records buffered before a flush is forced (16…4096) |
@@ -111,6 +116,28 @@ record the segment keeps is built even when the text view is at `info`, and vice
 
 The text log has no per-category exceptions: it is read by a person watching a terminal, not queried.
 `--log-category` is the segment's alone.
+
+Six of those rows need the `log-disk` feature, because they are the sink's own: `--log-dir`,
+`--log-level`, `--log-category`, `--log-retention`, `--log-compress` and `--log-durability`. Everything
+else, including the writer's `--log-batch-max`, `--log-flush-interval` and `--log-flush-on-warn`, is in
+every build — though without a sink those three bound batches that nothing stores.
+
+### What a build has
+
+| Build | On-disk sink | `--log-compress zstd-l1` |
+|---|---|---|
+| released binaries (musl, Apple, Windows), Docker image, OpenWrt packages | yes | musl, Apple and Windows only; not the armv7/MIPS packages |
+| `cargo build --release` (no features — the default) | no | no |
+| `cargo build --features log-disk` | yes | no |
+| `cargo build --features log-disk,log-zstd` | yes | yes |
+| the Android APK | no | no |
+
+`log-zstd` requires `log-disk`, since compression is a property of the segments that sink writes. A
+build without the sink has no `--log-dir`, no `--log-level`/`--log-category`, no `--log-compress` or
+`--log-durability`, and no `probe-segment`/`dump-segment`: clap refuses them by name, and the startup
+banner prints `Log sink: not in this build — the on-disk sink needs --features log-disk` instead of a
+directory. Nothing else changes: the records still reach the text log and the ring, and the writer
+still batches them.
 
 ## What gets recorded
 
@@ -309,40 +336,35 @@ Practical choices, from cheap to durable:
 
 ## What it costs
 
-Binary size, measured on this build's release profile (`lto`, `codegen-units = 1`, `strip`), with the
-musl targets built against a musl cross toolchain:
+Binary size, measured on this build's release profile (`lto`, `codegen-units = 1`, `strip`), one
+toolchain, each end of a row from the same profile — the musl targets against a musl cross toolchain:
 
-| Target | upstream 2.5.4 | default | `--features log-zstd` |
-|---|---|---|---|
-| `x86_64-unknown-linux-musl` | 4 616 896 B | 5 728 448 B (**+24 %**) | 6 277 312 B (+36 %) |
-| `aarch64-unknown-linux-musl` | 3 862 600 B | 4 773 464 B (**+24 %**) | 5 228 120 B (+35 %) |
+| Target | upstream 2.5.4 | default (no features) | `log-disk` | `log-disk,log-zstd` |
+|---|---|---|---|---|
+| `x86_64-unknown-linux-gnu` | 4 476 440 B | 4 570 696 B (**+2.1 %**) | 5 788 768 B (+29 %) | 6 736 088 B (+51 %) |
+| `x86_64-unknown-linux-musl` | 4 616 816 B | 4 708 432 B (**+2.0 %**) | 5 920 880 B (+28 %) | 6 867 056 B (+49 %) |
+| `aarch64-unknown-linux-musl` | 3 862 600 B | 3 958 328 B (**+2.5 %**) | 4 945 504 B (+28 %) | 5 699 168 B (+48 %) |
+| `armv7-unknown-linux-musleabihf` | 3 695 320 B | 3 808 728 B (**+3.1 %**) | 4 828 648 B (+31 %) | 5 610 984 B (+52 %) |
 
-Both ends of a row come from the same profile and the same toolchain, and that matters: the same source
-built for `x86_64-unknown-linux-gnu` is ~135 KB smaller than its musl twin, so a gnu baseline against a
-musl build overstates the increase by about four points. The zstd codec adds another 536 KiB on
-x86-64 and 444 KiB on aarch64. The release workflow builds `log-zstd` in for the musl targets (aarch64,
-x86_64), the Apple targets (both architectures and the universal build) and `x86_64-pc-windows-gnu`;
-the armv7 and MIPS targets ship without it, and `--log-compress` there offers `none` alone. A build
-without the codec cannot read a
-compressed segment.
+Read the second column as what the logging rework itself costs: the schema, the pipeline, the text
+projection and the ring are **92…113 KB** — 2–3 % of the binary — and that build has no storage engine
+in it at all. The third column is the sink: redb, the day segments, the retention sweep, the reader
+verbs and the `prost` decode they need, **0.99…1.22 MB** depending on the target. The fourth is the
+zstd codec, another **0.75…0.95 MB** (15–16 % of the sink build), which is why it is a feature of its
+own and why the armv7 and MIPS packages ship without it: 0.75 MB of flash on a router buys less than
+the compression saves.
 
-**The reader verbs have their own price**, and it is paid whether or not anyone runs them: a binary
-that only *wrote* segments never linked the decode half of `prost` or of zstd, and `--gc-sections`
-pruned both. Measured with this profile, the same source built with and without `probe-segment` and
-`dump-segment` (and with the retention fix that followed them):
+The same source built for gnu is ~135 KB smaller than its musl twin, so a gnu baseline against a musl
+build would overstate the increase by about four points; no row here does that. A build without the
+codec cannot read a compressed segment.
 
-| Target | without the verbs | with them | difference |
-|---|---|---|---|
-| `x86_64-unknown-linux-gnu`, `--features log-zstd` | 6 146 776 B | 6 735 256 B | **+588 KB (+9.6 %)** |
-| `x86_64-unknown-linux-gnu`, no codec | 5 592 816 B | 5 788 000 B | +195 KB (+3.5 %) |
-| `aarch64-unknown-linux-musl`, `--features log-zstd` | 5 228 120 B | 5 703 264 B | **+475 KB (+9.1 %)** |
-
-Almost all of the difference on a codec build is the zstd **decompressor** (≈393 KB of the 588 KB on
-x86-64): a segment written with `zstd-l1` cannot be counted without it. The rest is the `prost` decode
-of all 22 events, the JSON writer (hand-written — `serde_json` would have been another dependency tree
-in the shipped binary) and clap's subcommand machinery. A build without the codec pays a third of that
-and can still read an uncompressed segment. On the reference router's aarch64 target the binary goes
-from 5.0 MiB to 5.4 MiB, against a 128 MiB flash and a 490 MiB `/tmp`.
+**The reader verbs are inside that column too.** They used to be paid by every build, whether or not
+anyone ran them: a binary that only *wrote* segments never linked the decode half of `prost`, and
+`--gc-sections` pruned it — measured then at +195 KB on x86-64 without a codec and +588 KB with one
+(most of it the zstd decompressor). Behind `log-disk` they are part of the sink's 1.2 MB, and a
+default build pays none of it. What is left there is the `prost` decode of all 22 events, the JSON
+writer (hand-written — `serde_json` would have been another dependency tree in the shipped binary) and
+clap's subcommand machinery.
 
 Volume, measured rather than estimated: a record is **~44 B**, a client connection writes about **one**
 of them at the default level and about **four** at `--log-level debug`, and an idle process writes the

@@ -61,11 +61,17 @@ Set `TG_SECRET` so the secret survives restarts, and `--link-ip` so the printed
 ### Build from source
 
 ```bash
-cargo build --release
+cargo build --release                        # the proxy, text log and SIGUSR1 ring
+cargo build --release --features log-disk    # ... and the on-disk sink and reader verbs
 ```
 
-The binary lands in `target/release/tg-ws-proxy`. Cross-compiling for OpenWrt
-(MIPS/ARM/ARM64) is covered in [docs/Building.md](docs/Building.md).
+The binary lands in `target/release/tg-ws-proxy`. The on-disk sink is a build
+feature that is off by default: without `log-disk` the `--log-dir` flags and the
+`probe-segment`/`dump-segment` verbs do not exist, and the records reach the text
+log and the ring only. Every binary in Releases, the Docker image and the OpenWrt
+packages are built with it. `--features log-disk,log-zstd` adds `zstd-l1`
+compression, and needs `log-disk`. Cross-compiling for OpenWrt (MIPS/ARM/ARM64)
+is covered in [docs/Building.md](docs/Building.md).
 
 ### Android
 
@@ -269,8 +275,8 @@ tg-ws-proxy [OPTIONS]
 | `--text-log <stderr\|stdout\|off\|PATH>` | `stderr` | Where the text log goes; a path is appended to. The text is rendered from the same records the segments hold (see [docs/Logging.md](docs/Logging.md)) |
 | `--text-level <LEVEL>` | `info` | Floor for the text log; `debug` adds the per-rung ladder (`session_opened`, `tier_attempt`, `pool_*`) and refused handshakes |
 | `--ring-level <LEVEL>` / `--ring-capacity <N>` | `info` / `512` | The RAM ring behind `SIGUSR1`, which dumps the last records to the text log |
-| `--log-dir <PATH>` | off | Write the records as one segment file per UTC day in this directory. Unset keeps them in memory only — the text log still works |
-| `--log-level <LEVEL>` | `info` | Floor for the segment, adjustable per category with `--log-category` |
+| `--log-dir <PATH>` | off | Write the records as one segment file per UTC day in this directory. Unset keeps them in memory only — the text log still works. Needs a build with `log-disk`; every released binary has it |
+| `--log-level <LEVEL>` | `info` | Floor for the segment, adjustable per category with `--log-category`. Same feature as `--log-dir` |
 | `-q / --quiet` | off | Legacy alias for `--text-log off` (the startup banner still prints) |
 | `-v / --verbose` | off | Legacy alias for `--text-level debug` |
 | `--danger-accept-invalid-certs` | off | Skip TLS verification |
