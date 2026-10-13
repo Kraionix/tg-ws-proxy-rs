@@ -32,12 +32,17 @@ path = "src/main.rs"
 
 [features]
 # The structured log is always compiled in, and the record pipeline always
-# runs: the text log is a projection of it. `--log-dir` is what puts the
-# records on disk. Compression is the one part behind a feature, because it is
-# the one part that costs real weight for a mode that is off by default: see
-# the `zstd` dependency below.
+# runs: the text log is a projection of it, and the `SIGUSR1` ring is the
+# other consumer. The on-disk sink — redb day segments, the `--log-dir` flag
+# family, the `--log-level`/`--log-category` thresholds that only it reads, and
+# the `probe-segment`/`dump-segment` reader verbs — is the one part behind a
+# feature: it is off by default, and an embedder that only wants the text log
+# should not link a storage engine it never opens. See `redb` below.
 default = []
-log-zstd = ["dep:zstd"]
+log-disk = ["dep:redb"]
+# Compression for the segments the disk sink writes, so it cannot stand
+# without it: `log-zstd` implies `log-disk`. See the `zstd` dependency below.
+log-zstd = ["log-disk", "dep:zstd"]
 
 [dependencies]
 # Async runtime
@@ -113,8 +118,9 @@ prost = "0.14"
 # Day-segment storage: an embedded key-value store with typed keys and
 # per-transaction durability. Pure Rust, which is the point — every release
 # target cross-compiles, and a C storage engine would need a C toolchain for
-# each one.
-redb = "4.3"
+# each one. Optional: it is linked only by builds with `log-disk`, and in a
+# build without it `--log-dir` and the reader verbs do not exist at all.
+redb = { version = "4.3", optional = true }
 # Optional per-batch compression of stored batches (`--log-compress=zstd-l1`).
 # Off by default: the codec is ~500 KB of the release binary and the default
 # mode stores batches as they are, so a build that never compresses should not

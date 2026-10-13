@@ -309,6 +309,7 @@ async fn a_worker_tunnel_never_emits_an_oversized_frame() {
 /// connect, which is the fast and deterministic failure this classification
 /// exists to name. The read-back is the point — a record that never leaves the
 /// writer's channel looks identical to one that was never emitted.
+#[cfg(feature = "log-disk")]
 #[tokio::test]
 async fn a_ladder_walk_lands_in_the_segment_as_attempts_and_fallbacks() {
     let dir = std::env::temp_dir().join(format!("tgws-tier-attempt-{}", std::process::id()));
@@ -332,7 +333,7 @@ async fn a_ladder_walk_lands_in_the_segment_as_attempts_and_fallbacks() {
     .unwrap()
     .with_defaults();
 
-    let handle = crate::log::init(Some(&dir), config.log_settings(), config.log_options())
+    let handle = crate::log::init(config.log_settings(), config.log_disk())
         .expect("a writable temp dir accepts a segment");
     let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
     let pool = Arc::new(WsPool::with_runtime(
@@ -478,6 +479,7 @@ async fn a_ladder_walk_lands_in_the_segment_as_attempts_and_fallbacks() {
 /// warning while the success that clears it is a debug note. `info` is the
 /// disk floor, so this is also the difference between "the ladder is visible in
 /// a segment" and "only the failures are".
+#[cfg(feature = "log-disk")]
 #[tokio::test]
 async fn the_aligned_levels_land_in_the_segment() {
     use crate::log::schema::{AttemptSkipped, CooldownArmed, CooldownCleared, Event, TlsHandshake};
@@ -501,7 +503,7 @@ async fn the_aligned_levels_land_in_the_segment() {
     .unwrap()
     .with_defaults();
 
-    let handle = crate::log::init(Some(&dir), config.log_settings(), config.log_options())
+    let handle = crate::log::init(config.log_settings(), config.log_disk())
         .expect("a writable temp dir accepts a segment");
     let ctx = || Some(Ctx::new(2, false, LogTier::Ws));
 
@@ -660,6 +662,7 @@ async fn the_aligned_levels_land_in_the_segment() {
 /// is no rung to dial. An opened session with no close record is what a crashed
 /// process looks like in a segment; this is the record that tells the two
 /// apart.
+#[cfg(feature = "log-disk")]
 #[tokio::test]
 async fn a_session_with_nowhere_to_route_closes_as_no_route() {
     use crate::log::schema::{ClosedBy, Event};
@@ -683,7 +686,7 @@ async fn a_session_with_nowhere_to_route_closes_as_no_route() {
     .unwrap()
     .with_defaults();
 
-    let handle = crate::log::init(Some(&dir), config.log_settings(), config.log_options())
+    let handle = crate::log::init(config.log_settings(), config.log_disk())
         .expect("a writable temp dir accepts a segment");
 
     let config = Arc::new(config);

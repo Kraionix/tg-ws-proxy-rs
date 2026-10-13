@@ -6,6 +6,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+#[cfg(feature = "log-disk")]
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,6 +35,7 @@ const FD_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 /// Past this, `--log-retention` stops being a retention policy and becomes a
 /// wish — the sweep is by file name and simply finds nothing to delete. Warned
 /// about at startup rather than refused.
+#[cfg(feature = "log-disk")]
 const RETENTION_WARN_DAYS: u32 = 3650;
 
 /// Why [`run`] / [`run_with_listen`] stopped before serving, or failed to start.
@@ -47,8 +49,10 @@ pub enum RunError {
     /// `{host}:{port}` is not a valid socket address.
     InvalidListenAddress(String),
     /// `--log-dir` is on a filesystem that cannot carry a segment.
+    #[cfg(feature = "log-disk")]
     InvalidLogFs(String),
     /// `--log-dir` could not be created, opened, or claimed for writing.
+    #[cfg(feature = "log-disk")]
     InvalidLogDir(String),
     /// `--text-log` names something that cannot be written to.
     InvalidTextLog(String),
@@ -67,7 +71,9 @@ impl std::fmt::Display for RunError {
             Self::InvalidOutbound(e) => write!(f, "invalid outbound proxy config: {e}"),
             Self::InvalidPin(e) => write!(f, "invalid pinned upstream config: {e}"),
             Self::InvalidListenAddress(addr) => write!(f, "invalid listen address: {addr}"),
+            #[cfg(feature = "log-disk")]
             Self::InvalidLogFs(reason) => f.write_str(reason),
+            #[cfg(feature = "log-disk")]
             Self::InvalidLogDir(reason) => write!(f, "invalid --log-dir: {reason}"),
             Self::InvalidTextLog(reason) => write!(f, "invalid --text-log: {reason}"),
             Self::Bind { addr, source } => write!(f, "cannot bind {addr}: {source}"),
@@ -132,23 +138,25 @@ async fn check_verdict(rx: &mut Option<tokio::sync::oneshot::Receiver<bool>>) ->
 /// The pipeline is started here rather than in the binary's `main` because this
 /// is the function that owns `config`: a handle created outside would have to be
 /// threaded through `run`, every embedder and the Android shim to be usable
-/// inside — or worse, the shim would run without logging at all. With a
-/// `--log-dir` the sink is a segment on disk; without one it keeps nothing, and
-/// the text log is the whole of what the records are for. Starting it here also
-/// makes "a clean stop loses nothing" a property of the return path: every way
-/// out of [`serve`] comes back through the shutdown, including the early returns
-/// for `--check` and a failed bind.
+/// inside — or worse, the shim would run without logging at all. With the
+/// `log-disk` feature and a `--log-dir` the sink is a segment on disk; in any
+/// other build it keeps nothing, and the text log is the whole of what the
+/// records are for. Starting it here also makes "a clean stop loses nothing" a
+/// property of the return path: every way out of [`serve`] comes back through
+/// the shutdown, including the early returns for `--check` and a failed bind.
 pub async fn run_with_listen(
     config: Config,
     shutdown: impl Future<Output = ShutdownSignal> + Send,
     on_listen: impl FnOnce(ListenInfo) + Send,
 ) -> Result<(), RunError> {
-    let log = log::init(
-        config.log_dir.as_deref(),
-        config.log_settings(),
-        config.log_options(),
-    )
-    .map_err(|error| log_start_error(error, config.log_dir.as_deref()))?;
+    // The one place the sink is chosen. A build with the feature takes the
+    // directory the operator named; `None` is the documented "keep the records
+    // in memory" mode, and a build without the feature has no sink to choose.
+    #[cfg(feature = "log-disk")]
+    let log = log::init(config.log_settings(), config.log_disk())
+        .map_err(|error| log_start_error(error, config.log_dir.as_deref()))?;
+    #[cfg(not(feature = "log-disk"))]
+    let log = log::init(config.log_settings(), None).map_err(log_start_error)?;
 
     let result = serve(config, shutdown, on_listen, &log).await;
 
@@ -160,6 +168,7 @@ pub async fn run_with_listen(
 /// A destination that could not be opened is the one startup failure with no
 /// fallback: a log the operator asked for and did not get is a configuration
 /// mistake to see, not a reason to run on quietly without it.
+#[cfg(feature = "log-disk")]
 fn log_start_error(error: log::LogError, dir: Option<&Path>) -> RunError {
     match error {
         log::LogError::FsUnsupported(reason) => RunError::InvalidLogFs(reason),
@@ -171,6 +180,20 @@ fn log_start_error(error: log::LogError, dir: Option<&Path>) -> RunError {
         }),
         log::LogError::TextSink(reason) => RunError::InvalidTextLog(reason),
         error => RunError::InvalidLogDir(error.to_string()),
+    }
+}
+
+/// The same report in a build without the on-disk sink, whose only destination
+/// is the text view: the variants naming a segment are not compiled in, so
+/// there is nothing else `init` can fail on.
+#[cfg(not(feature = "log-disk"))]
+fn log_start_error(error: log::LogError) -> RunError {
+    match error {
+        log::LogError::TextSink(reason) => RunError::InvalidTextLog(reason),
+        // `Io` is the only other variant this build's `LogError` has, and
+        // nothing raises it here: the text view is the one destination `init`
+        // opens, and its failures arrive as `TextSink`.
+        error => RunError::InvalidTextLog(error.to_string()),
     }
 }
 
@@ -377,6 +400,13 @@ fn print_banner(
         settings.ring_capacity,
     );
 
+    // The sink line answers "where do the records go". A build without the
+    // feature has no sink to point at, and saying so is better than naming a
+    // flag that would be refused if it were typed.
+    #[cfg(not(feature = "log-disk"))]
+    println!("  Log sink:      not in this build — the on-disk sink needs `--features log-disk`");
+
+    #[cfg(feature = "log-disk")]
     match &config.log_dir {
         None => println!(
             "  Log sink:      none — records are not written to disk (--log-dir keeps them)"
@@ -619,11 +649,20 @@ async fn serve(
             .collect();
         dc_ips.sort_by_key(|entry| entry.dc);
 
-        let disks = config.log_settings().disk;
-        let categories: Vec<String> = Category::ALL
-            .iter()
-            .map(|category| format!("{}={}", category.name(), disks[*category as usize].name()))
-            .collect();
+        // The segment's per-category floors. A build without the on-disk sink
+        // has no per-category policy at all — the text view and the ring have
+        // one flat floor each — so the list is empty rather than a copy of a
+        // floor that belongs to another sink.
+        #[cfg(feature = "log-disk")]
+        let categories: Vec<String> = {
+            let disks = config.log_settings().disk;
+            Category::ALL
+                .iter()
+                .map(|category| format!("{}={}", category.name(), disks[*category as usize].name()))
+                .collect()
+        };
+        #[cfg(not(feature = "log-disk"))]
+        let categories: Vec<String> = Vec::new();
 
         let version = env!("CARGO_PKG_VERSION").to_string();
         let listen = format!("{bind_host}:{listen_port}");

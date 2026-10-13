@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::net::UdpSocket;
+#[cfg(feature = "log-disk")]
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -178,6 +179,7 @@ impl fmt::Display for UpstreamTier {
 /// `Category::Unspecified` is deliberately absent: it is the schema's zero
 /// value, not a category an event can carry, and a filter entry naming it would
 /// look like it did something.
+#[cfg(feature = "log-disk")]
 const LOG_CATEGORIES: &[(&str, log::schema::Category)] = &[
     ("session", log::schema::Category::Session),
     ("routing", log::schema::Category::Routing),
@@ -216,6 +218,7 @@ impl LogLevel {
 /// The compressed mode is a build-time feature, so the flag offers exactly what
 /// this binary can do: asking for a codec that is not compiled in is a clap
 /// error naming the possible values, not a mode that quietly stores raw bytes.
+#[cfg(feature = "log-disk")]
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum LogCompress {
     /// Store batches as they are encoded — the CPU stays with the proxy.
@@ -225,6 +228,7 @@ pub enum LogCompress {
     ZstdL1,
 }
 
+#[cfg(feature = "log-disk")]
 impl LogCompress {
     fn to_storage(self) -> log::storage::Compression {
         match self {
@@ -235,6 +239,7 @@ impl LogCompress {
     }
 }
 
+#[cfg(feature = "log-disk")]
 impl fmt::Display for LogCompress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(
@@ -246,6 +251,7 @@ impl fmt::Display for LogCompress {
 }
 
 /// `--log-durability`: how much of a segment survives a power cut.
+#[cfg(feature = "log-disk")]
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum LogDurability {
     /// fsync on a timer instead of per flush: up to that interval of records is
@@ -256,6 +262,7 @@ pub enum LogDurability {
     Immediate,
 }
 
+#[cfg(feature = "log-disk")]
 impl LogDurability {
     fn to_storage(self) -> log::storage::DurabilityMode {
         match self {
@@ -265,6 +272,7 @@ impl LogDurability {
     }
 }
 
+#[cfg(feature = "log-disk")]
 impl fmt::Display for LogDurability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(
@@ -280,6 +288,7 @@ impl fmt::Display for LogDurability {
 /// Rejecting at parse time is the point of doing it here: a filter the operator
 /// believes is on, but which names a category this build does not have or a
 /// level it cannot store, would silently log nothing extra.
+#[cfg(feature = "log-disk")]
 fn parse_log_category(value: &str) -> Result<(log::schema::Category, log::schema::Level), String> {
     let (name, level) = value
         .split_once(',')
@@ -466,10 +475,12 @@ pub struct Config {
     pub quiet: bool,
 
     // ── The record stream and its text projection ─────────────────────────
-    // One pipeline, two consumers: the segment on disk when `--log-dir` is
-    // set, and the text view, which renders the same records into the lines a
-    // human reads. `--log-dir` is the only one of these that decides whether
-    // anything is written to a file at all.
+    // One pipeline: the text view renders the same records into the lines a
+    // human reads, and the ring holds the last few hundred for `SIGUSR1`. The
+    // flags that only the on-disk sink reads — the segment directory, its
+    // levels, its codec, its durability and its retention — are `cfg`'d on the
+    // `log-disk` feature, so a build without it neither offers them nor
+    // mentions them in `--help`.
     /// Write structured records to one segment file per UTC day under this
     /// directory, keeping `--log-retention` days of them.
     ///
@@ -480,16 +491,17 @@ pub struct Config {
     /// filesystem that can hold a lock-protected database — ext4, xfs, btrfs,
     /// f2fs, tmpfs or overlayfs — so a FAT-family mount is refused at startup
     /// rather than allowed to corrupt a segment later.
+    #[cfg(feature = "log-disk")]
     #[arg(long = "log-dir", value_name = "PATH", env = "TG_LOG_DIR")]
     pub log_dir: Option<PathBuf>,
 
     /// Where the rendered text goes: `stderr` (the default), `stdout`, `off`,
     /// or a path, which is appended to and never truncated.
     ///
-    /// The text is a projection of the same records that go to `--log-dir`, so
-    /// turning it off costs no facts — only the file's own copy of them. It is
-    /// also not affected by `--log-level`: the two consumers filter
-    /// independently, and each has its own floor.
+    /// The text is a projection of the same records the pipeline carries, so
+    /// turning this off costs no facts — only this sink's copy of them. It is
+    /// filtered independently as well: `--text-level` is this view's own floor,
+    /// and the floors of the record stream's other consumers never move it.
     #[arg(
         long = "text-log",
         value_name = "[stderr|stdout|off|PATH]",
@@ -531,7 +543,8 @@ pub struct Config {
     /// A floor, not a ceiling: `warn` keeps warnings and errors and drops the
     /// rest. Per-category exceptions belong in `--log-category`; the text log
     /// and the ring have floors of their own (`--text-level`, `--ring-level`),
-    /// and a record is built if *any* of the three wants it.
+    /// and a record is built if *any* of the sinks wants it.
+    #[cfg(feature = "log-disk")]
     #[arg(
         long = "log-level",
         value_name = "LEVEL",
@@ -549,6 +562,7 @@ pub struct Config {
     ///
     /// Categories: session, routing, pool, cooldown, tls, crypto, accept,
     /// check, config, overflow.
+    #[cfg(feature = "log-disk")]
     #[arg(
         long = "log-category",
         value_name = "CATEGORY,LEVEL",
@@ -558,7 +572,7 @@ pub struct Config {
     )]
     pub log_categories: Vec<(log::schema::Category, log::schema::Level)>,
 
-    /// Records buffered before a flush is forced.
+    /// Records per batch the writer hands to its sink.
     ///
     /// Lower means more, smaller writes; higher means better compression and
     /// more records still in memory when the process dies.
@@ -574,8 +588,8 @@ pub struct Config {
     /// How long a record may sit unwritten before the writer flushes it, in
     /// seconds: this is the window a process that dies takes with it.
     ///
-    /// It is not the power-cut window — that is `--log-durability`, whose
-    /// `eventual` mode syncs every 30 seconds whatever this is set to.
+    /// It is not the power-cut window: how much of a written segment survives
+    /// that is the storage layer's own policy, not the writer's.
     #[arg(
         long = "log-flush-interval",
         value_name = "SEC",
@@ -600,6 +614,7 @@ pub struct Config {
     /// half a megabyte of the binary, so a build for a flash-constrained device
     /// leaves it out and this flag then offers `none` alone. A segment written
     /// with compression needs a build that has it to be read.
+    #[cfg(feature = "log-disk")]
     #[arg(
         long = "log-compress",
         value_name = "MODE",
@@ -615,6 +630,7 @@ pub struct Config {
     /// fsync. `immediate` syncs before every flush returns, so nothing written
     /// is lost; that is one fsync per `--log-flush-interval`. A clean stop is
     /// complete either way.
+    #[cfg(feature = "log-disk")]
     #[arg(
         long = "log-durability",
         value_name = "MODE",
@@ -628,6 +644,7 @@ pub struct Config {
     /// Retention is enforced by file name on rotation, so a value larger than
     /// the storage can hold deletes nothing — it is accepted with a warning
     /// rather than refused.
+    #[cfg(feature = "log-disk")]
     #[arg(
         long = "log-retention",
         value_name = "DAYS",
@@ -1041,11 +1058,16 @@ pub struct Config {
     /// configuration, while a segment is read from a directory and answered in
     /// JSON. No subcommand means "serve", which is what keeps every existing
     /// invocation — and every `TG_*` fallback above — working unchanged.
+    ///
+    /// Only a build with the `log-disk` feature has segments to read, so only
+    /// such a build has these verbs.
+    #[cfg(feature = "log-disk")]
     #[command(subcommand)]
     pub command: Option<Command>,
 }
 
 /// What the binary does instead of serving.
+#[cfg(feature = "log-disk")]
 #[derive(clap::Subcommand, Clone, Debug)]
 pub enum Command {
     /// Report what each segment in a directory holds, without printing records.
@@ -1241,15 +1263,18 @@ impl Config {
         self
     }
 
-    /// The structured sink's producer-side settings — the three filters, the
-    /// batch size and the flush triggers.
+    /// The structured sink's producer-side settings — the filters, the batch
+    /// size and the flush triggers.
     ///
-    /// Only the sink's own view: the on-disk policy is [`Self::log_options`].
-    /// Both are read by the code that starts the sink.
+    /// Only the sink's own view: compression, durability and retention belong
+    /// to the storage layer, and a build with the `log-disk` feature passes
+    /// those to it separately.
     pub fn log_settings(&self) -> log::Settings {
-        let level = self.log_level.to_schema();
+        // Mutable only where there is a per-category table to adjust below.
+        #[cfg_attr(not(feature = "log-disk"), allow(unused_mut))]
         let mut settings = log::Settings {
-            disk: [log::Filter::at(level); log::CATEGORY_COUNT],
+            #[cfg(feature = "log-disk")]
+            disk: [log::Filter::at(self.log_level.to_schema()); log::CATEGORY_COUNT],
             text: log::Filter::at(self.text_floor()),
             ring: log::Filter::at(self.ring_floor()),
             text_log: self.text_destination(),
@@ -1259,6 +1284,9 @@ impl Config {
             flush_on_warn: self.log_flush_on_warn,
         };
 
+        // `--log-category` moves a single category off the flat `--log-level`
+        // floor; the segment is the only sink that reads a per-category policy.
+        #[cfg(feature = "log-disk")]
         for (category, level) in &self.log_categories {
             settings.disk[*category as usize] = log::Filter::at(*level);
         }
@@ -1304,12 +1332,24 @@ impl Config {
 
     /// The structured sink's on-disk policy: compression, durability and how
     /// many days of segments to keep.
+    #[cfg(feature = "log-disk")]
     pub fn log_options(&self) -> log::storage::Options {
         log::storage::Options {
             compress: self.log_compress.to_storage(),
             durability: self.log_durability.to_storage(),
             retention_days: self.log_retention,
         }
+    }
+
+    /// The on-disk sink this configuration asks for: the directory it named and
+    /// the policy that goes with it, or `None` when it named no directory —
+    /// which is the documented "keep the records in memory" mode.
+    #[cfg(feature = "log-disk")]
+    pub fn log_disk(&self) -> Option<log::Disk> {
+        self.log_dir.clone().map(|dir| log::Disk {
+            dir,
+            options: self.log_options(),
+        })
     }
 
     /// Primary proxy secret (the first configured value).

@@ -745,6 +745,27 @@ fn unpolled_runtime() -> tokio::runtime::Runtime {
         .expect("a current-thread runtime")
 }
 
+/// [`super::init`] the way `server.rs` calls it: a directory means a segment in
+/// a build that has the on-disk sink, and nothing but the text view and the
+/// ring in a build that does not — which is also what `None` means in both.
+///
+/// The tests that assert on a segment's contents ask for one directly through
+/// `storage`, and are compiled only where it exists.
+fn init_with_dir(settings: Settings, dir: Option<&Path>) -> Result<Arc<LogHandle>, LogError> {
+    #[cfg(feature = "log-disk")]
+    let disk = dir.map(|dir| Disk {
+        dir: dir.to_path_buf(),
+        options: Options::default(),
+    });
+    #[cfg(not(feature = "log-disk"))]
+    let disk = {
+        let _ = dir;
+        None
+    };
+
+    init(settings, disk)
+}
+
 #[tokio::test]
 async fn a_full_batch_is_written_as_one_batch() {
     let (sink, shared, mut batches) = recording();
@@ -1037,6 +1058,7 @@ async fn the_macro_builds_the_payload_and_skips_what_the_filter_drops() {
     assert_eq!(batches[0].records[0].level, Level::Info as i32);
 }
 
+#[cfg(feature = "log-disk")]
 #[tokio::test]
 async fn a_category_can_be_quieter_than_the_global_level() {
     let (sink, shared, _batches) = recording();
@@ -1105,13 +1127,16 @@ fn a_filter_keeps_its_floor_and_everything_above_it() {
 }
 
 #[test]
-fn the_gate_is_the_union_of_the_three_policies() {
+fn the_gate_is_the_union_of_the_consumers_policies() {
     let runtime = unpolled_runtime();
 
-    // Disk at warn, text at info, ring off: the union is info, so an info
-    // payload is built for the text view even though the segment drops it.
+    // Text at info, ring off: the union is info, so an info payload is built
+    // for the text view. With the on-disk sink in the build its floor sits at
+    // warn here — the same point from the other side: the segment is what
+    // drops the record, not the gate.
     let (sink, _shared, _batches) = recording();
     let settings = Settings {
+        #[cfg(feature = "log-disk")]
         disk: [Filter::at(Level::Warn); CATEGORY_COUNT],
         text: Filter::at(Level::Info),
         ring: Filter::off(),
@@ -1124,6 +1149,7 @@ fn the_gate_is_the_union_of_the_three_policies() {
     // Only the ring wants debug, and that alone is enough.
     let (sink, _shared, _batches) = recording();
     let settings = Settings {
+        #[cfg(feature = "log-disk")]
         disk: [Filter::at(Level::Warn); CATEGORY_COUNT],
         text: Filter::off(),
         ring: Filter::at(Level::Debug),
@@ -1135,6 +1161,7 @@ fn the_gate_is_the_union_of_the_three_policies() {
     // Nobody wants it: the payload is not built at all.
     let (sink, _shared, _batches) = recording();
     let settings = Settings {
+        #[cfg(feature = "log-disk")]
         disk: [Filter::at(Level::Warn); CATEGORY_COUNT],
         text: Filter::off(),
         ring: Filter::off(),
@@ -1144,6 +1171,7 @@ fn the_gate_is_the_union_of_the_three_policies() {
     assert!(!handle.enabled(Category::Pool, Level::Debug));
 }
 
+#[cfg(feature = "log-disk")]
 #[tokio::test]
 async fn a_record_the_segment_does_not_keep_never_reaches_it() {
     // The counterpart of the union above: widening the gate must not widen the
@@ -1418,7 +1446,7 @@ async fn sigusr1_prints_the_ring_through_the_text_sink() {
     // Text off, ring on: the only text this run writes is the dump, so a line
     // in the file cannot be anything else.
     let settings = text_into(&path, Filter::off(), Filter::at(Level::Info));
-    let handle = init(Some(dir.path()), settings, Options::default()).expect("the sink starts");
+    let handle = init_with_dir(settings, Some(dir.path())).expect("the sink starts");
 
     for dc in 1..=3 {
         handle.emit(1, Category::Routing, Level::Info, pool_hit(dc));
@@ -1462,6 +1490,9 @@ async fn a_text_target_that_cannot_be_opened_is_a_startup_error() {
     );
 }
 
+// Every test below this line drives a real segment, so the whole section
+// is behind the `log-disk` feature that provides one.
+
 // ── Storage ────────────────────────────────────────────────────────────────
 
 use std::fs;
@@ -1469,6 +1500,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(feature = "log-zstd")]
 use super::storage::Compression;
+#[cfg(feature = "log-disk")]
 use super::storage::{self, DurabilityMode, FileSink, Options};
 
 /// A directory under the system temp dir, removed when the test ends.
@@ -1486,6 +1518,9 @@ impl TempDir {
         &self.0
     }
 
+    /// Every entry in the directory, sorted. Only the storage tests care what
+    /// a segment *did not* leave behind.
+    #[cfg(feature = "log-disk")]
     fn entries(&self) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(&self.0)
             .expect("the directory exists")
@@ -1506,6 +1541,7 @@ impl Drop for TempDir {
 /// `(ts_first_ns, seq)` is the `STOR:main` key, so every synthetic batch needs
 /// its own: a fixture that reused one would silently overwrite batches and make
 /// half these tests pass for the wrong reason.
+#[cfg(feature = "log-disk")]
 fn next_stamp() -> (u64, u32) {
     static NEXT: AtomicUsize = AtomicUsize::new(1);
     let n = NEXT.fetch_add(1, Relaxed) as u64;
@@ -1513,6 +1549,7 @@ fn next_stamp() -> (u64, u32) {
 }
 
 /// A batch of `conn_id`s, one record each, the way the writer would build it.
+#[cfg(feature = "log-disk")]
 fn batch_of(conn_ids: &[u64]) -> LogBatch {
     let (ts_ns, seq) = next_stamp();
     let records: Vec<LogRecord> = conn_ids
@@ -1597,10 +1634,12 @@ fn rich_batch() -> LogBatch {
     build_batch(&records).remove(0)
 }
 
+#[cfg(feature = "log-disk")]
 fn open_sink(dir: &Path, options: Options) -> FileSink {
     FileSink::open(dir, options).expect("the sink opens")
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn a_segment_from_another_schema_is_refused_rather_than_appended_to() {
     use redb::{Database, TableDefinition};
@@ -1639,6 +1678,7 @@ fn a_segment_from_another_schema_is_refused_rather_than_appended_to() {
     assert!(message.contains("move it out"), "{message}");
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn a_segment_round_trips_every_batch() {
     let dir = TempDir::new("roundtrip");
@@ -1655,6 +1695,7 @@ fn a_segment_round_trips_every_batch() {
     assert_eq!(read_back, vec![first, second]);
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn the_by_conn_index_returns_exactly_one_session() {
     let dir = TempDir::new("byconn");
@@ -1690,6 +1731,7 @@ fn the_by_conn_index_returns_exactly_one_session() {
     );
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn a_restart_inside_the_same_day_appends_to_the_same_segment() {
     let dir = TempDir::new("restart");
@@ -1716,6 +1758,7 @@ fn a_restart_inside_the_same_day_appends_to_the_same_segment() {
     );
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn both_durability_modes_survive_a_clean_close() {
     for mode in [DurabilityMode::Eventual, DurabilityMode::Immediate] {
@@ -1741,6 +1784,7 @@ fn both_durability_modes_survive_a_clean_close() {
     }
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn a_record_emitted_while_the_writer_is_stopping_still_reaches_the_sink() {
     // The accept loop stops before a session that is still tearing down, so the
@@ -1767,6 +1811,7 @@ fn a_record_emitted_while_the_writer_is_stopping_still_reaches_the_sink() {
     assert_eq!(seen, 1, "the record emitted during the stop was dropped");
 }
 
+#[cfg(feature = "log-disk")]
 #[cfg(not(feature = "log-zstd"))]
 #[test]
 fn a_build_without_zstd_names_the_build_that_could_read_a_compressed_batch() {
@@ -1778,6 +1823,7 @@ fn a_build_without_zstd_names_the_build_that_could_read_a_compressed_batch() {
     assert!(message.contains("log-zstd"), "{message}");
 }
 
+#[cfg(feature = "log-disk")]
 #[cfg(feature = "log-zstd")]
 #[test]
 fn zstd_shrinks_a_rich_batch_and_round_trips_it() {
@@ -1805,6 +1851,7 @@ fn zstd_shrinks_a_rich_batch_and_round_trips_it() {
     );
 }
 
+#[cfg(feature = "log-disk")]
 #[cfg(feature = "log-zstd")]
 #[test]
 fn a_compressed_segment_reads_back_as_written() {
@@ -1828,6 +1875,7 @@ fn a_compressed_segment_reads_back_as_written() {
     );
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn the_filesystem_gate_refuses_the_fat_family() {
     for refused in [
@@ -1862,6 +1910,7 @@ fn the_filesystem_gate_refuses_the_fat_family() {
     }
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn the_filesystem_gate_accepts_the_directory_this_test_runs_on() {
     let dir = TempDir::new("fsgate");
@@ -1873,6 +1922,7 @@ fn the_filesystem_gate_accepts_the_directory_this_test_runs_on() {
         .expect("a directory that does not exist yet resolves to its parent");
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn a_second_sink_on_the_same_directory_is_refused() {
     let dir = TempDir::new("conflict");
@@ -1888,6 +1938,7 @@ fn a_second_sink_on_the_same_directory_is_refused() {
     }
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn the_segment_records_its_provenance() {
     let dir = TempDir::new("meta");
@@ -1918,6 +1969,7 @@ fn the_segment_records_its_provenance() {
     );
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn the_fingerprint_follows_the_schema() {
     // Pinned so that a change to a field number, a tag or an enum value cannot
@@ -1929,6 +1981,7 @@ fn the_fingerprint_follows_the_schema() {
     );
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn retention_deletes_expired_segments_and_nothing_else() {
     let dir = TempDir::new("retention");
@@ -1957,6 +2010,7 @@ fn retention_deletes_expired_segments_and_nothing_else() {
     assert_eq!(dir.entries(), expected, "seven days kept, the rest swept");
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn retention_zero_keeps_everything() {
     let dir = TempDir::new("keepall");
@@ -1975,6 +2029,7 @@ fn retention_zero_keeps_everything() {
     assert!(dir.entries().contains(&ancient));
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn a_segment_name_round_trips_through_its_day_number() {
     // Retention does arithmetic on what a file is called, so the name parser has
@@ -1991,6 +2046,7 @@ fn a_segment_name_round_trips_through_its_day_number() {
     assert_eq!(storage::day_of_name("not-a-date"), None);
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn a_clock_in_the_future_does_not_sweep_the_archive() {
     // A router with no RTC can come up reading next year: the clock is set from
@@ -2026,6 +2082,7 @@ fn a_clock_in_the_future_does_not_sweep_the_archive() {
     );
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn a_clock_that_boots_in_the_past_does_not_delete_this_runs_segment() {
     // The other direction, and the one that nearly cost a boot its records on
@@ -2064,6 +2121,7 @@ fn a_clock_that_boots_in_the_past_does_not_delete_this_runs_segment() {
     );
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn rotation_moves_to_the_next_day_without_losing_the_previous_one() {
     let dir = TempDir::new("rotation");
@@ -2094,6 +2152,7 @@ fn rotation_moves_to_the_next_day_without_losing_the_previous_one() {
     );
 }
 
+#[cfg(feature = "log-disk")]
 #[cfg(unix)]
 #[test]
 fn a_segment_is_owner_only() {
@@ -2111,6 +2170,7 @@ fn a_segment_is_owner_only() {
     assert_eq!(mode, 0o600, "the segment holds every session's metadata");
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn records_written_through_the_pipeline_are_readable_back() {
     let runtime = unpolled_runtime();
@@ -2136,6 +2196,7 @@ fn records_written_through_the_pipeline_are_readable_back() {
     assert!(conns.contains(&1) && conns.contains(&2) && conns.contains(&3));
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn an_empty_segment_reads_back_as_an_empty_day() {
     // redb creates a table on its first write, so a segment that never took a
@@ -2158,6 +2219,7 @@ fn an_empty_segment_reads_back_as_an_empty_day() {
     );
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn init_starts_a_writable_segment_from_the_public_entry_point() {
     // What the startup path calls, with none of the test's own plumbing in
@@ -2168,7 +2230,7 @@ fn init_starts_a_writable_segment_from_the_public_entry_point() {
     let day = storage::today();
 
     let handle = runtime
-        .block_on(async { init(Some(dir.path()), Settings::default(), Options::default()) })
+        .block_on(async { init_with_dir(Settings::default(), Some(dir.path())) })
         .expect("the sink starts");
     handle.emit(1, Category::Accept, Level::Info, pool_hit(2));
     runtime.block_on(handle.shutdown());
@@ -2193,7 +2255,7 @@ fn without_a_directory_the_records_still_reach_the_text() {
     let settings = text_into(&path, Filter::at(Level::Info), Filter::off());
 
     let handle = runtime
-        .block_on(async { init(None, settings, Options::default()) })
+        .block_on(async { init_with_dir(settings, None) })
         .expect("the pipeline starts without a directory");
     handle.emit(1, Category::Accept, Level::Info, pool_hit(2));
     runtime.block_on(handle.shutdown());
@@ -2212,6 +2274,7 @@ fn without_a_directory_the_records_still_reach_the_text() {
     assert!(files.is_empty(), "{files:?}");
 }
 
+#[cfg(feature = "log-disk")]
 #[tokio::test]
 async fn the_text_floor_is_the_text_views_own_policy() {
     // The producer gate is the union of three consumers, so a record the
@@ -2238,6 +2301,7 @@ async fn the_text_floor_is_the_text_views_own_policy() {
     assert!(handle.text_keeps(Level::Error), "a floor is not a ceiling");
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn a_truncated_segment_is_refused_rather_than_half_read() {
     let dir = TempDir::new("truncated");
@@ -2272,6 +2336,7 @@ fn a_truncated_segment_is_refused_rather_than_half_read() {
     }
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn a_missing_segment_is_reported_as_missing() {
     let dir = TempDir::new("missing");
@@ -2282,6 +2347,7 @@ fn a_missing_segment_is_reported_as_missing() {
     );
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn reading_a_segment_leaves_its_bytes_alone() {
     // The reader used to hand `redb` the archive itself, and `redb` opens a
@@ -2295,7 +2361,7 @@ fn reading_a_segment_leaves_its_bytes_alone() {
     let date = storage::day_name(storage::today());
 
     let handle = runtime
-        .block_on(async { init(Some(dir.path()), Settings::default(), Options::default()) })
+        .block_on(async { init_with_dir(Settings::default(), Some(dir.path())) })
         .expect("the sink starts");
     handle.emit(1, Category::Session, Level::Info, pool_hit(2));
     runtime.block_on(handle.shutdown());

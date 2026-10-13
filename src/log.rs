@@ -1,12 +1,24 @@
-//! Structured event log: one small typed record per routing decision, written
-//! to a redb file per UTC day so that "why did this session fall back to the
-//! Cloudflare proxy at 14:03" is a query rather than a guess.
+//! Structured event log: one small typed record per routing decision, so that
+//! "why did this session fall back to the Cloudflare proxy at 14:03" is a query
+//! rather than a guess.
 //!
 //! The text a human reads is a *projection* of these records, not a parallel
 //! stream: [`render`] turns one record into one console line and [`view`] writes
 //! them to a terminal or a file, so the two can no longer drift apart. The
-//! pipeline runs whether or not `--log-dir` is set — without one the sink keeps
-//! nothing and the text log is the whole of what the records are for.
+//! pipeline runs in every build and whether or not the on-disk sink is
+//! configured — without one the sink keeps nothing and the text log is the
+//! whole of what the records are for.
+//!
+//! # What the `log-disk` feature adds
+//!
+//! The on-disk sink sits behind a cargo feature that is **off by default**:
+//! [`storage`] (redb day segments), the `--log-dir` flag family,
+//! `--log-level`/`--log-category` (the disk floor is the only per-category
+//! policy here), and the binary's `probe-segment`/`dump-segment` reader verbs.
+//! A build without it links no storage engine and its `--help` mentions none of
+//! them; the text view and the `SIGUSR1` ring are unaffected. [`Disk`] is how a
+//! caller hands the sink over — and in a build without the feature there is no
+//! sink to hand over.
 //!
 //! Three things are deliberately *not* records, because they cannot be: the
 //! startup banner (it carries the `tg://` links and is printed before anything
@@ -30,8 +42,8 @@
 //! `try_send` — never a lock, never an `await`, because this runs on the routing
 //! path in the middle of connection setup. The writer task at the far end
 //! batches records, writes them through a [`writer::BatchSink`], and hands them
-//! to storage; a full channel drops records and counts them, which is a
-//! counter and not an error (`INV:errors.drop_not_error`).
+//! to whatever sink the caller chose; a full channel drops records and counts
+//! them, which is a counter and not an error (`INV:errors.drop_not_error`).
 //!
 //! The session a record belongs to is not a parameter. [`scope`] plants the
 //! handle and the connection id in a task-local that the whole connection task
@@ -41,7 +53,8 @@
 //! process-wide events are emitted inside a scope with `conn_id = 0` instead.
 
 use std::future::Future;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "log-disk")]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -54,6 +67,7 @@ use view::{TEXT_RING_DEFAULT, TextTarget};
 
 pub mod render;
 pub mod schema;
+#[cfg(feature = "log-disk")]
 pub mod storage;
 pub mod view;
 mod writer;
@@ -99,10 +113,13 @@ pub enum LogError {
     /// The log directory could not be created or opened.
     Io(std::io::Error),
     /// The filesystem cannot carry a segment — see [`storage::check_filesystem`].
+    #[cfg(feature = "log-disk")]
     FsUnsupported(String),
     /// Another process is already writing today's segment.
+    #[cfg(feature = "log-disk")]
     WriterConflict(PathBuf),
     /// The segment file is not one this build can write.
+    #[cfg(feature = "log-disk")]
     Segment(String),
     /// The text view's destination could not be opened. Fatal for the same
     /// reason the segment's is: an operator who asked for a log file and did
@@ -114,13 +131,16 @@ impl std::fmt::Display for LogError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(f, "{error}"),
+            #[cfg(feature = "log-disk")]
             Self::FsUnsupported(reason) => f.write_str(reason),
+            #[cfg(feature = "log-disk")]
             Self::WriterConflict(path) => write!(
                 f,
                 "another process is writing {}; use a different --log-dir for \
                  multi-instance deployments",
                 path.display()
             ),
+            #[cfg(feature = "log-disk")]
             Self::Segment(reason) => f.write_str(reason),
             Self::TextSink(reason) => f.write_str(reason),
         }
@@ -195,15 +215,20 @@ impl Filter {
 
 /// What the subsystem is configured with.
 ///
-/// Three filters, one per consumer, plus the writer's batching policy. Which
-/// consumer sees which record is decided here and in the writer task: the
-/// producers only ask whether *anyone* wants the payload.
+/// One filter per consumer, plus the writer's batching policy. Which consumer
+/// sees which record is decided here and in the writer task: the producers only
+/// ask whether *anyone* wants the payload.
 #[derive(Clone, Debug)]
 pub struct Settings {
     /// Lowest level the segment sink records, indexed by [`Category`]. The only
     /// consumer with per-category exceptions, because it is the one an operator
     /// tunes — a flat table rather than a map so the filter on the emit path is
     /// an index and a compare.
+    ///
+    /// Only a build with the `log-disk` feature has a segment to record into,
+    /// so only such a build has this table: without it the producer gate is the
+    /// text view's floor and the ring's.
+    #[cfg(feature = "log-disk")]
     pub disk: [Filter; CATEGORY_COUNT],
     /// Lowest level the text view renders. One floor for every category: the
     /// view is read by a human watching a terminal, not queried.
@@ -232,6 +257,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "log-disk")]
             disk: [Filter::at(Level::Info); CATEGORY_COUNT],
             text: Filter::at(Level::Info),
             ring: Filter::at(Level::Info),
@@ -252,8 +278,9 @@ impl Default for Settings {
 pub struct LogHandle {
     tx: mpsc::Sender<LogRecord>,
     counters: Arc<Counters>,
-    /// The three consumers' floors, copied out of [`Settings`] so that the
-    /// producer gate needs no lock and no second lookup.
+    /// The consumers' floors, copied out of [`Settings`] so that the producer
+    /// gate needs no lock and no second lookup.
+    #[cfg(feature = "log-disk")]
     disk: [Filter; CATEGORY_COUNT],
     text: Filter,
     ring: Filter,
@@ -308,8 +335,18 @@ impl LogHandle {
     /// the record is delivered: getting the widening right here is what makes
     /// three consumers cost no more than one.
     pub fn enabled(&self, category: Category, level: Level) -> bool {
-        let index = category as usize;
-        self.disk[index].keeps(level) || self.text.keeps(level) || self.ring.keeps(level)
+        // The one per-category floor belongs to the segment, so a build without
+        // one has nothing to index: the category is then only in the signature
+        // because callers should not have to care which build this is.
+        #[cfg(feature = "log-disk")]
+        let disk = self.disk[category as usize].keeps(level);
+        #[cfg(not(feature = "log-disk"))]
+        let disk = {
+            let _ = category;
+            false
+        };
+
+        disk || self.text.keeps(level) || self.ring.keeps(level)
     }
 
     /// True when the *text view* would render a record at this level. Its own
@@ -409,6 +446,7 @@ fn start<S: writer::BatchSink + 'static>(
     let handle = LogHandle {
         tx,
         counters: Arc::clone(&counters),
+        #[cfg(feature = "log-disk")]
         disk: settings.disk,
         text: settings.text,
         ring: settings.ring,
@@ -430,10 +468,32 @@ fn start<S: writer::BatchSink + 'static>(
     Ok(handle)
 }
 
-/// Starts the subsystem: opens today's segment under `dir` and the writer task
-/// behind it, or reports why it could not.
+/// Where the on-disk sink writes, and how.
 ///
-/// `dir` is the only optional part. Without one the records go nowhere but the
+/// A wrapper rather than two more parameters on [`init`], because the storage
+/// policy types live behind the `log-disk` feature and the caller that starts
+/// the subsystem should not have to know whether this build has a sink at all.
+#[cfg(feature = "log-disk")]
+#[derive(Clone, Debug)]
+pub struct Disk {
+    /// Directory holding one `<date>.redb` per UTC day.
+    pub dir: PathBuf,
+    /// Compression, durability and retention for those segments.
+    pub options: storage::Options,
+}
+
+/// The sink a build without the `log-disk` feature does not have — see the
+/// variant with fields above. It has no public constructor, so `None` is the
+/// only value [`init`] can be given in such a build; it exists so that the call
+/// has one shape whether or not the feature is there.
+#[cfg(not(feature = "log-disk"))]
+#[derive(Clone, Debug)]
+pub struct Disk(());
+
+/// Starts the subsystem: opens today's segment if there is a [`Disk`], and the
+/// writer task behind it, or reports why it could not.
+///
+/// `disk` is the only optional part. Without one the records go nowhere but the
 /// text view and the ring — the pipeline itself is unconditional, because the
 /// text a human reads is a projection of it and a run without a segment is
 /// still a run somebody has to be able to read.
@@ -447,17 +507,18 @@ fn start<S: writer::BatchSink + 'static>(
 /// is a backoff and a warning.
 ///
 /// Must be called from within a Tokio runtime — the writer is a spawned task.
-pub fn init(
-    dir: Option<&Path>,
-    settings: Settings,
-    options: storage::Options,
-) -> Result<Arc<LogHandle>, LogError> {
-    let handle = match dir {
-        Some(dir) => {
-            let sink = storage::FileSink::open(dir, options)?;
-            start(sink, settings)?
-        }
+pub fn init(settings: Settings, disk: Option<Disk>) -> Result<Arc<LogHandle>, LogError> {
+    #[cfg(feature = "log-disk")]
+    let handle = match disk {
+        Some(disk) => start(storage::FileSink::open(&disk.dir, disk.options)?, settings)?,
         None => start(writer::MemorySink, settings)?,
+    };
+    #[cfg(not(feature = "log-disk"))]
+    let handle = {
+        // Nothing outside this crate can build the `Disk` this arm would need,
+        // which is the point: without the feature there is no sink to hand over.
+        let _ = disk;
+        start(writer::MemorySink, settings)?
     };
 
     let handle = Arc::new(handle);

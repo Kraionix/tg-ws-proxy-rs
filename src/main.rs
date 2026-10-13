@@ -22,6 +22,7 @@ use tracing_subscriber::registry::LookupSpan;
 
 use tg_ws_proxy_rs::config::Config;
 use tg_ws_proxy_rs::direct;
+#[cfg(feature = "log-disk")]
 use tg_ws_proxy_rs::dump;
 use tg_ws_proxy_rs::log::schema::ShutdownSignal;
 use tg_ws_proxy_rs::server::{self, RunError};
@@ -34,7 +35,9 @@ async fn main() {
     // for it — no rustls provider, no `tracing` subscriber, no runtime work —
     // because reading a segment is a file operation with a JSON answer, and a
     // router that asked "what is on the stick" should not start a proxy to
-    // find out.
+    // find out. The verbs themselves are in a build with the `log-disk`
+    // feature, which is the only one that has segments to read.
+    #[cfg(feature = "log-disk")]
     if let Some(command) = &config.command {
         let code = match dump::run(command) {
             std::process::ExitCode::SUCCESS => 0,

@@ -21,7 +21,9 @@ use tokio::sync::{mpsc, watch};
 
 use super::schema::{Category, Event, Level, LogBatch, LogOverflow, LogRecord, build_batch};
 use super::view::View;
-use super::{CATEGORY_COUNT, Counters, Filter, Settings, now_ns};
+#[cfg(feature = "log-disk")]
+use super::{CATEGORY_COUNT, Filter};
+use super::{Counters, Settings, now_ns};
 
 /// Where a finished batch goes.
 ///
@@ -50,7 +52,12 @@ impl BatchSink for MemorySink {
 /// A sink refused a batch. The records in it are lost — the sink's own retry
 /// and backoff policy belongs to the storage layer, which is the only thing
 /// that knows whether waiting would help.
+///
+/// Every variant but the one the tests raise is constructed by that storage
+/// layer, so a build without the `log-disk` feature has no producer for them:
+/// the type is still needed for [`BatchSink`]'s signature.
 #[derive(Debug)]
+#[cfg_attr(not(feature = "log-disk"), allow(dead_code))]
 pub(crate) enum WriterError {
     /// Sink-side I/O: a directory that cannot be created, a volume that is gone.
     Io(std::io::Error),
@@ -159,9 +166,10 @@ struct Task<S> {
     writer: Writer<S>,
     counters: Arc<Counters>,
     /// The segment's own filter, indexed by category. The producer gate is the
-    /// union of the three consumers' policies, so a record can reach this task
-    /// that the segment does not want: the text view or the ring asked for it,
-    /// and this is where the disk policy becomes exact.
+    /// union of the consumers' policies, so a record can reach this task that
+    /// the segment does not want: the text view or the ring asked for it, and
+    /// this is where the disk policy becomes exact.
+    #[cfg(feature = "log-disk")]
     disk: [Filter; CATEGORY_COUNT],
     failures: u64,
     overflow_window: Instant,
@@ -184,6 +192,7 @@ impl<S: BatchSink> Task<S> {
     /// which `prost` preserves as an integer — is kept rather than dropped: the
     /// filter exists to keep the file small, not to lose records it cannot
     /// classify.
+    #[cfg(feature = "log-disk")]
     fn keeps(&self, record: &LogRecord) -> bool {
         let Some(filter) = self.disk.get(record.category as usize) else {
             return false;
@@ -192,6 +201,15 @@ impl<S: BatchSink> Task<S> {
             Ok(level) => filter.keeps(level),
             Err(_) => true,
         }
+    }
+
+    /// A build without the `log-disk` feature has no segment to filter for: the
+    /// sink under this task is the memory one, and the writer batches whatever
+    /// reached the channel. What dropped a record was the producer gate — the
+    /// text view's floor and the ring's — before it ever got here.
+    #[cfg(not(feature = "log-disk"))]
+    fn keeps(&self, _record: &LogRecord) -> bool {
+        true
     }
 
     /// Takes a record the view has already seen: buffered for the segment when
@@ -286,6 +304,7 @@ pub(super) async fn run<S: BatchSink + 'static>(
     let mut task = Task {
         writer: Writer::new(sink, settings.batch_max),
         counters,
+        #[cfg(feature = "log-disk")]
         disk: settings.disk,
         failures: 0,
         overflow_window: Instant::now(),

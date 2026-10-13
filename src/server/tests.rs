@@ -1,3 +1,7 @@
+//! The one test here reads a segment back, so the file needs the sink that
+//! writes one: without the `log-disk` feature there is nothing to assert on.
+#![cfg(feature = "log-disk")]
+
 use super::*;
 
 use clap::Parser;
@@ -28,7 +32,7 @@ async fn the_domain_list_records_where_it_came_from() {
     ])
     .expect("the fixture parses");
 
-    let handle = log::init(Some(&dir), config.log_settings(), config.log_options())
+    let handle = log::init(config.log_settings(), config.log_disk())
         .expect("a writable temp dir accepts a segment");
 
     log_domain_list(

@@ -170,6 +170,7 @@ async fn check_listener_mode_stops_with_the_check_verdict() {
 
 /// The wiring stage's end-to-end: `--log-dir` starts the sink, the segment
 /// exists before the first record is written, and a clean stop leaves it there.
+#[cfg(feature = "log-disk")]
 #[tokio::test]
 async fn a_log_dir_gets_todays_segment() {
     let dir = std::env::temp_dir().join(format!("tgws-server-log-{}", std::process::id()));
@@ -232,6 +233,7 @@ async fn a_log_dir_gets_todays_segment() {
 
 /// A `--log-dir` this process cannot write to is a startup error rather than a
 /// silent run without logs, and the message has to name the path it tried.
+#[cfg(feature = "log-disk")]
 #[tokio::test]
 async fn an_unusable_log_dir_refuses_startup() {
     let blocker = std::env::temp_dir().join(format!("tgws-log-blocker-{}", std::process::id()));

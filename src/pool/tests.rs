@@ -1,8 +1,11 @@
 use super::*;
 
+#[cfg(feature = "log-disk")]
 use clap::Parser;
 
+#[cfg(feature = "log-disk")]
 use crate::log::schema::ErrorCode;
+#[cfg(feature = "log-disk")]
 use tokio_tungstenite::MaybeTlsStream;
 
 #[test]
@@ -66,6 +69,7 @@ async fn a_cloudflare_prefetch_burst_spawns_one_refill_task() {
 /// The attribute is the whole point: a refill is spawned from whichever
 /// connection happened to arrive first, and a record that inherited that
 /// connection's id would read as if the session had done the dialling.
+#[cfg(feature = "log-disk")]
 #[tokio::test]
 async fn a_miss_is_recorded_against_the_pool_rather_than_the_caller() {
     let dir = std::env::temp_dir().join(format!("tgws-pool-events-{}", std::process::id()));
@@ -87,7 +91,7 @@ async fn a_miss_is_recorded_against_the_pool_rather_than_the_caller() {
     .unwrap()
     .with_defaults();
 
-    let handle = crate::log::init(Some(&dir), config.log_settings(), config.log_options())
+    let handle = crate::log::init(config.log_settings(), config.log_disk())
         .expect("a writable temp dir accepts a segment");
     let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
     let pool = Arc::new(
@@ -140,6 +144,7 @@ async fn a_miss_is_recorded_against_the_pool_rather_than_the_caller() {
 /// A local WebSocket pair, for the pool entries these tests need a real
 /// connection for: the pool holds `TgWsStream`s, and a `PoolDiscard` is about
 /// what happens to one of them.
+#[cfg(feature = "log-disk")]
 async fn ws_pair() -> (TgWsStream, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -166,6 +171,7 @@ async fn ws_pair() -> (TgWsStream, tokio::task::JoinHandle<()>) {
 /// thrown away says which one and why, a warm-up says how much the pool is
 /// worth, and a refill that dialled into nothing carries the class it failed
 /// with.
+#[cfg(feature = "log-disk")]
 #[tokio::test]
 async fn discards_warmup_and_refills_are_recorded() {
     use crate::log::schema::{DiscardReason, WarmupComplete};
@@ -189,7 +195,7 @@ async fn discards_warmup_and_refills_are_recorded() {
     .unwrap()
     .with_defaults();
 
-    let handle = crate::log::init(Some(&dir), config.log_settings(), config.log_options())
+    let handle = crate::log::init(config.log_settings(), config.log_disk())
         .expect("a writable temp dir accepts a segment");
     let pool = Arc::new(
         WsPool::with_runtime(

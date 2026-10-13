@@ -7,6 +7,11 @@
 //! the documented JSON Lines shape, and that pointing them at a segment leaves
 //! that segment byte for byte as it was — the property the whole verb exists
 //! for, since an operator reads the archive on the stick they archive.
+//!
+//! Both verbs, and the module behind them, are in a build with the `log-disk`
+//! feature: without it there is no segment to reach from the command line.
+
+#![cfg(feature = "log-disk")]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -62,6 +67,8 @@ fn write_segment(dir: &Path) -> String {
         "tg-ws-proxy",
         "--secret",
         &"ab".repeat(32),
+        "--log-dir",
+        dir.to_str().expect("a utf-8 temp path"),
         "--log-level",
         "debug",
         "--text-log",
@@ -69,7 +76,7 @@ fn write_segment(dir: &Path) -> String {
     ])
     .expect("the fixture config parses");
     let handle = runtime
-        .block_on(async { log::init(Some(dir), config.log_settings(), config.log_options()) })
+        .block_on(async { log::init(config.log_settings(), config.log_disk()) })
         .expect("the sink starts");
 
     for conn in 1..=3u64 {

@@ -1,12 +1,18 @@
+#[cfg(feature = "log-disk")]
 use std::path::Path;
 use std::time::Duration;
 
 use clap::Parser;
 use tg_ws_proxy_rs::config::{Config, UpstreamTier};
 use tg_ws_proxy_rs::log::Filter;
-use tg_ws_proxy_rs::log::schema::{Category, Level};
+#[cfg(feature = "log-disk")]
+use tg_ws_proxy_rs::log::schema::Category;
+use tg_ws_proxy_rs::log::schema::Level;
+#[cfg(feature = "log-disk")]
 use tg_ws_proxy_rs::log::storage::{Compression, DurabilityMode};
-use tg_ws_proxy_rs::log::view::{TEXT_RING_DEFAULT, TEXT_RING_MAX, TEXT_RING_MIN, TextTarget};
+#[cfg(feature = "log-disk")]
+use tg_ws_proxy_rs::log::view::TEXT_RING_DEFAULT;
+use tg_ws_proxy_rs::log::view::{TEXT_RING_MAX, TEXT_RING_MIN, TextTarget};
 
 #[test]
 fn ee_secret_supplies_inbound_faketls_domain_and_key() {
@@ -789,14 +795,24 @@ fn split_cli_args_rejects_trailing_backslash() {
 
 // ── Structured log sink ─────────────────────────────────────────────────────
 
+/// A config parsed from `extra` alone: the pipeline flags — the text view's,
+/// the ring's and the writer's — that every build has.
+fn base_config(extra: &[&str]) -> Config {
+    let mut args = vec!["tg-ws-proxy"];
+    args.extend_from_slice(extra);
+    Config::try_parse_from(args).unwrap().with_defaults()
+}
+
 /// A config with the sink switched on: every other flag under test is inert
 /// without `--log-dir`.
+#[cfg(feature = "log-disk")]
 fn log_config(extra: &[&str]) -> Config {
     let mut args = vec!["tg-ws-proxy", "--log-dir", "/var/log/tg-ws-proxy"];
     args.extend_from_slice(extra);
     Config::try_parse_from(args).unwrap().with_defaults()
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn the_sink_is_disabled_until_it_is_given_a_directory() {
     let cfg = Config::try_parse_from(["tg-ws-proxy"])
@@ -805,6 +821,7 @@ fn the_sink_is_disabled_until_it_is_given_a_directory() {
     assert_eq!(cfg.log_dir, None);
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn structured_log_defaults_are_the_documented_ones() {
     let cfg = log_config(&[]);
@@ -835,6 +852,7 @@ fn structured_log_defaults_are_the_documented_ones() {
     assert_eq!(options.retention_days, 7);
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn the_global_log_level_is_the_floor_every_category_starts_from() {
     let cfg = log_config(&["--log-level", "warn"]);
@@ -846,6 +864,7 @@ fn the_global_log_level_is_the_floor_every_category_starts_from() {
     );
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn a_log_category_override_wins_over_the_global_level() {
     let cfg = log_config(&[
@@ -863,6 +882,7 @@ fn a_log_category_override_wins_over_the_global_level() {
     assert_eq!(disk[Category::Session as usize], Filter::at(Level::Warn));
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn log_categories_can_be_joined_for_a_single_valued_env_var() {
     // `TG_LOG_CATEGORY` can only carry one value, so pairs are joined with `+`;
@@ -873,6 +893,7 @@ fn log_categories_can_be_joined_for_a_single_valued_env_var() {
     assert_eq!(disk[Category::Tls as usize], Filter::at(Level::Error));
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn an_unknown_log_category_or_level_is_refused() {
     for value in [
@@ -908,12 +929,21 @@ fn the_log_batch_and_flush_bounds_are_enforced_at_parse_time() {
 
 #[test]
 fn the_bounds_themselves_are_accepted() {
-    let cfg = log_config(&["--log-batch-max", "16", "--log-flush-interval", "86400"]);
+    let cfg = Config::try_parse_from([
+        "tg-ws-proxy",
+        "--log-batch-max",
+        "16",
+        "--log-flush-interval",
+        "86400",
+    ])
+    .unwrap()
+    .with_defaults();
     let settings = cfg.log_settings();
     assert_eq!(settings.batch_max, 16);
     assert_eq!(settings.flush_interval, Duration::from_secs(86400));
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn durability_and_retention_reach_the_storage_options() {
     let cfg = log_config(&[
@@ -934,6 +964,7 @@ fn durability_and_retention_reach_the_storage_options() {
 /// The compressed mode is a build-time feature, and the flag has to offer
 /// exactly what the binary can do: with the feature it parses, without it the
 /// value is not among the possible ones rather than accepted and ignored.
+#[cfg(feature = "log-disk")]
 #[cfg(feature = "log-zstd")]
 #[test]
 fn the_zstd_mode_is_offered_when_it_is_compiled_in() {
@@ -941,7 +972,9 @@ fn the_zstd_mode_is_offered_when_it_is_compiled_in() {
     assert_eq!(cfg.log_options().compress, Compression::ZstdL1);
 }
 
-#[cfg(not(feature = "log-zstd"))]
+/// `--log-compress` itself is in the build only with `log-disk`, so this is the
+/// one case that needs both features absent.
+#[cfg(all(feature = "log-disk", not(feature = "log-zstd")))]
 #[test]
 fn the_zstd_mode_is_refused_when_it_is_not_compiled_in() {
     let err = Config::try_parse_from(["tg-ws-proxy", "--log-compress", "zstd-l1"])
@@ -957,6 +990,7 @@ fn the_zstd_mode_is_refused_when_it_is_not_compiled_in() {
 
 /// The schema spells the level names and so do the flags; a record that says
 /// `info` has to be the same level as `--log-level info`.
+#[cfg(feature = "log-disk")]
 #[test]
 fn every_level_name_the_schema_prints_is_one_the_flag_parses() {
     for level in [Level::Debug, Level::Info, Level::Warn, Level::Error] {
@@ -974,6 +1008,7 @@ fn every_level_name_the_schema_prints_is_one_the_flag_parses() {
 
 // ── The text view's own flags ──────────────────────────────────────────────
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn the_text_log_and_the_ring_have_their_own_floors() {
     let cfg = log_config(&[
@@ -1014,7 +1049,7 @@ fn the_text_log_names_a_stream_or_a_path() {
         // somebody will find, and a silently disabled view is not.
         ("sterr", TextTarget::File("sterr".into())),
     ] {
-        let cfg = log_config(&["--text-log", spec]);
+        let cfg = base_config(&["--text-log", spec]);
         assert_eq!(cfg.log_settings().text_log, expected, "{spec}");
     }
 }
@@ -1064,26 +1099,28 @@ fn check_mode_keeps_the_text_log_off() {
 fn the_legacy_console_flags_still_map_onto_the_text_log() {
     // `--verbose` and `--quiet` are what the Android app and older scripts
     // pass; the new flags are what they mean, and they win when both are given.
-    let quiet_cfg = log_config(&["--quiet"]);
+    let quiet_cfg = base_config(&["--quiet"]);
     assert_eq!(quiet_cfg.log_settings().text_log, TextTarget::Off);
 
-    let verbose_cfg = log_config(&["--verbose"]);
+    let verbose_cfg = base_config(&["--verbose"]);
     assert_eq!(verbose_cfg.log_settings().text, Filter::at(Level::Debug));
 
-    let both = log_config(&["--verbose", "--text-level", "warn"]);
+    let both = base_config(&["--verbose", "--text-level", "warn"]);
     assert_eq!(both.log_settings().text, Filter::at(Level::Warn));
 
-    let both_targets = log_config(&["--quiet", "--text-log", "stdout"]);
+    let both_targets = base_config(&["--quiet", "--text-log", "stdout"]);
     assert_eq!(both_targets.log_settings().text_log, TextTarget::Stdout);
 }
 
 #[test]
 fn the_text_log_is_written_even_without_a_log_directory() {
     // The pipeline is unconditional: `--log-dir` decides where the records are
-    // *stored*, not whether there are any.
+    // *stored*, not whether there are any — and in a build without the on-disk
+    // sink there is no such flag, only the text view and the ring.
     let cfg = Config::try_parse_from(["tg-ws-proxy", "--text-log", "stdout"])
         .unwrap()
         .with_defaults();
+    #[cfg(feature = "log-disk")]
     assert_eq!(cfg.log_dir, None);
     assert_eq!(cfg.log_settings().text_log, TextTarget::Stdout);
 }
