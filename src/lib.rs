@@ -2,6 +2,7 @@ pub mod check;
 pub mod config;
 pub mod crypto;
 pub mod default_domains;
+pub mod dump;
 pub mod faketls;
 pub mod limits;
 pub mod log;

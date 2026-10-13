@@ -192,36 +192,61 @@ session cannot be read off its end. The pool's misses and refills are not printe
 size is rounded: the same questions have no answer there, however long the file is.
 
 The price of that is stated once, below: the exact numbers live in the segment, and reading a segment
-means the repository's test reader. The text log is what you read on the device; the segment is what you
-count.
+means the reader in the binary (`probe-segment`, `dump-segment`). The text log is what you read on the
+device; the segment is what you count.
 
 ## Reading a segment back
 
-There is **no CLI reader** in the binary, deliberately: reading a segment is a post-mortem operation,
-not something the proxy needs at runtime, and the reader that ships with the repository is enough to
-get a record-for-record dump:
+The binary reads its own segments. Two verbs, both answering in JSON Lines so `jq`, a spreadsheet or
+`pandas.read_json` can take it from there:
 
 ```sh
-TG_DUMP_DIR=/tmp/tgws-logs TG_DUMP_DATE=2026-10-11 \
-  cargo test --features log-zstd --lib dump_segment -- --ignored --nocapture
+# What is on the stick: one object per day file, no records.
+tg-ws-proxy probe-segment /mnt/usb/tgws-logs
+```
+```json
+{"batches":1020,"bytes":1298432,"conns":2510,"date":"2026-10-13","error":null,
+ "events":{"PoolRefill":1736,"SessionClosed":2489,"SessionOpened":2510,…},
+ "file":"2026-10-13.redb","first_ns":1791855111473720307,"last_ns":1791891131980655208,
+ "records":12986,"sha256":"b611b048…","type":"segment"}
 ```
 
+```sh
+# The records themselves: a batch object, then its records.
+tg-ws-proxy dump-segment /mnt/usb/tgws-logs --date 2026-10-13 --out day.jsonl
 ```
-batch ts=1791735882145978319 records=33 conns=[0, 1, 2, …]
-  seq=1 conn=0 level=2 category=9 Some(StartupSummary(StartupSummary { version: "2.5.4-struct-logging", …
-  seq=2 conn=2 level=1 category=1 Some(SessionOpened(SessionOpened { peer: Some(Peer { addr: [192, 168, …
+```json
+{"conns":[0,1,…],"date":"2026-10-13","dc_mask":34,"records":33,"type":"batch",…}
+{"category":"config","conn":0,"date":"2026-10-13","event":{"count":20,"event":"DomainListFetched",…},
+ "level":"info","seq":1,"ts_ns":1791855111473720307,"type":"record"}
 ```
+
+Field names are the schema's own (`src/log/schema.rs`), an enum prints under its variant name
+(`Cfworker`, `TlsTimeout`, `Upstream`), and a discriminant this build has no name for stays the raw
+number rather than failing the read — so a later binary's segment still dumps. `--records-only` leaves
+the batch lines out; without `--date` the whole directory is dumped in date order.
+
+**Reading does not write.** `redb` has no read-only mode: opening a database opens the file for
+writing, and the recovery pass on the way in writes the commit slots it examined. Measured on the
+reference router: about 2 % of a 500 KB segment's bytes differed after every read, from offset 10 (the
+database header) down into the pages. The reader therefore copies the segment first and gives `redb`
+the copy, which is deleted on the way out — the archive keeps the hash it was archived with, and the
+copy is where a repair of a half-written file happens. The copy is made beside the segment, falling
+back to `TMPDIR` if that directory cannot be written to; both names are hidden and do not look like
+segments, so a sweep or a `probe-segment` ignores them. A read costs the segment's size in free space
+while it runs.
 
 A segment written with `zstd-l1` needs a build that has the codec, so keep the `log-zstd` feature in
-the same configuration as the binary that wrote it. Field numbers, event tags and the on-disk format
-are fixed by `src/log/schema.rs`; a later binary reads an older segment. A segment written under a
-different schema version is refused at startup rather than appended to, and the message names both
-hashes — move the old day files aside and restart.
+the same configuration as the binary that wrote it; a build without it refuses a compressed segment by
+name rather than half-reading it. A segment written under a different schema version is refused at
+startup rather than appended to, and the message names both hashes — move the old day files aside and
+restart.
 
-Refusing is not the same as leaving the file alone: the check runs after `redb` has opened it, and about
-2 % of a 500 KB segment's bytes differed afterwards — from offset 10, which is the database header, down
-into the pages. The reader opens the file the same way, so reading a copy is not a promise that the copy
-is untouched, which matters when the copy is the only one and it lives on flash.
+Reading a segment is also the only way to see the events the text view never prints — `pool_hit`,
+`pool_miss`, `pool_refill`, `tier_attempt`, `session_opened` are debug, and `--text-level info` keeps
+them out of the file on the router's flash. Measured on the reference router, for the run of
+2026-10-13 up to 11:32 UTC: 12 986 records in the segment, 6 335 lines in the text log (6 319 info,
+16 warn, no debug) — the other half is the ladder's own decisions.
 
 ## Clocks, runs and connection ids
 
@@ -229,10 +254,25 @@ Three facts about a router that the log cannot fix, only record:
 
 - **There is no RTC.** A freshly booted OpenWrt router sets the clock from the newest file in `/etc`
   and `ntpd` corrects it a couple of minutes later — by minutes, sometimes by hours (measured on the
-  reference router: +4 h 55 m, and +8 h 18 m the day before). Records carry wall-clock time, so the
-  jump is visible as timestamps that leap forward or back while `seq` keeps counting: the sequence is
-  monotonic, the clock is not. A record written before the correction is not wrong; it is written in
-  the clock of that moment, and the run's first records can land in the previous day's file.
+  reference router: +4 h 55 m, +8 h 18 m the day before, and **+10 h 30 m** on 2026-10-13). Records
+  carry wall-clock time, so the jump is visible as timestamps that leap forward or back while `seq`
+  keeps counting: the sequence is monotonic, the clock is not. A record written before the correction
+  is not wrong; it is written in the clock of that moment, and the run's first records land in the
+  previous day's file — the file a batch goes to is the day the clock says, not the day the records
+  are from, and a rotation forward is never undone.
+
+  Measured case, reference router, boot at 01:31:15 UTC on 2026-10-13: the clock came up reading
+  2026-10-12 15:00:47, the sink opened `2026-10-12.redb`, the first seven records (`domain_list_fetched`
+  failing with `tcp_connect`, `startup_summary`, four `pool_refill`s, `warmup_complete` — the boot had
+  no network yet) were written there, and at 01:31:51 `ntpd` stepped the clock forward 630 minutes
+  (`crond` logged `time disparity of 630 minutes detected`). The next batch rotated to `2026-10-13.redb`,
+  which therefore starts at `seq = 8`. Nothing was lost: the seven records are the tail of the previous
+  day's file, stamped 15:00:57–15:01:00 on the 12th. Read a day file by `probe-segment`, not by its name:
+  the object carries the time span it really covers (`first_ns`/`last_ns`).
+
+  What that costs in the other direction is worth knowing: the retention sweep is by file name, so a
+  clock far enough *behind* deletes the segment this run just wrote on the first rotation, and a clock
+  in the *future* sweeps the whole directory at startup.
 - **Two runs in one day file are not distinguishable by the file.** `conn_id` numbers sessions from
   one at every start, so `conn_id = 7` exists in both. `startup_summary` is what separates them: it is
   written once per run, and the text view uses it to forget the client addresses of the previous run.
@@ -280,6 +320,24 @@ x86_64), the Apple targets (both architectures and the universal build) and `x86
 the armv7 and MIPS targets ship without it, and `--log-compress` there offers `none` alone. A build
 without the codec cannot read a
 compressed segment.
+
+**The reader verbs have their own price**, and it is paid whether or not anyone runs them: a binary
+that only *wrote* segments never linked the decode half of `prost` or of zstd, and `--gc-sections`
+pruned both. Measured with this profile, the same source built with and without `probe-segment` and
+`dump-segment`:
+
+| Target | without the verbs | with them | difference |
+|---|---|---|---|
+| `x86_64-unknown-linux-gnu`, `--features log-zstd` | 6 146 776 B | 6 732 504 B | **+586 KB (+9.5 %)** |
+| `x86_64-unknown-linux-gnu`, no codec | 5 592 816 B | 5 785 184 B | +192 KB (+3.4 %) |
+| `aarch64-unknown-linux-musl`, `--features log-zstd` | 5 228 120 B | 5 707 360 B | **+479 KB (+9.2 %)** |
+
+Almost all of the difference on a codec build is the zstd **decompressor** (≈ 394 KB of the 586 KB on
+x86-64): a segment written with `zstd-l1` cannot be counted without it. The rest is the `prost` decode
+of all 22 events, the JSON writer (hand-written — `serde_json` would have been another dependency tree
+in the shipped binary) and clap's subcommand machinery. A build without the codec pays a third of that
+and can still read an uncompressed segment. On the reference router's aarch64 target the binary goes
+from 5.0 MiB to 5.4 MiB, against a 128 MiB flash and a 490 MiB `/tmp`.
 
 Volume, measured rather than estimated: a record is **~44 B**, a client connection writes about **one**
 of them at the default level and about **four** at `--log-level debug`, and an idle process writes the
@@ -368,10 +426,12 @@ shown here. See [OpenWrtPackage.md](OpenWrtPackage.md).
 
 ## Known gaps
 
-- No CLI reader, as above — reading means the repository's test reader.
+- The reader loads a whole day into memory, which is the right shape for one segment's post-mortem and
+  the wrong one for a month of them; `iter_batches` is where that gets fixed.
 - The midnight rollover (closing one day's segment and opening the next) is covered by unit tests; the
   retention sweep that deletes older segments is covered by unit tests *and* was verified on the
-  reference router by seeding two dated segments and restarting.
+  reference router by seeding two dated segments and restarting. What the sweep does with a clock that
+  is far behind or ahead is documented above and is a hazard rather than a promise.
 - **The Android app's on-screen log is behind this rework.** Its Log panel and logcat are fed by the
   `tracing` layer, which now carries only other crates' lines, so the panel shows nothing of the
   proxy's own. The app still starts, parses its arguments and shows the `tg://` link (that arrives

@@ -22,16 +22,31 @@ use tracing_subscriber::registry::LookupSpan;
 
 use tg_ws_proxy_rs::config::Config;
 use tg_ws_proxy_rs::direct;
+use tg_ws_proxy_rs::dump;
 use tg_ws_proxy_rs::log::schema::ShutdownSignal;
 use tg_ws_proxy_rs::server::{self, RunError};
 
 #[tokio::main]
 async fn main() {
+    let config = Config::from_args();
+
+    // A reader verb instead of the server: nothing below this line is set up
+    // for it — no rustls provider, no `tracing` subscriber, no runtime work —
+    // because reading a segment is a file operation with a JSON answer, and a
+    // router that asked "what is on the stick" should not start a proxy to
+    // find out.
+    if let Some(command) = &config.command {
+        let code = match dump::run(command) {
+            std::process::ExitCode::SUCCESS => 0,
+            _ => 1,
+        };
+        std::process::exit(code);
+    }
+
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls ring CryptoProvider");
 
-    let config = Config::from_args();
     init_foreign_logging();
 
     match server::run(config, shutdown_signal()).await {

@@ -150,6 +150,10 @@ libc = "0.2"
 
 [dev-dependencies]
 rcgen = "0.12"
+# The segment reader prints JSON Lines, and a test that reads its own output
+# back with the format's own parser is worth more than one that greps it. Test
+# only: nothing here is linked into the binary that ships.
+serde_json = "1"
 
 [profile.release]
 opt-level = 3

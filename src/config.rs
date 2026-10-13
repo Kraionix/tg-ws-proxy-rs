@@ -1033,6 +1033,51 @@ pub struct Config {
 
     #[arg(skip)]
     normalized_listen_faketls_domain: OnceLock<Option<String>>,
+
+    /// A verb instead of the server, for reading a day segment back.
+    ///
+    /// A subcommand rather than another flag because it shares nothing with
+    /// serving: `--check` is a mode of the proxy and needs the proxy's own
+    /// configuration, while a segment is read from a directory and answered in
+    /// JSON. No subcommand means "serve", which is what keeps every existing
+    /// invocation — and every `TG_*` fallback above — working unchanged.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// What the binary does instead of serving.
+#[derive(clap::Subcommand, Clone, Debug)]
+pub enum Command {
+    /// Report what each segment in a directory holds, without printing records.
+    ///
+    /// One JSON object per `<date>.redb`: its size, SHA-256, batch and record
+    /// counts, the connections it mentions, the time span it covers and how
+    /// many of each event it holds. This is the cheap answer to "what is on the
+    /// stick", and the one that runs on a router.
+    ProbeSegment {
+        /// Directory holding `<date>.redb` segments, e.g. `/mnt/usb/tgws-logs`.
+        dir: PathBuf,
+    },
+    /// Print one JSON object per record, and one per batch above them.
+    ///
+    /// JSON Lines on stdout, or into `--out`. A batch object carries the
+    /// header's masks and connection list; a record object carries its
+    /// timestamp, connection, sequence number, level, category and the event
+    /// with the schema's own field names.
+    DumpSegment {
+        /// Directory holding `<date>.redb` segments.
+        dir: PathBuf,
+        /// Only this day, spelled as the segment's file stem (`2026-10-13`).
+        /// Omitted, every segment in the directory is dumped in date order.
+        #[arg(long)]
+        date: Option<String>,
+        /// Write here instead of stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Records only: leave out the batch lines.
+        #[arg(long)]
+        records_only: bool,
+    },
 }
 
 /// Split a shell-style argument line into tokens.
