@@ -477,18 +477,19 @@ impl Drop for Segment {
 
 // ── Reading back ───────────────────────────────────────────────────────────
 //
-// Nothing in the binary reads a segment: `--log-dir` only writes. The
-// whole-day reader is public all the same, because the program that reads a
-// segment back is an operator's tool rather than this binary — the rest of this
-// file stays crate-private, and anything unused in here is still a warning.
+// What `tg-ws-proxy probe-segment` and `tg-ws-proxy dump-segment` print, and
+// what the schema check reads. A segment is read from a private copy rather
+// than from the archive itself — see [`ReadCopy`] — and the rest of this file
+// stays crate-private: anything unused in here is still a warning.
 
 /// Reads a whole day back, in time order.
 ///
 /// Loads the day into memory, which is the right shape for a post-mortem of one
 /// segment and the wrong one for a reader that scans a month — the reading
-/// iteration is where that gets fixed.
+/// iteration is where that gets fixed. The file this reads is a copy; the
+/// segment itself is not opened at all.
 pub fn iter_batches(dir: &Path, date: &str) -> Result<Vec<LogBatch>, LogError> {
-    let (db, transaction) = open_for_read(dir, date)?;
+    let (db, transaction, copy) = open_for_read(dir, date)?;
     let table = match transaction.open_table(MAIN) {
         Ok(table) => table,
         // redb creates a table on its first write, so a segment that recorded
@@ -507,7 +508,12 @@ pub fn iter_batches(dir: &Path, date: &str) -> Result<Vec<LogBatch>, LogError> {
         let (_, value) = entry.map_err(|error| LogError::Segment(error.to_string()))?;
         batches.push(decode(value.value())?);
     }
+    // In this order, so the copy is the last thing holding the file: on Windows
+    // an open file cannot be deleted, and a read that left its copy behind
+    // would be a reader that writes after all.
+    drop(transaction);
     drop(db);
+    drop(copy);
     Ok(batches)
 }
 
@@ -518,7 +524,7 @@ pub(crate) fn iter_conn_batches(
     date: &str,
     conn_id: u64,
 ) -> Result<Vec<LogBatch>, LogError> {
-    let (db, transaction) = open_for_read(dir, date)?;
+    let (db, transaction, copy) = open_for_read(dir, date)?;
     let index = match transaction.open_table(BY_CONN) {
         Ok(index) => index,
         // No index means no batch was ever indexed, which means no records
@@ -548,7 +554,9 @@ pub(crate) fn iter_conn_batches(
             batches.push(decode(value.value())?);
         }
     }
+    drop(transaction);
     drop(db);
+    drop(copy);
     Ok(batches)
 }
 
@@ -556,7 +564,7 @@ pub(crate) fn iter_conn_batches(
 /// own before trusting anything else in the file.
 #[allow(dead_code)]
 pub(super) fn meta(dir: &Path, date: &str, key: &str) -> Result<Option<Vec<u8>>, LogError> {
-    let (db, transaction) = open_for_read(dir, date)?;
+    let (db, transaction, copy) = open_for_read(dir, date)?;
     let table = transaction
         .open_table(META)
         .map_err(|error| LogError::Segment(error.to_string()))?;
@@ -564,21 +572,106 @@ pub(super) fn meta(dir: &Path, date: &str, key: &str) -> Result<Option<Vec<u8>>,
         .get(key)
         .map_err(|error| LogError::Segment(error.to_string()))?
         .map(|guard| guard.value().to_vec());
+    drop(transaction);
     drop(db);
+    drop(copy);
     Ok(value)
 }
 
+/// A private copy of a segment, deleted when the read that made it is over.
+///
+/// # Why a copy
+///
+/// `redb` has no read-only mode: opening a database opens the file for writing,
+/// and the recovery pass that runs on the way in writes the commit slots it
+/// examined. Reading a segment therefore used to change it. Measured on the
+/// router's stick on 2026-10-13: `probe` of the same segment returned identical
+/// sizes and identical records every time, and a different SHA-256 every time.
+/// An archive that changes when it is read is not an archive — a hash taken
+/// before the read no longer describes the file, and a segment on a flash stick
+/// takes writes nobody asked for.
+///
+/// So the reader copies the file first and gives `redb` the copy. Whatever
+/// recovery writes lands in a file that is deleted on the way out. That is also
+/// the *better* recovery: a segment copied while its writer was mid-commit — the
+/// live day's file, which is exactly what an operator reads first — can be
+/// repaired, where a strictly read-only open could only refuse to read it.
+///
+/// # What it costs
+///
+/// The copy is the size of the segment, placed beside it so the read stays on
+/// the filesystem the operator pointed at (on the devices this ships to
+/// `TMPDIR` is RAM). A directory that cannot be written to falls back to
+/// `TMPDIR`, and one where neither works is an error rather than a read that
+/// quietly changed the file.
+struct ReadCopy {
+    path: PathBuf,
+}
+
+impl ReadCopy {
+    fn of(source: &Path, dir: &Path, date: &str) -> Result<Self, LogError> {
+        let pid = std::process::id();
+        // Both names keep the `.redb` out of the extension: the retention sweep
+        // and the readers that scan a directory for segments match on the file
+        // name, and a copy must not look like one.
+        let beside = dir.join(format!(".{date}{SEGMENT_SUFFIX}.read-{pid}"));
+        match fs::copy(source, &beside) {
+            Ok(_) => Ok(Self { path: beside }),
+            Err(beside_error) => {
+                // A segment that is not there at all is the common case, and the
+                // interesting one to report; the copy destination is not.
+                if beside_error.kind() == ErrorKind::NotFound {
+                    return Err(LogError::Segment(format!(
+                        "{}: no such segment",
+                        source.display()
+                    )));
+                }
+                let elsewhere = std::env::temp_dir().join(format!(
+                    "{}.{date}{SEGMENT_SUFFIX}.read-{pid}",
+                    env!("CARGO_PKG_NAME")
+                ));
+                match fs::copy(source, &elsewhere) {
+                    Ok(_) => Ok(Self { path: elsewhere }),
+                    Err(temp_error) => Err(LogError::Segment(format!(
+                        "cannot copy {} to read it: beside it: {beside_error}; in {}: \
+                         {temp_error} — a segment is read from a copy, because reading \
+                         it in place writes to it",
+                        source.display(),
+                        elsewhere.display()
+                    ))),
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ReadCopy {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(&self.path) {
+            crate::direct!(
+                "cannot remove the read copy {}: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+/// Opens a segment for reading, through a copy of it ([`ReadCopy`]).
 #[allow(dead_code)]
-fn open_for_read(dir: &Path, date: &str) -> Result<(Database, redb::ReadTransaction), LogError> {
+fn open_for_read(
+    dir: &Path,
+    date: &str,
+) -> Result<(Database, redb::ReadTransaction, ReadCopy), LogError> {
     let path = dir.join(format!("{date}{SEGMENT_SUFFIX}"));
+    let copy = ReadCopy::of(&path, dir, date)?;
     let db = Database::builder()
         .set_cache_size(CACHE_SIZE)
-        .open(&path)
+        .open(&copy.path)
         .map_err(|error| LogError::Segment(format!("{}: {error}", path.display())))?;
     let transaction = db
         .begin_read()
         .map_err(|error| LogError::Segment(error.to_string()))?;
-    Ok((db, transaction))
+    Ok((db, transaction, copy))
 }
 
 pub(super) fn encode(batch: &LogBatch, compress: Compression) -> Result<Vec<u8>, WriterError> {

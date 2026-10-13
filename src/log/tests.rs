@@ -2184,28 +2184,59 @@ fn a_truncated_segment_is_refused_rather_than_half_read() {
 }
 
 #[test]
-#[ignore = "prints a segment for a human to read; run with --ignored --nocapture"]
-fn dump_segment() {
-    let Some(dir) = std::env::var_os("TG_DUMP_DIR") else {
-        panic!("set TG_DUMP_DIR to the log directory to dump");
-    };
-    let dir = PathBuf::from(dir);
-    let date =
-        std::env::var("TG_DUMP_DATE").unwrap_or_else(|_| storage::day_name(storage::today()));
+fn a_missing_segment_is_reported_as_missing() {
+    let dir = TempDir::new("missing");
+    let error = storage::iter_batches(dir.path(), "2001-01-01").expect_err("nothing to read");
+    assert!(
+        error.to_string().contains("no such segment"),
+        "unexpected error: {error}"
+    );
+}
 
-    for batch in storage::iter_batches(&dir, &date).expect("readable") {
-        let header = batch.header.expect("header");
-        println!(
-            "batch ts={} records={} conns={:?}",
-            header.ts_first_ns, header.record_count, header.conn_ids
-        );
-        for record in &batch.records {
-            println!(
-                "  seq={} conn={} level={} category={} {:?}",
-                record.seq, record.conn_id, record.level, record.category, record.event
-            );
-        }
-    }
+#[test]
+fn reading_a_segment_leaves_its_bytes_alone() {
+    // The reader used to hand `redb` the archive itself, and `redb` opens a
+    // database read-write: every read rewrote bytes in it. Measured on the
+    // router's stick on 2026-10-13 — identical sizes, identical records, a
+    // different SHA-256 after every `probe`. A segment that changes when it is
+    // read is not an archive: a hash taken before the read stops describing the
+    // file, and a stick in a router takes writes nobody asked for.
+    let runtime = unpolled_runtime();
+    let dir = TempDir::new("read-only");
+    let date = storage::day_name(storage::today());
+
+    let handle = runtime
+        .block_on(async { init(Some(dir.path()), Settings::default(), Options::default()) })
+        .expect("the sink starts");
+    handle.emit(1, Category::Session, Level::Info, pool_hit(2));
+    runtime.block_on(handle.shutdown());
+
+    let path = dir.path().join(format!("{date}.redb"));
+    let before = fs::read(&path).expect("the segment exists");
+
+    let batches = storage::iter_batches(dir.path(), &date).expect("readable");
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.records.len())
+            .sum::<usize>(),
+        1
+    );
+    // Twice: a read that writes may write on the way in, on the way out, or
+    // both, and only the second read would notice the first one's edit.
+    storage::iter_batches(dir.path(), &date).expect("readable");
+
+    let after = fs::read(&path).expect("the segment still exists");
+    assert!(
+        before == after,
+        "reading the segment changed it: {} bytes before, {} after",
+        before.len(),
+        after.len()
+    );
+
+    // And the copy the read is made from goes with the read: the directory
+    // holds the segment and nothing else.
+    assert_eq!(dir.entries(), vec![format!("{date}.redb")]);
 }
 
 /// The connection counter is 32 bits wide, because the MIPS release targets
