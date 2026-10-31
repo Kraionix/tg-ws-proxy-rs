@@ -9,7 +9,7 @@ tools/sync-logreel.sh ../logreel
 
 | item | value |
 |---|---|
-| source commit | `e2051baede31ee03a84857d474a197a1e3b03b1a` |
+| source commit | `95dfa3debc4bc2919eaa2a11bfded9ff34d04bc6` |
 | source tree | `16b5b3acf49840623cc376462d0a76e07e829aca` |
 | version | `0.3.0` |
 | crates | `logreel`, `logreel-core`, `logreel-store`, `logreel-file` |
