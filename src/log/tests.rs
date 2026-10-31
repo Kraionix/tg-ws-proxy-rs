@@ -6,7 +6,7 @@ use prost::Message;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::schema::*;
-use super::view::TextTarget;
+use super::view::{TextSink, TextTarget, View};
 use super::writer::{BatchSink, Writer, WriterError};
 use super::*;
 
@@ -2405,4 +2405,57 @@ fn a_wrapped_connection_id_is_never_zero() {
     assert_eq!(counters.next_conn(), u64::from(u32::MAX));
     assert_eq!(counters.next_conn(), 1, "the wrap skips the reserved zero");
     assert_eq!(counters.next_conn(), 2);
+}
+
+/// The text projection, frozen for the migration to logreel.
+///
+/// One record per `oneof` variant, rendered through the view that shipped
+/// before the swap: the same 22 samples `every_event_variant_round_trips`
+/// uses, fed in order so the `[peer]` map is exercised as well as the lines.
+/// The file is a gate, not a fixture — the migration must not be allowed to
+/// change a single byte of it. Regenerate deliberately with
+/// `TG_GOLDEN_UPDATE=1 cargo test text_projection_matches_the_golden_corpus`.
+#[test]
+fn text_projection_matches_the_golden_corpus() {
+    let golden = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/text-golden.txt"
+    ));
+    let rendered =
+        std::env::temp_dir().join(format!("tgws-text-golden-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&rendered);
+
+    let sink = TextSink::open(&TextTarget::File(rendered.clone())).expect("the temp file opens");
+    // Both floors at the bottom: the sample set is the event table, not a
+    // filtering rule, so nothing may be dropped on level.
+    let mut view = View::with_sink(
+        sink,
+        Filter::at(Level::Debug),
+        Filter::at(Level::Debug),
+        256,
+    );
+    for (_, record) in samples() {
+        view.show(&record);
+    }
+    view.flush();
+
+    let got = std::fs::read_to_string(&rendered).expect("the view wrote the file");
+    let _ = std::fs::remove_file(&rendered);
+
+    if std::env::var_os("TG_GOLDEN_UPDATE").is_some() {
+        if let Some(parent) = golden.parent() {
+            std::fs::create_dir_all(parent).expect("the data directory");
+        }
+        std::fs::write(golden, &got).expect("the golden file is writable");
+        return;
+    }
+
+    let expected = std::fs::read_to_string(golden)
+        .unwrap_or_else(|error| panic!("{} is unreadable: {error}", golden.display()));
+    assert_eq!(
+        got,
+        expected,
+        "the text projection changed; see {}",
+        golden.display()
+    );
 }

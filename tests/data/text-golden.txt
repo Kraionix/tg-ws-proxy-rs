@@ -1,0 +1,20 @@
+2023-11-14T22:13:20.123456Z  INFO [203.0.113.5:51234] DC2 session opened
+2023-11-14T22:13:20.123456Z  INFO [203.0.113.5:51234] DC2m WS session closed via kws2.web.telegram.org by upstream: ↑1.0MB  ↓4.0MB  120.0s
+2023-11-14T22:13:20.123456Z  INFO [?] DC4m CF proxy failed on cf.example.com: tcp_connect (os error 113) (2.50s)
+2023-11-14T22:13:20.123456Z  INFO [?] DC2 ws→cfworker (ws_fail)
+2023-11-14T22:13:20.123456Z  INFO [?] DC2 WS failed, cooldown 5m0s for kws2.web.telegram.org:443 (http_status 403)
+2023-11-14T22:13:20.123456Z  INFO [?] DC2 IP cooldown cleared for 149.154.167.220
+2023-11-14T22:13:20.123456Z  INFO [?] DC2m upstream in cooldown, skipping (proxy.example:443)
+2023-11-14T22:13:20.123456Z  INFO [?] DC2 WS pool hit (3 left)
+2023-11-14T22:13:20.123456Z  INFO [?] DC2m CF Worker pool miss
+2023-11-14T22:13:20.123456Z  INFO [?] DC203 CF proxy pool refilled: +4 (4 ready, 850ms) failed: tls_timeout (os error 113)
+2023-11-14T22:13:20.123456Z  INFO [?] DC2 WS TLS handshake full (180ms)
+2023-11-14T22:13:20.123456Z  INFO [?] relay init needed 3 retries
+2023-11-14T22:13:20.123456Z  INFO [?] accept error: resource (os error 24) — backing off 100ms
+2023-11-14T22:13:20.123456Z  INFO [?] fds 214/1024, permits 810
+2023-11-14T22:13:20.123456Z  INFO [?] log dropped 12 records over 2.00s
+2023-11-14T22:13:20.123456Z  INFO [?] DC2 WS pool discarded a stale connection
+2023-11-14T22:13:20.123456Z  INFO [?] warmup complete: 16 ready (1.2s)
+2023-11-14T22:13:20.123456Z  INFO [?] DC2m skip mtproto (pinned)
+2023-11-14T22:13:20.123456Z  INFO [?] default CF domains: 5 from github
+2023-11-14T22:13:20.123456Z  INFO [?] SIGTERM received, stopping
