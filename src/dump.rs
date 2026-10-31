@@ -39,13 +39,116 @@ use sha2::{Digest, Sha256};
 
 use crate::config::Command;
 use crate::log::render::peer_text;
-use crate::log::schema::{self, Event, LogBatch, LogRecord, Peer};
+use crate::log::schema::{self, Ctx, Event, LogRecord, Peer, dc_bit};
 use crate::log::storage::iter_batches;
 
 /// One `<date>.seg` file, with the day its name spells.
 struct Segment {
     path: PathBuf,
     date: String,
+}
+
+/// The summary the old batch header carried, recomputed from the records.
+///
+/// A segment frame stores no header: the envelope is the frame, and every
+/// field below is derivable from the records it holds. The dump prints them
+/// because the reader it replaced did, and a dump taken today must be
+/// comparable with one taken before the segment backend.
+#[derive(Debug)]
+pub(crate) struct Summary {
+    pub(crate) ts_first_ns: u64,
+    pub(crate) ts_last_ns: u64,
+    pub(crate) record_count: u32,
+    pub(crate) kind_mask: u64,
+    pub(crate) dc_mask: u32,
+    pub(crate) dc_media_mask: u32,
+    pub(crate) conn_ids: Vec<u64>,
+}
+
+/// One frame read back: its summary and its records.
+#[derive(Debug)]
+pub(crate) struct Batch {
+    pub(crate) summary: Summary,
+    pub(crate) records: Vec<LogRecord>,
+}
+
+/// Rebuild the summary of the batch a frame holds.
+pub(crate) fn header_for(records: &[LogRecord]) -> Summary {
+    let mut summary = Summary {
+        ts_first_ns: u64::MAX,
+        ts_last_ns: 0,
+        record_count: records.len() as u32,
+        kind_mask: 0,
+        dc_mask: 0,
+        dc_media_mask: 0,
+        conn_ids: Vec::new(),
+    };
+    let mut conns: Vec<u64> = Vec::new();
+    for record in records {
+        let (tag, dc, is_media) = shape(record);
+        if tag != 0 {
+            summary.kind_mask |= 1u64 << (tag - 16);
+        }
+        if let Some(bit) = dc.and_then(dc_bit) {
+            let mask = 1u32 << bit;
+            summary.dc_mask |= mask;
+            if is_media {
+                summary.dc_media_mask |= mask;
+            }
+        }
+        if !conns.contains(&record.conn_id) {
+            conns.push(record.conn_id);
+        }
+        summary.ts_first_ns = summary.ts_first_ns.min(record.ts_ns);
+        summary.ts_last_ns = summary.ts_last_ns.max(record.ts_ns);
+    }
+    if summary.ts_first_ns == u64::MAX {
+        summary.ts_first_ns = 0;
+    }
+    conns.sort_unstable();
+    summary.conn_ids = conns;
+    summary
+}
+
+/// Oneof tag, DC and media flag for a record -- a single exhaustive match, so
+/// adding an event variant is a compile error here until its mask bits are
+/// decided rather than a silent zero.
+fn shape(record: &LogRecord) -> (u32, Option<u32>, bool) {
+    match &record.event {
+        Some(Event::SessionOpened(e)) => tagged(16, &e.ctx),
+        Some(Event::SessionClosed(e)) => tagged(17, &e.ctx),
+        Some(Event::TierAttempt(e)) => tagged(18, &e.ctx),
+        Some(Event::TierFallback(e)) => tagged(19, &e.ctx),
+        Some(Event::CooldownArmed(e)) => tagged(20, &e.ctx),
+        Some(Event::CooldownCleared(e)) => tagged(21, &e.ctx),
+        Some(Event::CooldownSkipped(e)) => tagged(22, &e.ctx),
+        Some(Event::PoolHit(e)) => tagged(23, &e.ctx),
+        Some(Event::PoolMiss(e)) => tagged(24, &e.ctx),
+        Some(Event::PoolRefill(e)) => tagged(25, &e.ctx),
+        Some(Event::TlsHandshake(e)) => tagged(26, &e.ctx),
+        Some(Event::RelayInitRetries(_)) => (27, None, false),
+        Some(Event::AcceptError(_)) => (28, None, false),
+        Some(Event::FdSnapshot(_)) => (29, None, false),
+        Some(Event::ProbeResult(_)) => (30, None, false),
+        Some(Event::LogOverflow(_)) => (31, None, false),
+        Some(Event::StartupSummary(_)) => (32, None, false),
+        Some(Event::PoolDiscard(e)) => tagged(33, &e.ctx),
+        Some(Event::WarmupComplete(_)) => (34, None, false),
+        Some(Event::AttemptSkipped(e)) => tagged(35, &e.ctx),
+        Some(Event::DomainListFetched(_)) => (36, None, false),
+        Some(Event::Shutdown(_)) => (37, None, false),
+        None => (0, None, false),
+    }
+}
+
+/// A record's oneof tag together with the DC and media flag its [`Ctx`]
+/// carries. A session-scoped event without a context contributes no DC rather
+/// than a wrong one.
+fn tagged(tag: u32, ctx: &Option<Ctx>) -> (u32, Option<u32>, bool) {
+    match ctx {
+        Some(ctx) => (tag, Some(ctx.dc), ctx.is_media),
+        None => (tag, None, false),
+    }
 }
 
 /// Runs the verb the operator asked for and returns the exit code for it.
@@ -373,30 +476,22 @@ fn strings(values: &[String]) -> String {
     array(&values.iter().map(|value| string(value)).collect::<Vec<_>>())
 }
 
-fn batch_json(segment: &Segment, batch: &LogBatch) -> String {
-    match &batch.header {
-        Some(header) => object(&[
-            (
-                "conns",
-                array(&header.conn_ids.iter().map(number).collect::<Vec<_>>()),
-            ),
-            ("date", string(&segment.date)),
-            ("dc_mask", number(header.dc_mask)),
-            ("dc_media_mask", number(header.dc_media_mask)),
-            ("kind_mask", number(header.kind_mask)),
-            ("records", number(header.record_count)),
-            ("ts_first_ns", number(header.ts_first_ns)),
-            ("ts_last_ns", number(header.ts_last_ns)),
-            ("type", string("batch")),
-        ]),
-        // A batch that reached the file without a header is one this build
-        // cannot describe; its records still print.
-        None => object(&[
-            ("date", string(&segment.date)),
-            ("records", number(batch.records.len())),
-            ("type", string("batch")),
-        ]),
-    }
+fn batch_json(segment: &Segment, batch: &Batch) -> String {
+    let summary = &batch.summary;
+    object(&[
+        (
+            "conns",
+            array(&summary.conn_ids.iter().map(number).collect::<Vec<_>>()),
+        ),
+        ("date", string(&segment.date)),
+        ("dc_mask", number(summary.dc_mask)),
+        ("dc_media_mask", number(summary.dc_media_mask)),
+        ("kind_mask", number(summary.kind_mask)),
+        ("records", number(summary.record_count)),
+        ("ts_first_ns", number(summary.ts_first_ns)),
+        ("ts_last_ns", number(summary.ts_last_ns)),
+        ("type", string("batch")),
+    ])
 }
 
 fn record_json(segment: &Segment, record: &LogRecord) -> String {

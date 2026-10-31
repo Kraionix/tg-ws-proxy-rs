@@ -1,5 +1,5 @@
-//! The log wire format: `LogRecord`, the `LogBatch` it travels in, and the
-//! bit-packing helpers both sides of the file need.
+//! The log wire format: `LogRecord`, its events, and the bit-packing helpers
+//! both sides of the file need.
 //!
 //! Field numbers, oneof tags and event semantics are fixed by the `.proto` in
 //! `artifacts/logging/10_SCHEMA.md`, which is the source of record. What is
@@ -32,7 +32,7 @@
 /// behind a classified error, and the two pool counters.
 pub const SCHEMA_VERSION: u32 = 2;
 
-/// Historical bound on distinct `conn_id`s in one [`LogBatch`].
+/// Historical bound on distinct `conn_id`s in one old-format batch.
 ///
 /// The writer used to cut a batch when a seventeenth session appeared, so that
 /// the old store's per-connection key prefix stayed selective. Nothing splits
@@ -123,44 +123,6 @@ pub enum Event {
     DomainListFetched(DomainListFetched),
     #[prost(message, tag = "37")]
     Shutdown(Shutdown),
-}
-
-/// What a writer hands to storage: the batch's summary plus its records.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct LogBatch {
-    #[prost(message, optional, tag = "1")]
-    pub header: Option<BatchHeader>,
-    #[prost(message, repeated, tag = "2")]
-    pub records: Vec<LogRecord>,
-}
-
-/// The summary computed by [`build_batch`].
-///
-/// Everything here is derivable from the records; it exists so that a reader
-/// can filter a day of segments — by DC, by category, by connection — without
-/// decoding every record in them.
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct BatchHeader {
-    #[prost(fixed64, tag = "1")]
-    pub ts_first_ns: u64,
-    #[prost(fixed64, tag = "2")]
-    pub ts_last_ns: u64,
-    #[prost(uint32, tag = "3")]
-    pub record_count: u32,
-    /// One bit per oneof field number, offset by 16: `EVT:session_opened` (16)
-    /// is bit 0, `EVT:shutdown` (37) is bit 21.
-    #[prost(uint64, tag = "4")]
-    pub kind_mask: u64,
-    /// One bit per DC, laid out by [`dc_bit`] — never `1 << dc`, which
-    /// overflows at 203.
-    #[prost(uint32, tag = "5")]
-    pub dc_mask: u32,
-    /// Same layout as `dc_mask`, set only for media sessions.
-    #[prost(uint32, tag = "6")]
-    pub dc_media_mask: u32,
-    /// Ascending, deduplicated, at most [`BATCH_MAX_UNIQUE_CONNS`] entries.
-    #[prost(uint64, repeated, tag = "7")]
-    pub conn_ids: Vec<u64>,
 }
 
 // ── Enums ──────────────────────────────────────────────────────────────────
@@ -846,7 +808,7 @@ pub struct DcIp {
 
 // ── Derivation ─────────────────────────────────────────────────────────────
 
-/// Bit index of `dc` in [`BatchHeader::dc_mask`], or `None` when the record
+/// Bit index of `dc` in a batch header's `dc_mask`, or `None` when the record
 /// names no routable DC.
 ///
 /// The mask is this fixed six-bit layout rather than `1 << dc` because DC 203
@@ -1168,88 +1130,4 @@ pub(crate) fn canonical_records() -> [LogRecord; 22] {
             signal: ShutdownSignal::Term as i32,
         })),
     ]
-}
-
-/// The header for one batch of records.
-///
-/// A reader rebuilding a header for a batch that is already in a file must use
-/// the frame as the boundary: a converted day can hold far more sessions than
-/// the writer would ever have put in one batch.
-pub fn header_for(records: &[LogRecord]) -> BatchHeader {
-    let mut header = BatchHeader {
-        ts_first_ns: u64::MAX,
-        ts_last_ns: 0,
-        record_count: records.len() as u32,
-        kind_mask: 0,
-        dc_mask: 0,
-        dc_media_mask: 0,
-        conn_ids: Vec::new(),
-    };
-    let mut conns: Vec<u64> = Vec::new();
-    for record in records {
-        let (tag, dc, is_media) = shape(record);
-        if tag != 0 {
-            header.kind_mask |= 1u64 << (tag - 16);
-        }
-        if let Some(bit) = dc.and_then(dc_bit) {
-            let mask = 1u32 << bit;
-            header.dc_mask |= mask;
-            if is_media {
-                header.dc_media_mask |= mask;
-            }
-        }
-        if !conns.contains(&record.conn_id) {
-            conns.push(record.conn_id);
-        }
-        header.ts_first_ns = header.ts_first_ns.min(record.ts_ns);
-        header.ts_last_ns = header.ts_last_ns.max(record.ts_ns);
-    }
-    if header.ts_first_ns == u64::MAX {
-        header.ts_first_ns = 0;
-    }
-    conns.sort_unstable();
-    header.conn_ids = conns;
-    header
-}
-
-/// Oneof tag, DC and media flag for a record — a single exhaustive match, so
-/// adding an event variant is a compile error here until its mask bits are
-/// decided rather than a silent zero.
-fn shape(record: &LogRecord) -> (u32, Option<u32>, bool) {
-    match &record.event {
-        Some(Event::SessionOpened(e)) => tagged(16, &e.ctx),
-        Some(Event::SessionClosed(e)) => tagged(17, &e.ctx),
-        Some(Event::TierAttempt(e)) => tagged(18, &e.ctx),
-        Some(Event::TierFallback(e)) => tagged(19, &e.ctx),
-        Some(Event::CooldownArmed(e)) => tagged(20, &e.ctx),
-        Some(Event::CooldownCleared(e)) => tagged(21, &e.ctx),
-        Some(Event::CooldownSkipped(e)) => tagged(22, &e.ctx),
-        Some(Event::PoolHit(e)) => tagged(23, &e.ctx),
-        Some(Event::PoolMiss(e)) => tagged(24, &e.ctx),
-        Some(Event::PoolRefill(e)) => tagged(25, &e.ctx),
-        Some(Event::TlsHandshake(e)) => tagged(26, &e.ctx),
-        Some(Event::RelayInitRetries(_)) => (27, None, false),
-        Some(Event::AcceptError(_)) => (28, None, false),
-        Some(Event::FdSnapshot(_)) => (29, None, false),
-        Some(Event::ProbeResult(_)) => (30, None, false),
-        Some(Event::LogOverflow(_)) => (31, None, false),
-        Some(Event::StartupSummary(_)) => (32, None, false),
-        Some(Event::PoolDiscard(e)) => tagged(33, &e.ctx),
-        Some(Event::WarmupComplete(_)) => (34, None, false),
-        Some(Event::AttemptSkipped(e)) => tagged(35, &e.ctx),
-        Some(Event::DomainListFetched(_)) => (36, None, false),
-        Some(Event::Shutdown(_)) => (37, None, false),
-        None => (0, None, false),
-    }
-}
-
-/// A record's oneof tag together with the DC and media flag its [`Ctx`] carries,
-/// which is what the batch header's masks are made of. A session-scoped event
-/// without a context — the schema allows it, no producer writes it — contributes
-/// no DC rather than a wrong one.
-fn tagged(tag: u32, ctx: &Option<Ctx>) -> (u32, Option<u32>, bool) {
-    match ctx {
-        Some(ctx) => (tag, Some(ctx.dc), ctx.is_media),
-        None => (tag, None, false),
-    }
 }

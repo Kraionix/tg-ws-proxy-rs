@@ -381,6 +381,7 @@ fn dc_bit_maps_the_documented_table() {
     }
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn header_masks_follow_the_records() {
     let mut records = vec![
@@ -430,7 +431,7 @@ fn header_masks_follow_the_records() {
         records[i].ts_ns = ts_ns;
     }
 
-    let header = header_for(&records);
+    let header = crate::dump::header_for(&records);
 
     assert_eq!(header.record_count, 6);
     assert_eq!(header.ts_first_ns, 100);
@@ -450,9 +451,10 @@ fn header_masks_follow_the_records() {
     assert_eq!(header.conn_ids, vec![42]);
 }
 
+#[cfg(feature = "log-disk")]
 #[test]
 fn an_empty_batch_has_an_empty_header() {
-    let header = header_for(&[]);
+    let header = crate::dump::header_for(&[]);
     assert_eq!(header.record_count, 0);
     assert_eq!(header.ts_first_ns, 0);
     assert_eq!(header.ts_last_ns, 0);
@@ -599,10 +601,16 @@ fn pool_hit(dc: u32) -> Event {
     })
 }
 
+/// One encoded batch decoded back for a test: the records are all it checks.
+#[derive(Clone, Debug, PartialEq)]
+struct TestBatch {
+    records: Vec<LogRecord>,
+}
+
 /// What a sink was asked to write, kept for the test to inspect.
 #[derive(Default)]
 struct Recording {
-    batches: StdMutex<Vec<LogBatch>>,
+    batches: StdMutex<Vec<TestBatch>>,
     attempts: AtomicUsize,
     fail_next: AtomicBool,
 }
@@ -616,14 +624,14 @@ impl Recording {
         self.batches.lock().unwrap().len()
     }
 
-    fn batches(&self) -> Vec<LogBatch> {
+    fn batches(&self) -> Vec<TestBatch> {
         self.batches.lock().unwrap().clone()
     }
 }
 
 struct RecordingSink {
     shared: Arc<Recording>,
-    notify: Option<UnboundedSender<LogBatch>>,
+    notify: Option<UnboundedSender<TestBatch>>,
     /// Sleeps in write_batch, so a test can fill the channel on purpose.
     delay: Option<Duration>,
 }
@@ -656,7 +664,7 @@ impl logreel::BatchSink for RecordingSink {
 /// u64 first timestamp, u64 last, u16 mask length and the mask, u16 domain
 /// length and the domain, then per record level, category, kind, timestamp,
 /// varint sequence, varint connection, varint payload length and the payload.
-fn batch_from_encoded(batch: &logreel::EncodedBatch) -> LogBatch {
+fn batch_from_encoded(batch: &logreel::EncodedBatch) -> TestBatch {
     let mut cursor = Cursor::new(&batch.payload);
     let count = cursor.u32();
     let _first = cursor.u64();
@@ -688,10 +696,7 @@ fn batch_from_encoded(batch: &logreel::EncodedBatch) -> LogBatch {
         });
     }
 
-    LogBatch {
-        header: Some(header_for(&records)),
-        records,
-    }
+    TestBatch { records }
 }
 
 /// A reader over a batch payload; the format is the library's, the arithmetic
@@ -743,7 +748,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn recording() -> (RecordingSink, Arc<Recording>, UnboundedReceiver<LogBatch>) {
+fn recording() -> (RecordingSink, Arc<Recording>, UnboundedReceiver<TestBatch>) {
     let shared = Arc::new(Recording::default());
     let (notify, batches) = unbounded_channel();
     let sink = RecordingSink {
@@ -764,7 +769,7 @@ fn quiet(batch_max: usize) -> Settings {
     }
 }
 
-async fn next_batch(batches: &mut UnboundedReceiver<LogBatch>) -> LogBatch {
+async fn next_batch(batches: &mut UnboundedReceiver<TestBatch>) -> TestBatch {
     tokio::time::timeout(Duration::from_secs(5), batches.recv())
         .await
         .expect("the writer flushed within 5 s")
@@ -822,10 +827,6 @@ async fn a_full_batch_is_written_as_one_batch() {
 
     let batch = next_batch(&mut batches).await;
     assert_eq!(batch.records.len(), DEFAULT_BATCH_MAX);
-    assert_eq!(
-        batch.header.expect("every batch has a header").record_count as usize,
-        DEFAULT_BATCH_MAX
-    );
     assert_eq!(shared.batch_count(), 1);
     assert_eq!(handle.dropped(), 0);
 
@@ -1358,17 +1359,17 @@ use super::storage::Compression;
 #[cfg(feature = "log-disk")]
 use super::storage::{self, DurabilityMode, FileSink, Options};
 
-/// The old sink interface, for the storage tests: a LogBatch encoded the way
+/// The old sink interface, for the storage tests: a TestBatch encoded the way
 /// the library's writer would encode it. The library's own BatchSink takes the
 /// encoded form, and the tests still speak batches of records.
 #[cfg(feature = "log-disk")]
 trait SinkWrite {
-    fn write(&mut self, batch: &LogBatch) -> Result<(), logreel::StoreError>;
+    fn write(&mut self, batch: &TestBatch) -> Result<(), logreel::StoreError>;
 }
 
 #[cfg(feature = "log-disk")]
 impl SinkWrite for FileSink {
-    fn write(&mut self, batch: &LogBatch) -> Result<(), logreel::StoreError> {
+    fn write(&mut self, batch: &TestBatch) -> Result<(), logreel::StoreError> {
         let encoded = encoded(batch);
         logreel::BatchSink::write_batch(self, &encoded)
     }
@@ -1376,7 +1377,7 @@ impl SinkWrite for FileSink {
 
 /// Encode a proxy batch the way the library's writer does.
 #[cfg(feature = "log-disk")]
-fn encoded(batch: &LogBatch) -> logreel::EncodedBatch {
+fn encoded(batch: &TestBatch) -> logreel::EncodedBatch {
     let records: Vec<logreel::Record<Event>> = batch
         .records
         .iter()
@@ -1441,7 +1442,7 @@ fn next_stamp() -> (u64, u32) {
 
 /// A batch of `conn_id`s, one record each, the way the writer would build it.
 #[cfg(feature = "log-disk")]
-fn batch_of(conn_ids: &[u64]) -> LogBatch {
+fn batch_of(conn_ids: &[u64]) -> TestBatch {
     let (ts_ns, seq) = next_stamp();
     let records: Vec<LogRecord> = conn_ids
         .iter()
@@ -1452,17 +1453,14 @@ fn batch_of(conn_ids: &[u64]) -> LogBatch {
             record
         })
         .collect();
-    LogBatch {
-        header: Some(header_for(&records)),
-        records,
-    }
+    TestBatch { records }
 }
 
 /// A batch with the variety real traffic has: mixed event kinds, different
 /// sessions, counters that move. A fixture of 256 identical records would
 /// compress to almost nothing and flatter the ratio this test exists to report.
 #[cfg(feature = "log-zstd")]
-fn rich_batch() -> LogBatch {
+fn rich_batch() -> TestBatch {
     let (ts_ns, seq) = next_stamp();
     // xorshift64: deterministic across runs, which a random generator would not
     // be, and varied enough that zstd sees more than one record shape.
@@ -1523,10 +1521,16 @@ fn rich_batch() -> LogBatch {
         })
         .collect();
 
-    LogBatch {
-        header: Some(header_for(&records)),
-        records,
-    }
+    TestBatch { records }
+}
+
+#[cfg(feature = "log-disk")]
+fn records_of(dir: &Path, day: &str) -> Vec<Vec<LogRecord>> {
+    storage::iter_batches(dir, day)
+        .expect("readable")
+        .into_iter()
+        .map(|batch| batch.records)
+        .collect()
 }
 
 #[cfg(feature = "log-disk")]
@@ -1620,7 +1624,8 @@ fn a_segment_round_trips_every_batch() {
 
     let read_back =
         storage::iter_batches(dir.path(), &logreel::file::day_name(day)).expect("readable");
-    assert_eq!(read_back, vec![first, second]);
+    let read_back: Vec<Vec<LogRecord>> = read_back.into_iter().map(|batch| batch.records).collect();
+    assert_eq!(read_back, vec![first.records, second.records]);
 }
 
 #[cfg(feature = "log-disk")]
@@ -1644,10 +1649,13 @@ fn a_restart_inside_the_same_day_appends_to_the_same_segment() {
         vec![format!("{}.seg", logreel::file::day_name(day))],
         "one segment for the day, not one per run"
     );
-    assert_eq!(
-        storage::iter_batches(dir.path(), &logreel::file::day_name(day)).expect("readable"),
-        vec![first, second]
-    );
+    let read_back: Vec<Vec<LogRecord>> =
+        storage::iter_batches(dir.path(), &logreel::file::day_name(day))
+            .expect("readable")
+            .into_iter()
+            .map(|batch| batch.records)
+            .collect();
+    assert_eq!(read_back, vec![first.records, second.records]);
 }
 
 #[cfg(feature = "log-disk")]
@@ -1668,9 +1676,15 @@ fn both_durability_modes_survive_a_clean_close() {
         sink.write(&batch).expect("written");
         drop(sink);
 
+        let read_back: Vec<Vec<LogRecord>> =
+            storage::iter_batches(dir.path(), &logreel::file::day_name(day))
+                .expect("readable")
+                .into_iter()
+                .map(|entry| entry.records)
+                .collect();
         assert_eq!(
-            storage::iter_batches(dir.path(), &logreel::file::day_name(day)).expect("readable"),
-            vec![batch],
+            read_back,
+            vec![batch.records],
             "{mode:?} lost a batch on a clean close"
         );
     }
@@ -2065,12 +2079,12 @@ fn rotation_moves_to_the_next_day_without_losing_the_previous_one() {
         ]
     );
     assert_eq!(
-        storage::iter_batches(dir.path(), &logreel::file::day_name(today)).expect("readable"),
-        vec![first]
+        records_of(dir.path(), &logreel::file::day_name(today)),
+        vec![first.records]
     );
     assert_eq!(
-        storage::iter_batches(dir.path(), &logreel::file::day_name(today + 1)).expect("readable"),
-        vec![second]
+        records_of(dir.path(), &logreel::file::day_name(today + 1)),
+        vec![second.records]
     );
 }
 

@@ -37,7 +37,7 @@ use logreel::file::{
 use logreel::{Durability, ErrorKind, Store as _};
 
 use super::LogError;
-use super::schema::{self, Event, LogBatch, LogRecord};
+use super::schema::{Event, LogRecord};
 
 /// Segments kept by default, counting today.
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
@@ -275,11 +275,11 @@ impl logreel::BatchSink for FileSink {
 /// Reads one day's segment back as the batches the dump verb prints.
 ///
 /// The records are decoded into the proxy's own [`LogRecord`] and the batch
-/// header is rebuilt with [`schema::header_for`], so `dump-segment` prints the
+/// summary is rebuilt with [`crate::dump::header_for`], so `dump-segment` prints the
 /// same bytes for a `.seg` as it did for the redb file it replaced — including
 /// the `kind_mask`, `dc_mask` and connection list, which are derived from the
 /// records rather than stored.
-pub fn iter_batches(dir: &Path, date: &str) -> Result<Vec<LogBatch>, LogError> {
+pub(crate) fn iter_batches(dir: &Path, date: &str) -> Result<Vec<crate::dump::Batch>, LogError> {
     let path = dir.join(format!("{date}{SEGMENT_SUFFIX}"));
     if !path.exists() {
         return Err(LogError::Segment(format!(
@@ -306,8 +306,8 @@ pub fn iter_batches(dir: &Path, date: &str) -> Result<Vec<LogBatch>, LogError> {
                 event: Some(event),
             });
         }
-        batches.push(LogBatch {
-            header: Some(schema::header_for(&records)),
+        batches.push(crate::dump::Batch {
+            summary: crate::dump::header_for(&records),
             records,
         });
     }
