@@ -25,6 +25,10 @@ version_code = 205040
 [workspace]
 members = ["crates/android-jni"]
 default-members = ["."]
+# The vendored library is its own workspace with its own inheritance; a path
+# dependency alone would make cargo adopt it as a member of this one, where
+# `workspace.package` means something else.
+exclude = ["vendor/logreel"]
 
 [[bin]]
 name = "tg-ws-proxy"
@@ -39,10 +43,10 @@ path = "src/main.rs"
 # feature: it is off by default, and an embedder that only wants the text log
 # should not link a storage engine it never opens. See `redb` below.
 default = []
-log-disk = ["dep:redb"]
+log-disk = ["dep:redb", "logreel/file"]
 # Compression for the segments the disk sink writes, so it cannot stand
 # without it: `log-zstd` implies `log-disk`. See the `zstd` dependency below.
-log-zstd = ["log-disk", "dep:zstd"]
+log-zstd = ["log-disk", "dep:zstd", "logreel/zstd"]
 
 [dependencies]
 # Async runtime
@@ -114,6 +118,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # in artifacts/logging/10_SCHEMA.md, so the derive is all that is needed —
 # there is no protoc and no build.rs in this crate.
 prost = "0.14"
+
+# The record pipeline and the segment format, vendored in `vendor/logreel`
+# (see the note there). The library owns the channel, the filters, the batch
+# envelope, the `.seg` file and the readers; this crate keeps the event schema,
+# the rendered text and the `[peer]` map. The file backend is optional and is
+# switched on by `log-disk`; `log-zstd` adds the codec.
+logreel = { path = "vendor/logreel/crates/logreel", default-features = false }
 
 # Day-segment storage: an embedded key-value store with typed keys and
 # per-transaction durability. Pure Rust, which is the point — every release

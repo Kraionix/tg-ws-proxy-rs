@@ -647,6 +647,44 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "logreel"
+version = "0.2.0"
+dependencies = [
+ "logreel-core",
+ "logreel-derive",
+ "logreel-file",
+]
+
+[[package]]
+name = "logreel-core"
+version = "0.2.0"
+dependencies = [
+ "logreel-store",
+ "tokio",
+]
+
+[[package]]
+name = "logreel-derive"
+version = "0.2.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "logreel-file"
+version = "0.2.0"
+dependencies = [
+ "logreel-store",
+ "zstd",
+]
+
+[[package]]
+name = "logreel-store"
+version = "0.2.0"
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1177,6 +1215,7 @@ dependencies = [
  "httparse",
  "ipnet",
  "libc",
+ "logreel",
  "percent-encoding",
  "prost",
  "rand 0.9.5",

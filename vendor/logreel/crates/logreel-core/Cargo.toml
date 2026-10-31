@@ -1,0 +1,20 @@
+[package]
+name = "logreel-core"
+description = "Typed event pipeline for logreel: envelope, filters, scopes, text projection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+text = []
+ring = []
+
+[dependencies]
+logreel-store.workspace = true
+tokio = { workspace = true }
+
+[lints]
+workspace = true

@@ -155,6 +155,34 @@ jobs:
       - name: Release build
         run: cargo build --release --locked
 
+  # The vendored library is its own workspace with its own lock and target
+  # directory, so the jobs above never compile it: a break in
+  # vendor/logreel would only surface after it was copied into a user's build.
+  vendored-logreel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read pinned Rust toolchain
+        id: rust-toolchain
+        shell: bash
+        run: |
+          toolchain="$(sed -n -E 's/^channel = "(.+)"/\1/p' rust-toolchain.toml)"
+          test -n "$toolchain"
+          echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          components: clippy
+          toolchain: ${{ steps.rust-toolchain.outputs.toolchain }}
+
+      - name: Clippy the vendored workspace
+        run: cargo clippy --manifest-path vendor/logreel/Cargo.toml --all-targets --all-features
+
+      - name: Test the vendored workspace
+        run: cargo test --manifest-path vendor/logreel/Cargo.toml --all-features
+
   android:
     runs-on: ubuntu-latest
     steps:

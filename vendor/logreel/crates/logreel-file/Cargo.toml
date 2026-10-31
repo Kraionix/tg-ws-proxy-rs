@@ -1,0 +1,26 @@
+[package]
+name = "logreel-file"
+description = "Append-only segment files for logreel: rotation, retention, probe and streaming scan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+zstd = ["dep:zstd"]
+
+[dependencies]
+logreel-store.workspace = true
+zstd = { workspace = true, optional = true }
+
+[[bin]]
+name = "crash-writer"
+path = "src/bin/crash_writer.rs"
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
