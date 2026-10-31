@@ -20,6 +20,11 @@ grep and diff between two runs.
 Nothing about the record stream requires a disk. Without `--log-dir` the pipeline still runs, the
 records reach the text log and the RAM ring, and nothing is written anywhere.
 
+Both views — the rendered line and the ring — belong to the proxy, not to the logging library: the
+proxy's observer renders each record as it arrives and keeps its own bounded buffer, so a record the
+segment filter drops can still be on the console, and `--ring-level` stays independent of
+`--log-level`.
+
 ## The four things on the console
 
 | what | where | when |

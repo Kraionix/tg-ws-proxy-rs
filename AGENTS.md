@@ -35,8 +35,8 @@ src/
   log.rs                 Record pipeline: settings/filters, `LogHandle`, `log_event!`/`direct!`, scope
   log/                   schema.rs (record types), event.rs (schema → logreel event adapter),
                          storage.rs (.seg day segments — `log-disk` only), view.rs (the writer's
-                         observer: text sink, `[peer]` map, `SIGUSR1` ring), render.rs (record →
-                         text line) — see docs/Logging.md
+                         observer: text sink, `[peer]` map, `SIGUSR1` ring — both views are ours,
+                         the library keeps none), render.rs (record → text line) — see docs/Logging.md
   dump.rs                The reader verbs `probe-segment`/`dump-segment` — `log-disk` only
   outbound/               Outbound TCP connector: HTTP/SOCKS5(h) proxy support, NO_PROXY matching
   default_domains/http.rs  Minimal HTTPS GET used only to fetch the default domain list
@@ -156,6 +156,10 @@ requests, so add a rehearsal there when adding one.
   Worker, TCP fallback, `--check`, and the default-domain fetch all call into the shared outbound
   connector so proxy/NO_PROXY behavior stays consistent. Don't open a raw `TcpStream::connect`
   elsewhere.
+- **The logging library is vendored.** `vendor/logreel/` is produced only by
+  `tools/sync-logreel.sh` from a pinned commit and patched only there (see `VENDORED.md`); do not
+  edit it by hand, and re-run the script after moving the library forward. Its text/ring features do
+  not exist: the text view and the ring are this crate's observer in `src/log/view.rs`.
 - **Integration tests are organized by subsystem**, one file per `src/` module area (e.g.
   `tests/config.rs`, `tests/outbound.rs`, `tests/faketls.rs`). Add new tests to the matching file
   rather than creating a new one per feature. Fixtures shared across those files belong in
