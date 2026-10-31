@@ -232,7 +232,8 @@ async fn run_check_logged(
     listener: Option<SocketAddr>,
     log: &Arc<LogHandle>,
 ) -> bool {
-    log::scope_global(
+    log::scope(
+        0,
         Arc::clone(log),
         check::run_check_with_outbound(config, outbound, listener),
     )
@@ -753,7 +754,7 @@ async fn serve(
         let handle = Arc::clone(&log);
         let semaphore = Arc::clone(&semaphore);
         let soft_limit = fd_limit.min(u32::MAX as usize) as u32;
-        tokio::spawn(log::scope_global(handle, async move {
+        tokio::spawn(log::scope(0, handle, async move {
             let mut ticker = tokio::time::interval(FD_SNAPSHOT_INTERVAL);
             // The first tick of an interval is immediate; this record is about
             // a steady state, not a startup.
@@ -838,7 +839,7 @@ async fn serve(
                             (50, ErrorCode::Unspecified)
                         };
                         let errno = e.raw_os_error().unwrap_or(0);
-                        log::scope_global(Arc::clone(&log), async {
+                        log::scope(0, Arc::clone(&log), async {
                             log_event!(Category::Accept, Level::Warn, Event::AcceptError {
                                 errno,
                                 backoff_ms,

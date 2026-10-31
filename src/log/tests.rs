@@ -2381,7 +2381,7 @@ async fn a_sink_that_fails_does_not_stop_the_writer() {
 
 #[tokio::test]
 async fn emitting_outside_a_scope_is_a_no_op() {
-    assert!(!inside_scope());
+    assert!(logreel::current::<Event>().is_none());
     assert!(!enabled(Category::Routing, Level::Info));
     emit(Category::Routing, Level::Info, pool_hit(2));
 
@@ -2389,13 +2389,16 @@ async fn emitting_outside_a_scope_is_a_no_op() {
     let handle = Arc::new(start(sink, quiet(DEFAULT_BATCH_MAX)));
 
     scope(7, Arc::clone(&handle), async {
-        assert!(inside_scope());
+        assert!(logreel::current::<Event>().is_some());
         assert!(enabled(Category::Routing, Level::Info));
         emit(Category::Routing, Level::Info, pool_hit(2));
     })
     .await;
 
-    assert!(!inside_scope(), "the scope must not outlive its future");
+    assert!(
+        logreel::current::<Event>().is_none(),
+        "the scope must not outlive its future"
+    );
     handle.shutdown().await;
 
     let batches = shared.batches();

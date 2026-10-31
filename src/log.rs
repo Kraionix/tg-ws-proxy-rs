@@ -651,17 +651,14 @@ fn dump_on_usr1(handle: Arc<LogHandle>) {
 fn dump_on_usr1(_handle: Arc<LogHandle>) {}
 
 tokio::task_local! {
-    /// The session a record belongs to, and the handle to send it through.
-    static LOG_CTX: LogCtx;
+    /// The text view's floor. One byte, and the one thing about a scope the
+    /// library does not own: the text view is the proxy's observer, not the
+    /// pipeline's built-in.
+    static TEXT_FLOOR: Filter;
 }
 
-struct LogCtx {
-    handle: Arc<LogHandle>,
-    conn_id: u64,
-}
-
-/// Runs future with the log context planted, so every log_event! inside it --
-/// in this task or in any task spawned from it -- is attributed to conn_id.
+/// Runs future with the library's scope planted, so every log_event! inside it
+/// -- in this task or in any task spawned from it -- is attributed to conn_id.
 ///
 /// This is the one place a connection's logging is set up: the accept arm in
 /// server.rs wraps the per-connection task in it, and
@@ -671,7 +668,11 @@ pub fn scope<F>(conn_id: u64, handle: Arc<LogHandle>, future: F) -> impl Future<
 where
     F: Future,
 {
-    LOG_CTX.scope(LogCtx { handle, conn_id }, future)
+    let text = handle.text;
+    TEXT_FLOOR.scope(
+        text,
+        logreel::scope(conn_id, Arc::clone(&handle.inner), future),
+    )
 }
 
 /// LogHandle::emit for process-wide events, tolerating a caller that has no
@@ -693,38 +694,24 @@ pub fn emit_global(
     }
 }
 
-/// scope for work that belongs to no session: the accept loop's own errors, the
-/// descriptor snapshot, pool refills, the --check probes. Their records carry
-/// conn_id = 0, which is the documented way to say so.
-pub fn scope_global<F>(handle: Arc<LogHandle>, future: F) -> impl Future<Output = F::Output>
-where
-    F: Future,
-{
-    scope(0, handle, future)
-}
-
-/// True when the current task is inside a scope. Used by the process-wide
-/// emitters to assert they were set up, since forgetting is otherwise silent.
-#[cfg(test)]
-pub fn inside_scope() -> bool {
-    LOG_CTX.try_with(|_| ()).is_ok()
-}
-
 /// Emits into the current scope, or does nothing when there is none.
 ///
 /// The no-op is deliberate: a record emitted from a task nobody scoped is a
 /// missing log line, and taking the connection down over one would be a
-/// strictly worse trade.
+/// strictly worse trade. The scope's handle is borrowed, not cloned.
 pub fn emit(category: Category, level: Level, event: Event) {
-    let _ = LOG_CTX.try_with(|ctx| ctx.handle.emit(ctx.conn_id, category, level, event));
+    let _ = logreel::with_current::<Event, _>(|inner, conn_id| {
+        let _ = inner.emit(logreel_level(level), category as u8, conn_id, event);
+    });
 }
 
 /// LogHandle::enabled for the current scope. Without a scope nothing is enabled,
 /// so a producer outside one does not even build its payload.
 pub fn enabled(category: Category, level: Level) -> bool {
-    LOG_CTX
-        .try_with(|ctx| ctx.handle.enabled(category, level))
-        .unwrap_or(false)
+    logreel::with_current::<Event, _>(|inner, _| {
+        inner.enabled(category as u8, logreel_level(level))
+    })
+    .unwrap_or(false)
 }
 
 /// True when the *text view* renders records at level and above.
@@ -734,9 +721,10 @@ pub fn enabled(category: Category, level: Level) -> bool {
 /// handshake refused before a session existed. Without a scope, or with the text
 /// log off, nothing is written.
 pub fn text_keeps(level: Level) -> bool {
-    LOG_CTX
-        .try_with(|ctx| ctx.handle.text_keeps(level))
+    TEXT_FLOOR
+        .try_with(|filter| filter.keeps(level))
         .unwrap_or(false)
+        && logreel::with_current::<Event, _>(|_, _| ()).is_some()
 }
 
 /// Writes one line that is not a record: stderr, one write, tg-ws-proxy: in
