@@ -338,20 +338,22 @@ toolchain, each end of a row from the same profile — the musl targets against 
 
 | Target | upstream 2.5.4 | default (no features) | `log-disk` | `log-disk,log-zstd` |
 |---|---|---|---|---|
-| `x86_64-unknown-linux-gnu` | 4 476 440 B | 4 570 696 B (**+2.1 %**) | 5 788 768 B (+29 %) | 6 736 088 B (+51 %) |
+| `x86_64-unknown-linux-gnu` | 4 476 440 B | 4 641 384 B (**+3.7 %**) | 4 933 752 B (+10 %) | 5 850 488 B (+31 %) |
 | `x86_64-unknown-linux-musl` | 4 616 816 B | 4 708 432 B (**+2.0 %**) | 5 920 880 B (+28 %) | 6 867 056 B (+49 %) |
 | `aarch64-unknown-linux-musl` | 3 862 600 B | 3 958 328 B (**+2.5 %**) | 4 945 504 B (+28 %) | 5 699 168 B (+48 %) |
 | `armv7-unknown-linux-musleabihf` | 3 695 320 B | 3 808 728 B (**+3.1 %**) | 4 828 648 B (+31 %) | 5 610 984 B (+52 %) |
 
-Read the second column as what the logging rework itself costs: the schema, the pipeline, the text
-projection and the ring are **92…113 KB** — 2–3 % of the binary — and that build has no storage engine
-in it at all. The third column is the sink: the segment file, day rotation, the retention sweep, the
-reader verbs and the `prost` decode they need, **0.99…1.22 MB** when the table was measured with the
-previous storage engine; the current one is smaller (see `artifacts/INTEGRATION-RESULT-2026-11-01.md`
-for the measured x86-64 comparison). The fourth is the
-zstd codec, another **0.75…0.95 MB** (15–16 % of the sink build), which is why it is a feature of its
-own and why the armv7 and MIPS packages ship without it: 0.75 MB of flash on a router buys less than
-the compression saves.
+Read the second column as what the always-linked pipeline costs: the schema, the filters, the
+writer and the text view are **165 KB — 3.7 %** of the gnu binary, and that build has no storage
+engine in it at all. The third column is the sink: the segment file, day rotation, retention, the
+reader verbs and the `prost` decode they need, **292 KB (6.3 %)** on top of the text-only build. The
+fourth is the zstd codec, another **917 KB** (19 % of the sink build), which is why it is a feature of
+its own and why the armv7 and MIPS packages ship without it: close to a megabyte of flash on a router
+buys less than the compression saves.
+
+The gnu row was re-measured after the logging library moved to 0.3.0 and the old batch envelope left
+the runtime (see `artifacts/REFACTOR-RESULT-2026-11-01.md`); the musl rows are the previous
+measurement and were not rebuilt for that revision.
 
 The same source built for gnu is ~135 KB smaller than its musl twin, so a gnu baseline against a musl
 build would overstate the increase by about four points; no row here does that. A build without the
