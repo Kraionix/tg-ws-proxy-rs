@@ -119,6 +119,7 @@ impl TextTarget {
         }
     }
 
+    #[cfg(test)]
     pub fn is_off(&self) -> bool {
         matches!(self, Self::Off)
     }
@@ -189,6 +190,7 @@ impl TextSink {
         }
     }
 
+    #[cfg(test)]
     pub fn is_off(&self) -> bool {
         matches!(self, Self::Off)
     }
@@ -262,6 +264,7 @@ impl View {
     /// *some* consumer wanted it — the segment, the ring or the text — so a
     /// view with a floor of `warn` sees warnings here that the segment may have
     /// dropped, and a ring at `debug` keeps records the text never prints.
+    #[cfg(test)]
     pub fn show(&mut self, record: &LogRecord) {
         let Some(event) = record.event.as_ref() else {
             return;
@@ -365,11 +368,13 @@ impl View {
     }
 
     /// The records the ring holds, for tests and for the future status page.
+    #[cfg(test)]
     pub fn ring(&self) -> impl Iterator<Item = &LogRecord> {
         self.ring.iter()
     }
 
     /// Where the last few hundred records would go, as the banner says it.
+    #[cfg(test)]
     pub fn sink_name(&self) -> &'static str {
         match self.sink {
             TextSink::Off => "off",

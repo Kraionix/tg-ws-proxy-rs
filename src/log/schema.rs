@@ -32,9 +32,14 @@
 /// behind a classified error, and the two pool counters.
 pub const SCHEMA_VERSION: u32 = 2;
 
-/// Upper bound on distinct `conn_id`s in one [`LogBatch`], so that
-/// `STOR:by_conn`'s key prefix stays selective: a batch spanning more sessions
-/// than this is split even though it would encode fine.
+/// Historical bound on distinct `conn_id`s in one [`LogBatch`].
+///
+/// The writer used to cut a batch when a seventeenth session appeared, so that
+/// the old store's per-connection key prefix stayed selective. Nothing splits
+/// batches by connection any more -- the library's `batch_max` decides where a
+/// batch ends, and a converted day can hold far more sessions than this -- but
+/// the number is still hashed into [`fingerprint`], and removing it would move
+/// the hash and refuse every `.redb` file written before the segment backend.
 pub const BATCH_MAX_UNIQUE_CONNS: usize = 16;
 
 // ── Envelope ───────────────────────────────────────────────────────────────
@@ -888,6 +893,7 @@ pub fn fingerprint() -> u64 {
 
     let mut hasher = Sha256::new();
     hasher.update(SCHEMA_VERSION.to_le_bytes());
+    // Historical: see the constant. Hashed so old files keep converting.
     hasher.update((BATCH_MAX_UNIQUE_CONNS as u32).to_le_bytes());
     for values in enum_values() {
         for value in values {
@@ -1164,41 +1170,11 @@ pub(crate) fn canonical_records() -> [LogRecord; 22] {
     ]
 }
 
-/// Splits `records` into batches of at most [`BATCH_MAX_UNIQUE_CONNS`] distinct
-/// connections and computes each batch's header. Records keep their order and
-/// are never dropped or reordered; a batch boundary falls where the next record
-/// would introduce a seventeenth connection.
-pub fn build_batch(records: &[LogRecord]) -> Vec<LogBatch> {
-    let mut batches = Vec::new();
-    let mut conns: Vec<u64> = Vec::with_capacity(BATCH_MAX_UNIQUE_CONNS);
-    let mut start = 0;
-
-    for (i, record) in records.iter().enumerate() {
-        if conns.contains(&record.conn_id) {
-            continue;
-        }
-        if conns.len() == BATCH_MAX_UNIQUE_CONNS {
-            let closed = std::mem::replace(&mut conns, Vec::with_capacity(BATCH_MAX_UNIQUE_CONNS));
-            batches.push(batch_of(&records[start..i], closed));
-            start = i;
-        }
-        conns.push(record.conn_id);
-    }
-
-    if start < records.len() {
-        batches.push(batch_of(&records[start..], conns));
-    }
-    batches
-}
-
-/// The header for one batch of records, without the connection-count split.
+/// The header for one batch of records.
 ///
-/// [`build_batch`] is the writer's rule: a batch holds at most
-/// [`BATCH_MAX_UNIQUE_CONNS`] sessions, so a batch is cut when the next record
-/// would add a seventeenth. A reader rebuilding a header for a batch that is
-/// already in a file must not apply that rule: the frame is the boundary, and a
-/// converted day can hold far more sessions than the writer would ever have put
-/// in one batch.
+/// A reader rebuilding a header for a batch that is already in a file must use
+/// the frame as the boundary: a converted day can hold far more sessions than
+/// the writer would ever have put in one batch.
 pub fn header_for(records: &[LogRecord]) -> BatchHeader {
     let mut header = BatchHeader {
         ts_first_ns: u64::MAX,
@@ -1234,42 +1210,6 @@ pub fn header_for(records: &[LogRecord]) -> BatchHeader {
     conns.sort_unstable();
     header.conn_ids = conns;
     header
-}
-
-fn batch_of(records: &[LogRecord], mut conns: Vec<u64>) -> LogBatch {
-    let mut header = BatchHeader {
-        ts_first_ns: u64::MAX,
-        ts_last_ns: 0,
-        record_count: records.len() as u32,
-        kind_mask: 0,
-        dc_mask: 0,
-        dc_media_mask: 0,
-        conn_ids: Vec::new(),
-    };
-
-    for record in records {
-        let (tag, dc, is_media) = shape(record);
-        if tag != 0 {
-            header.kind_mask |= 1u64 << (tag - 16);
-        }
-        if let Some(bit) = dc.and_then(dc_bit) {
-            let mask = 1u32 << bit;
-            header.dc_mask |= mask;
-            if is_media {
-                header.dc_media_mask |= mask;
-            }
-        }
-        header.ts_first_ns = header.ts_first_ns.min(record.ts_ns);
-        header.ts_last_ns = header.ts_last_ns.max(record.ts_ns);
-    }
-
-    conns.sort_unstable();
-    header.conn_ids = conns;
-
-    LogBatch {
-        header: Some(header),
-        records: records.to_vec(),
-    }
 }
 
 /// Oneof tag, DC and media flag for a record — a single exhaustive match, so

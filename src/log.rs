@@ -195,11 +195,13 @@ impl Filter {
     }
 
     /// Keeps nothing.
+    #[cfg(test)]
     pub const fn off() -> Self {
         Self::Off
     }
 
     /// True when this policy keeps nothing at all.
+    #[cfg(test)]
     pub fn is_off(self) -> bool {
         matches!(self, Self::Off)
     }
@@ -381,6 +383,7 @@ impl LogHandle {
 
     /// Records that did not fit the channel. Not an error: the alternative
     /// would be blocking a connection on a logging write.
+    #[cfg(test)]
     pub fn dropped(&self) -> u32 {
         self.inner.dropped().min(u64::from(u32::MAX)) as u32
     }
@@ -702,6 +705,7 @@ where
 
 /// True when the current task is inside a scope. Used by the process-wide
 /// emitters to assert they were set up, since forgetting is otherwise silent.
+#[cfg(test)]
 pub fn inside_scope() -> bool {
     LOG_CTX.try_with(|_| ()).is_ok()
 }

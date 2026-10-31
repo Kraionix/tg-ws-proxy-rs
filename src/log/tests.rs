@@ -430,9 +430,7 @@ fn header_masks_follow_the_records() {
         records[i].ts_ns = ts_ns;
     }
 
-    let batches = build_batch(&records);
-    assert_eq!(batches.len(), 1);
-    let header = batches[0].header.clone().unwrap();
+    let header = header_for(&records);
 
     assert_eq!(header.record_count, 6);
     assert_eq!(header.ts_first_ns, 100);
@@ -450,73 +448,18 @@ fn header_masks_follow_the_records() {
     // Only the dc 2 session is a media session.
     assert_eq!(header.dc_media_mask, 0b10);
     assert_eq!(header.conn_ids, vec![42]);
-    assert_eq!(batches[0].records, records);
 }
 
 #[test]
-fn split_respects_the_unique_conn_bound() {
-    // Two rounds over the same 16 connections do not split: the bound is on
-    // distinct connections, not on record count.
-    let mut records: Vec<LogRecord> = (0..2)
-        .flat_map(|_| {
-            (0..16u64).map(|conn| {
-                event_for(
-                    conn,
-                    Event::PoolMiss(PoolMiss {
-                        ctx: Some(Ctx::new(2, false, Tier::Ws)),
-                    }),
-                )
-            })
-        })
-        .collect();
-    assert_eq!(build_batch(&records).len(), 1);
-
-    // A seventeenth connection in the middle splits where it appears, not at
-    // the end and not on the record that happens to be last.
-    records.insert(
-        5,
-        event_for(
-            99,
-            Event::PoolHit(PoolHit {
-                ctx: Some(Ctx::new(2, false, Tier::Ws)),
-                left: 0,
-            }),
-        ),
-    );
-
-    let batches = build_batch(&records);
-    assert_eq!(batches.len(), 2);
-    for batch in &batches {
-        let header = batch.header.as_ref().unwrap();
-        assert!(
-            header.conn_ids.len() <= BATCH_MAX_UNIQUE_CONNS,
-            "{header:?}"
-        );
-        assert_eq!(header.record_count as usize, batch.records.len());
-        assert!(
-            header.conn_ids.windows(2).all(|w| w[0] < w[1]),
-            "conn_ids must be sorted and deduplicated: {header:?}"
-        );
-    }
-    assert_eq!(
-        batches[0].header.as_ref().unwrap().record_count,
-        16,
-        "the split happens on the record that would introduce a seventeenth connection"
-    );
-
-    let flattened: Vec<u64> = batches
-        .iter()
-        .flat_map(|b| b.records.iter().map(|r| r.conn_id))
-        .collect();
-    assert_eq!(
-        flattened,
-        records.iter().map(|r| r.conn_id).collect::<Vec<_>>()
-    );
-}
-
-#[test]
-fn empty_input_makes_no_batches() {
-    assert!(build_batch(&[]).is_empty());
+fn an_empty_batch_has_an_empty_header() {
+    let header = header_for(&[]);
+    assert_eq!(header.record_count, 0);
+    assert_eq!(header.ts_first_ns, 0);
+    assert_eq!(header.ts_last_ns, 0);
+    assert_eq!(header.kind_mask, 0);
+    assert_eq!(header.dc_mask, 0);
+    assert_eq!(header.dc_media_mask, 0);
+    assert!(header.conn_ids.is_empty());
 }
 
 #[test]
@@ -639,6 +582,7 @@ fn encoded_sizes_fit_the_storage_budget() {
     );
 }
 
+#[cfg(feature = "log-disk")]
 fn event_for(conn_id: u64, event: Event) -> LogRecord {
     LogRecord {
         conn_id,
@@ -744,13 +688,10 @@ fn batch_from_encoded(batch: &logreel::EncodedBatch) -> LogBatch {
         });
     }
 
-    let mut batches = build_batch(&records);
-    assert_eq!(
-        batches.len(),
-        1,
-        "one encoded batch decodes to one proxy batch"
-    );
-    batches.remove(0)
+    LogBatch {
+        header: Some(header_for(&records)),
+        records,
+    }
 }
 
 /// A reader over a batch payload; the format is the library's, the arithmetic
@@ -1511,9 +1452,10 @@ fn batch_of(conn_ids: &[u64]) -> LogBatch {
             record
         })
         .collect();
-    let mut batches = build_batch(&records);
-    assert_eq!(batches.len(), 1, "the fixture fits in one batch");
-    batches.remove(0)
+    LogBatch {
+        header: Some(header_for(&records)),
+        records,
+    }
 }
 
 /// A batch with the variety real traffic has: mixed event kinds, different
@@ -1581,7 +1523,10 @@ fn rich_batch() -> LogBatch {
         })
         .collect();
 
-    build_batch(&records).remove(0)
+    LogBatch {
+        header: Some(header_for(&records)),
+        records,
+    }
 }
 
 #[cfg(feature = "log-disk")]
@@ -1635,6 +1580,8 @@ fn a_segment_from_another_schema_is_refused_rather_than_appended_to() {
         max_total_bytes: 0,
         compress,
         zstd_level: 3,
+        retention_anchor: logreel::file::RetentionAnchor::Clock,
+        on_warning: None,
     };
     let mut store = logreel::file::FileStore::open(foreign).expect("the foreign store opens");
     store
@@ -1927,7 +1874,6 @@ fn the_segment_records_its_provenance() {
     );
 }
 
-#[cfg(feature = "log-disk")]
 #[test]
 fn the_fingerprint_follows_the_schema() {
     // Pinned so that a change to a field number, a tag or an enum value cannot
