@@ -15,6 +15,19 @@ transport frame, re-encrypts it for the target DC, and forwards it — preferrin
 tunnel to `wss://kwsN.web.telegram.org/apiws`, with Cloudflare-proxy, Cloudflare-Worker, upstream
 MTProto proxy, and raw TCP as successive fallbacks.
 
+## This fork
+
+This repository is the `Kraionix` fork of `valnesfjord/tg-ws-proxy-rs`.
+
+- **`main` carries the structured-logging line.** The record stream, the text view rendered from it
+  and the `.seg` sink are this fork's work. The commits written on `feat/structured-logging` are the
+  ones on `main`, so the tree differs from upstream by more than the log, and upstream's release notes
+  do not describe it.
+- **No pull requests to upstream.** The rework is maintained here deliberately; upstream stays
+  reference material, not a merge target.
+- The logging library is [logreel](https://github.com/Kraionix/logreel), a separate public repository,
+  vendored below.
+
 ## Repository layout
 
 ```
@@ -156,7 +169,8 @@ requests, so add a rehearsal there when adding one.
   Worker, TCP fallback, `--check`, and the default-domain fetch all call into the shared outbound
   connector so proxy/NO_PROXY behavior stays consistent. Don't open a raw `TcpStream::connect`
   elsewhere.
-- **The logging library is vendored.** `vendor/logreel/` is produced only by
+- **The logging library is vendored.** [`logreel`](https://github.com/Kraionix/logreel) lives in its
+  own repository; `vendor/logreel/` is produced only by
   `tools/sync-logreel.sh` from a pinned commit and patched only there (see `VENDORED.md`); do not
   edit it by hand, and re-run the script after moving the library forward. Its text/ring features do
   not exist: the text view and the ring are this crate's observer in `src/log/view.rs`.

@@ -25,6 +25,12 @@ proxy's observer renders each record as it arrives and keeps its own bounded buf
 segment filter drops can still be on the console, and `--ring-level` stays independent of
 `--log-level`.
 
+The stream underneath them is [`logreel`](https://github.com/Kraionix/logreel), a separate library with
+its own format specification: typed events, an append-only segment with a 56-byte header and
+CRC-framed batches, and a reader that needs no codec. The pinned copy under `vendor/logreel/` is
+produced only by `tools/sync-logreel.sh`, so the normative description of the bytes is
+[logreel's `docs/SPEC.md`](https://github.com/Kraionix/logreel/blob/main/docs/SPEC.md), not this guide.
+
 ## The four things on the console
 
 | what | where | when |

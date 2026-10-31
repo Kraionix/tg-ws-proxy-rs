@@ -387,6 +387,11 @@ cooldown are all documented in [docs/Fallbacks.md](docs/Fallbacks.md).
 | [docs/CfWorker.md](docs/CfWorker.md) | Cloudflare Worker TCP tunnel setup |
 | [AGENTS.md](AGENTS.md) | Repository layout and conventions for contributors |
 
+The record pipeline — typed events, the segment framing, the day rotation and
+the reader — is [`logreel`](https://github.com/Kraionix/logreel), vendored at a
+pinned commit under `vendor/logreel/`. The rendered text and the `SIGUSR1` ring
+are the proxy's own observer, not the library's.
+
 Releases and changes are announced on the Telegram channel
 [@tg_ws_proxy_rs](https://t.me/tg_ws_proxy_rs).
 
