@@ -61,29 +61,22 @@ pub fn run(command: &Command) -> ExitCode {
     }
 }
 
-/// The segments in `dir`, in date order — the order they were written in.
-fn segments(dir: &Path) -> io::Result<Vec<Segment>> {
-    let mut found = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let path = entry?.path();
-        // The extension, not the stem: a read copy (`.<date>.seg.read-<pid>`)
-        // is not a segment, and neither is anything else an operator left here.
-        if path.extension().is_none_or(|extension| extension != "seg") {
-            continue;
-        }
-        // Owned before the path moves into the struct below: the stem borrows
-        // the path, and the struct needs both.
-        let Some(date) = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(str::to_string)
-        else {
-            continue;
-        };
-        found.push(Segment { path, date });
-    }
-    found.sort_by(|a, b| a.date.cmp(&b.date));
-    Ok(found)
+/// The segments in `dir`, in date order — the library lists and names them.
+///
+/// A read copy (`.<date>.seg.read-<pid>`) or a file an operator left here is
+/// not a segment: `logreel::file::segments` keeps only names that spell a day.
+fn segments(dir: &Path) -> Result<Vec<Segment>, logreel::StoreError> {
+    Ok(logreel::file::segments(dir)?
+        .into_iter()
+        .filter_map(|path| {
+            let date = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(logreel::file::segment_day)?
+                .to_owned();
+            Some(Segment { path, date })
+        })
+        .collect())
 }
 
 fn probe(dir: &Path) -> ExitCode {
