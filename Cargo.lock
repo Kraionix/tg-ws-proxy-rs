@@ -1183,7 +1183,7 @@ dependencies = [
 
 [[package]]
 name = "tg-ws-proxy-rs"
-version = "2.5.4-struct-logging"
+version = "2.5.10-struct-logging"
 dependencies = [
  "aes",
  "async-http-proxy",

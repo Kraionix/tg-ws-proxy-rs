@@ -137,6 +137,8 @@ fn shape(record: &LogRecord) -> (u32, Option<u32>, bool) {
         Some(Event::AttemptSkipped(e)) => tagged(35, &e.ctx),
         Some(Event::DomainListFetched(_)) => (36, None, false),
         Some(Event::Shutdown(_)) => (37, None, false),
+        Some(Event::CooldownReprobe(e)) => tagged(38, &e.ctx),
+        Some(Event::DomainRefetch(_)) => (39, None, false),
         None => (0, None, false),
     }
 }
@@ -584,6 +586,8 @@ fn event_name(event: &Event) -> &'static str {
         Event::AttemptSkipped(_) => "AttemptSkipped",
         Event::DomainListFetched(_) => "DomainListFetched",
         Event::Shutdown(_) => "Shutdown",
+        Event::CooldownReprobe(_) => "CooldownReprobe",
+        Event::DomainRefetch(_) => "DomainRefetch",
     }
 }
 
@@ -747,6 +751,21 @@ fn event_json(event: &Event) -> String {
                 "signal",
                 enum_json::<schema::ShutdownSignal>(payload.signal),
             ),
+        ]),
+        Event::CooldownReprobe(payload) => object(&[
+            ("ctx", ctx_json(&payload.ctx)),
+            ("event", string("CooldownReprobe")),
+            ("key", string(&payload.key_display)),
+            ("kind", enum_json::<schema::CooldownKind>(payload.kind)),
+        ]),
+        Event::DomainRefetch(payload) => object(&[
+            ("attempt", number(payload.attempt)),
+            ("count", number(payload.count)),
+            ("err", enum_json::<schema::ErrorCode>(payload.err)),
+            ("err_code", number(payload.err_code)),
+            ("event", string("DomainRefetch")),
+            ("exhausted", bool_of(payload.exhausted)),
+            ("ok", bool_of(payload.ok)),
         ]),
     }
 }

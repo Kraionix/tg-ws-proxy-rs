@@ -124,6 +124,12 @@ pub enum Event {
     DomainListFetched(DomainListFetched),
     #[prost(message, tag = "37")]
     Shutdown(Shutdown),
+    /// A cooled rung dialled again because every other rung failed.
+    #[prost(message, tag = "38")]
+    CooldownReprobe(CooldownReprobe),
+    /// A background re-fetch of the default domain list.
+    #[prost(message, tag = "39")]
+    DomainRefetch(DomainRefetch),
 }
 
 // ── Enums ──────────────────────────────────────────────────────────────────
@@ -269,6 +275,9 @@ pub enum ProbeKind {
     CfWorker = 2,
     MtprotoProxy = 3,
     Listener = 4,
+    /// The background re-test of a `--dc-ip` address whose cooldown ran out.
+    /// No client is behind it, so it is not a session event.
+    IpFail = 5,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -523,6 +532,22 @@ pub struct CooldownSkipped {
     pub key_display: String,
 }
 
+/// `EVT:cooldown_reprobe` — a cooled rung tried again, out of turn.
+///
+/// The default ladder records its re-probe as the step back up from TCP; a pin
+/// has no such step, so without this event the one thing that could still save
+/// the client is missing from the segment.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CooldownReprobe {
+    #[prost(message, optional, tag = "1")]
+    pub ctx: Option<Ctx>,
+    #[prost(enumeration = "CooldownKind", tag = "2")]
+    pub kind: i32,
+    /// The cooldown's key as the operator would recognise it.
+    #[prost(string, tag = "3")]
+    pub key_display: String,
+}
+
 /// `EVT:pool_hit` — a pre-warmed connection was reused.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PoolHit {
@@ -734,6 +759,31 @@ pub struct DomainListFetched {
     pub err_code: u32,
 }
 
+/// `EVT:domain_refetch` — a background retry of the default domain list.
+///
+/// The startup fetch warns once that the built-in list is in use; this is how
+/// the segment says the list later changed (or that the hour of retries ran
+/// out), which the console-only version of this behaviour could not.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DomainRefetch {
+    /// 1-based attempt number, so a segment shows how long the run has been
+    /// serving the built-in list.
+    #[prost(uint32, tag = "1")]
+    pub attempt: u32,
+    #[prost(bool, tag = "2")]
+    pub ok: bool,
+    /// Domains now in use; zero until an attempt succeeds.
+    #[prost(uint32, tag = "3")]
+    pub count: u32,
+    #[prost(enumeration = "ErrorCode", tag = "4")]
+    pub err: i32,
+    #[prost(uint32, tag = "5")]
+    pub err_code: u32,
+    /// The loop gave up after this attempt: the built-in list stays in use.
+    #[prost(bool, tag = "6")]
+    pub exhausted: bool,
+}
+
 /// `EVT:shutdown` — the process being asked to stop, and stopping.
 ///
 /// Written through the sink it is describing, which is why it exists: the last
@@ -930,6 +980,7 @@ fn enum_values() -> [&'static [i32]; 13] {
             ProbeKind::CfWorker as i32,
             ProbeKind::MtprotoProxy as i32,
             ProbeKind::Listener as i32,
+            ProbeKind::IpFail as i32,
         ],
         &[
             Reason::Unspecified as i32,
@@ -991,7 +1042,7 @@ fn enum_values() -> [&'static [i32]; 13] {
 /// The text view renders this same corpus in `render::tests`, which is how a
 /// variant that gains no line is caught twice: once by the exhaustive match and
 /// once by a test that would otherwise be looking at an empty line.
-pub(crate) fn canonical_records() -> [LogRecord; 22] {
+pub(crate) fn canonical_records() -> [LogRecord; 24] {
     let record = |event: Event| LogRecord {
         ts_ns: 1,
         conn_id: 1,
@@ -1125,6 +1176,19 @@ pub(crate) fn canonical_records() -> [LogRecord; 22] {
             count: 1,
             err: ErrorCode::Dns as i32,
             err_code: 1,
+        })),
+        record(Event::CooldownReprobe(CooldownReprobe {
+            ctx: Some(Ctx::new(1, true, Tier::Ws)),
+            kind: CooldownKind::IpFail as i32,
+            key_display: "192.0.2.1".to_string(),
+        })),
+        record(Event::DomainRefetch(DomainRefetch {
+            attempt: 2,
+            ok: true,
+            count: 3,
+            err: ErrorCode::Dns as i32,
+            err_code: 4,
+            exhausted: true,
         })),
         record(Event::Shutdown(Shutdown {
             phase: ShutdownPhase::Forced as i32,

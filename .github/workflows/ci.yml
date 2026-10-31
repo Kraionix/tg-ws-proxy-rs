@@ -74,9 +74,18 @@ jobs:
             python3 -c 'import sys; current = tuple(map(int, sys.argv[1].split("."))); base = tuple(map(int, sys.argv[2].split("."))); sys.exit(0 if current > base else 1)' "$1" "$2"
           }
 
+          # The fork build is `X.Y.Z-struct-logging`: not publishable to
+          # crates.io, and it sorts below plain X.Y.Z on purpose, so the release
+          # it is based on is never claimed. It is still a version the checks
+          # below can compare, which is why the suffix is allowed and only the
+          # numeric prefix is compared.
+          numeric() {
+            printf '%s' "${1%%-*}"
+          }
+
           current_version="$(read_version Cargo.toml)"
-          if [[ ! "$current_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error file=Cargo.toml::package.version must be numeric X.Y.Z, got '$current_version'"
+          if [[ ! "$current_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-struct-logging)?$ ]]; then
+            echo "::error file=Cargo.toml::package.version must be numeric X.Y.Z (optionally -struct-logging), got '$current_version'"
             exit 1
           fi
 
@@ -85,12 +94,12 @@ jobs:
             git show "origin/${GITHUB_BASE_REF}:Cargo.toml" > /tmp/base-Cargo.toml
             base_version="$(read_version /tmp/base-Cargo.toml)"
 
-            if [[ ! "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              echo "::error::base package.version must be numeric X.Y.Z, got '$base_version'"
+            if [[ ! "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-struct-logging)?$ ]]; then
+              echo "::error::base package.version must be numeric X.Y.Z (optionally -struct-logging), got '$base_version'"
               exit 1
             fi
 
-            if ! compare_versions "$current_version" "$base_version"; then
+            if ! compare_versions "$(numeric "$current_version")" "$(numeric "$base_version")"; then
               echo "::error file=Cargo.toml::package.version must be greater than base branch version ($base_version), got '$current_version'"
               exit 1
             fi

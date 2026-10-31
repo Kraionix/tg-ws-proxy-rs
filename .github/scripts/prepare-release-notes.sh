@@ -11,8 +11,11 @@ TAG="$1"
 OUTPUT="$2"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)(-beta\.[1-9][0-9]*)?$ ]]; then
-    printf 'error: release tag must be vX.Y.Z or vX.Y.Z-beta.N: %s\n' "$TAG" >&2
+# The fork's build carries a `-struct-logging` suffix before any beta
+# qualifier; its notes are per full version (2.5.10-struct-logging.md), so the
+# base version the file is looked up by is the suffixed one.
+if [[ ! "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+(-struct-logging)?)(-beta\.[1-9][0-9]*)?$ ]]; then
+    printf 'error: release tag must be vX.Y.Z[-struct-logging] or vX.Y.Z[-struct-logging]-beta.N: %s\n' "$TAG" >&2
     exit 1
 fi
 

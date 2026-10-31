@@ -1895,7 +1895,7 @@ fn the_fingerprint_follows_the_schema() {
     // land without someone noticing that it moved.
     assert_eq!(
         fingerprint(),
-        0x6a72_5f4f_33ea_d554_u64,
+        0x0d38_0a48_bbf8_f473_u64,
         "the wire format changed"
     );
 }

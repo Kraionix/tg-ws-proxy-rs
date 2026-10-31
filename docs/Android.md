@@ -23,6 +23,17 @@ starts, the `tg://` link arrives through the listen callback (not by scraping
 the log), and `--log-file` is gone — `--text-log` writes the rendered text to a
 path the app can read.
 
+## Quick Settings tile
+
+Pull down the notification shade, open the tile editor (the pencil icon) and
+drag **TG WS Proxy** into the active tiles. Tapping it starts or stops the
+proxy with the arguments last saved in the app, so set them up there once.
+The tile shows the same running state as the app's Start/Stop button.
+
+If the system refuses to start the proxy from the tile (some vendor builds
+restrict starting a foreground service outside the app), the tile opens the
+app instead, and **Start** there works as usual.
+
 ## Requirements
 
 - JDK 17+ already on `PATH`. The Gradle wrapper downloads *Gradle*, not a JDK:

@@ -510,7 +510,7 @@ fn process_wide_events_carry_a_subsystem_tag() {
                     err_code: 0,
                 }),
             ),
-            " WARN default CF domains: 3 from built-in fallback (fetch failed: dns)",
+            " WARN default CF domains: 3 from built-in fallback (fetch failed: dns), re-fetching in the background",
         ),
         (
             "a stop signal",

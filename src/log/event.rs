@@ -1,6 +1,6 @@
 //! The bridge between the proxy's record schema and the library's event contract.
 //!
-//! The schema in [`super::schema`] is not replaced: it is what the 22 event
+//! The schema in [`super::schema`] is not replaced: it is what the 24 event
 //! types and their field numbers are written in, what the artifact fixes, and
 //! what `render.rs` and the reader verbs already speak. What the library needs
 //! is an implementation of [`logreel::Event`]: the absolute kind of a value, a
@@ -18,8 +18,8 @@
 //!   [`schema::fingerprint`], so the test below compares the two rather than
 //!   trusting a number somebody remembered to update.
 //!
-//! Kind space: the oneof tags are 16..=37, and [`logreel::Event::BASE`] is 16,
-//! so a record's local kind is 0..=21 and the batch kind mask has one bit per
+//! Kind space: the oneof tags are 16..=39, and [`logreel::Event::BASE`] is 16,
+//! so a record's local kind is 0..=23 and the batch kind mask has one bit per
 //! event in the order the schema declares them — the same layout the redb batch
 //! header used, which is what keeps a converted segment's `kind_mask` equal to
 //! the one its source carried.
@@ -30,7 +30,7 @@ use super::schema::Event;
 pub const CODEC_ID: u16 = 1;
 
 /// Events in the schema, one per oneof variant.
-pub const KIND_COUNT: u16 = 22;
+pub const KIND_COUNT: u16 = 24;
 
 /// Tag of the first event; kinds are absolute, the library subtracts the base.
 pub const BASE_KIND: u16 = 16;
@@ -41,7 +41,7 @@ pub const BASE_KIND: u16 = 16;
 /// second half carries the schema version and the event count: a build that
 /// bumps one without the other still writes a different header, which is the
 /// point of a tripwire.
-pub const SCHEMA_HASH: [u8; 16] = [84, 213, 234, 51, 79, 95, 114, 106, 2, 0, 0, 0, 22, 0, 0, 0];
+pub const SCHEMA_HASH: [u8; 16] = [115, 244, 248, 187, 72, 10, 56, 13, 2, 0, 0, 0, 24, 0, 0, 0];
 
 impl logreel::Event for Event {
     const CODEC_ID: u16 = CODEC_ID;
@@ -73,6 +73,8 @@ impl logreel::Event for Event {
             Self::AttemptSkipped(_) => 35,
             Self::DomainListFetched(_) => 36,
             Self::Shutdown(_) => 37,
+            Self::CooldownReprobe(_) => 38,
+            Self::DomainRefetch(_) => 39,
         }
     }
 
@@ -100,6 +102,8 @@ impl logreel::Event for Event {
             Self::AttemptSkipped(message) => put(message, out),
             Self::DomainListFetched(message) => put(message, out),
             Self::Shutdown(message) => put(message, out),
+            Self::CooldownReprobe(message) => put(message, out),
+            Self::DomainRefetch(message) => put(message, out),
         }
     }
 
@@ -127,6 +131,8 @@ impl logreel::Event for Event {
             35 => Self::AttemptSkipped(get(bytes, kind)?),
             36 => Self::DomainListFetched(get(bytes, kind)?),
             37 => Self::Shutdown(get(bytes, kind)?),
+            38 => Self::CooldownReprobe(get(bytes, kind)?),
+            39 => Self::DomainRefetch(get(bytes, kind)?),
             other => {
                 return Err(logreel::DecodeError::new(other, "no event has this kind"));
             }

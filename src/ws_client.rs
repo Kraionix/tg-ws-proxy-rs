@@ -826,6 +826,10 @@ struct Upgrade {
 /// else — the SNI choice, the certificate configuration — is what the connector
 /// would have done. `sni` is the fronted hostname when one is configured,
 /// because the request's own host cannot be overridden through the connector.
+///
+/// No `result_large_err` expectation here, unlike upstream: this fork wraps the
+/// result in [`Upgrade`] and classifies the error before it is returned, so the
+/// lint does not fire and an `expect` would only be an unfulfilled warning.
 async fn tls_handshake_and_upgrade<R>(
     tcp: TcpStream,
     request: R,
@@ -935,6 +939,7 @@ pub fn cf_worker_path(dst: &str, dc: u32, is_media: bool) -> String {
 }
 
 /// Try all domains for a DC in order; return the first success or the last error.
+/// A TCP connect that times out ends the walk: every domain shares the address.
 ///
 /// Returns `(Some(stream), all_redirects)`:
 /// - `all_redirects = true` when every domain returned a redirect (WS is
@@ -1026,6 +1031,13 @@ pub async fn connect_ws_for_dc_with_outbound(
             WsConnectResult::ConnectTimedOut(_) => {
                 all_redirects = false;
                 any_connect_timed_out = true;
+
+                // Every record is dialled at the same `ip` — the hostname only
+                // reaches the SNI and Host header, after the TCP connect.  A
+                // connect that ran out the clock would run it out again for
+                // the next record, so the second attempt only doubled what a
+                // client waits before the fallback chain gets a turn (#148).
+                break;
             }
         }
 
@@ -1068,8 +1080,14 @@ pub async fn connect_ws_for_dc_with_outbound(
 pub fn cf_ws_domains(dc: u32, cf_domains: &[String], _is_media: bool) -> Vec<String> {
     cf_domains
         .iter()
-        .map(|cf_domain| format!("kws{}.{}", dc, cf_domain))
+        .map(|cf_domain| cf_record(dc, cf_domain))
         .collect()
+}
+
+/// The `kws{N}` record of one `--cf-domain` zone — the only name in the zone
+/// that is ever dialled.
+pub(crate) fn cf_record(dc: u32, cf_domain: &str) -> String {
+    format!("kws{}.{}", dc, cf_domain)
 }
 
 /// Ordering policy for the Cloudflare connect loop.
@@ -1144,7 +1162,7 @@ impl<'a> CfAttempts<'a> {
     }
 
     fn hostname(&self, domain_index: usize) -> String {
-        format!("kws{}.{}", self.dc, self.domains[domain_index])
+        cf_record(self.dc, &self.domains[domain_index])
     }
 }
 

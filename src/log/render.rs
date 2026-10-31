@@ -376,6 +376,42 @@ fn write_message(event: &Event, out: &mut String) -> bool {
                     let _ = write!(out, " {}", fetched.err_code);
                 }
                 out.push(')');
+                // The startup fetch is retried now (#159); the line says so,
+                // because otherwise the built-in list looks permanent.
+                if fetched.source == DomainSource::Builtin as i32 {
+                    out.push_str(", re-fetching in the background");
+                }
+            }
+        }
+        Event::CooldownReprobe(reprobe) => {
+            write_dc(reprobe.ctx.as_ref(), out);
+            out.push_str(cooldown_kind_text(reprobe.kind));
+            out.push_str(", re-probing");
+            if !reprobe.key_display.is_empty() {
+                out.push_str(" (");
+                out.push_str(&reprobe.key_display);
+                out.push(')');
+            }
+            out.push_str(" after every other rung failed");
+        }
+        Event::DomainRefetch(refetch) => {
+            if refetch.ok {
+                let _ = write!(
+                    out,
+                    "re-fetched the default CF domain list: {} now in use",
+                    refetch.count
+                );
+            } else if refetch.exhausted {
+                out.push_str(
+                    "gave up re-fetching the default CF domain list; built-in list stays in use",
+                );
+            } else {
+                let _ = write!(
+                    out,
+                    "default CF domain re-fetch {} failed: ",
+                    refetch.attempt
+                );
+                write_error(refetch.err, refetch.err_code, 0, out);
             }
         }
         Event::Shutdown(shutdown) => match ShutdownPhase::try_from(shutdown.phase) {

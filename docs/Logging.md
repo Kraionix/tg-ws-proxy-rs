@@ -158,17 +158,30 @@ still batches them.
 | `cooldown_armed` | warn | cooldown | a failure memory was set: kind, key (DC, IP, domain), duration |
 | `cooldown_cleared` | debug | cooldown | the memory expired or was dropped |
 | `cooldown_skipped` | debug | cooldown | a rung was not even tried because of an armed cooldown |
+| `cooldown_reprobe` | info | cooldown | a cooled rung was dialled again anyway — a pinned ladder's last rung failed, so the address gets its chance back |
 | `pool_hit` / `pool_miss` | debug | pool | a client took a pre-warmed connection, or had to dial |
 | `pool_refill` | debug | pool | background refill: how many were added, how many are ready, in what time, and the failure when it could not connect |
 | `pool_discard` | debug | pool | a pooled connection was thrown away, and why (`stale`, `closed`) |
 | `warmup_complete` | debug | pool | the startup warm-up finished: how many connections are ready |
 | `relay_init_retries` | warn | crypto | retries when the relay's first frame did not decode |
 | `accept_error` | warn | accept | an inbound connection was rejected: errno, backoff |
-| `probe_result` | info | check | a `--check` probe finished: kind, target, ok/fail, duration, failure class |
-| `domain_list_fetched` | info / warn | config | where `--default-domains` got its list; `warn` when the built-in fallback is what runs |
+| `probe_result` | info | check | a `--check` probe finished — kind, target, ok/fail, duration, failure class. `kind = ip_fail` is the background re-test of a cooled `--dc-ip`, which runs outside any session |
+| `domain_list_fetched` | info / warn | config | where `--default-domains` got its list; `warn` when the built-in fallback is what runs, and the text log then says it is re-fetching |
+| `domain_refetch` | debug / info / warn | config | a background retry of the default domain list: attempt number, success with the new count, or the give-up that leaves the built-in list in use |
 | `fd_snapshot` | debug | accept | descriptor budget: open, soft limit, permits available |
 | `shutdown` | info | config | the stop was asked for (with the signal) and it completed |
 | `log_overflow` | warn | overflow | records dropped because the writer could not keep up, and over what window |
+
+Two events describe work that outlives the session that caused it — the background re-test of a cooled
+`--dc-ip` and the retry of a failed `--default-domains` fetch. They are emitted with
+`conn_id = 0`: the DC and the media flag still identify the probe's record, and a retry belongs to
+the process, not to whichever client happened to arm it.
+
+The wire format gained these events after 2.5.4-struct-logging, so a segment this build writes has a
+different header fingerprint. New builds read old segments unchanged (the format is additive and the
+schema version stays 2); a 2.5.4-struct-logging binary refuses a segment this build wrote, the same
+way it would refuse any other schema it does not know. Downgrade with the old binary reading its own
+old files, not with it reading new ones.
 
 Levels are a floor, not a ceiling, and they belong to the *event*, not to the caller: a successful dial
 is `info` whatever rung made it, a failed one is `warn`. `--log-level warn` keeps warnings and errors
@@ -337,23 +350,26 @@ Practical choices, from cheap to durable:
 Binary size, measured on this build's release profile (`lto`, `codegen-units = 1`, `strip`), one
 toolchain, each end of a row from the same profile — the musl targets against a musl cross toolchain:
 
-| Target | upstream 2.5.4 | default (no features) | `log-disk` | `log-disk,log-zstd` |
+| Target | upstream | default (no features) | `log-disk` | `log-disk,log-zstd` |
 |---|---|---|---|---|
-| `x86_64-unknown-linux-gnu` | 4 476 440 B | 4 641 384 B (**+3.7 %**) | 4 933 752 B (+10 %) | 5 850 488 B (+31 %) |
+| `x86_64-unknown-linux-gnu` | 4 549 336 B (2.5.10) | 4 705 096 B (**+3.4 %**) | 5 006 936 B (+10 %) | 5 923 608 B (+30 %) |
 | `x86_64-unknown-linux-musl` | 4 616 816 B | 4 708 432 B (**+2.0 %**) | 5 920 880 B (+28 %) | 6 867 056 B (+49 %) |
 | `aarch64-unknown-linux-musl` | 3 862 600 B | 3 958 328 B (**+2.5 %**) | 4 945 504 B (+28 %) | 5 699 168 B (+48 %) |
 | `armv7-unknown-linux-musleabihf` | 3 695 320 B | 3 808 728 B (**+3.1 %**) | 4 828 648 B (+31 %) | 5 610 984 B (+52 %) |
 
 Read the second column as what the always-linked pipeline costs: the schema, the filters, the
-writer and the text view are **165 KB — 3.7 %** of the gnu binary, and that build has no storage
+writer and the text view are **156 KB — 3.4 %** of the gnu binary, and that build has no storage
 engine in it at all. The third column is the sink: the segment file, day rotation, retention, the
-reader verbs and the `prost` decode they need, **292 KB (6.3 %)** on top of the text-only build. The
-fourth is the zstd codec, another **917 KB** (19 % of the sink build), which is why it is a feature of
+reader verbs and the `prost` decode they need, **302 KB (6.4 %)** on top of the text-only build. The
+fourth is the zstd codec, another **917 KB** (18 % of the sink build), which is why it is a feature of
 its own and why the armv7 and MIPS packages ship without it: close to a megabyte of flash on a router
 buys less than the compression saves.
 
-The gnu row was re-measured after the logging library moved to 0.3.0 and the old batch envelope left
-the runtime (see `artifacts/REFACTOR-RESULT-2026-11-01.md`); the musl rows are the previous
+The gnu row was re-measured after the upstream 2.5.10 sync (same profile, same toolchain: the
+upstream column is a build of `v2.5.10` itself); the musl rows are still measured against the 2.5.4
+tree, so their percentages are not directly comparable to the gnu row's. The gnu row before that was
+re-measured after the logging library moved to 0.3.0 and the old batch envelope left the runtime (see
+`artifacts/REFACTOR-RESULT-2026-11-01.md`); the musl rows are the previous
 measurement and were not rebuilt for that revision.
 
 The same source built for gnu is ~135 KB smaller than its musl twin, so a gnu baseline against a musl

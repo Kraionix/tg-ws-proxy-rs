@@ -21,6 +21,7 @@
 //! client's own reader/writer halves only ever have to be moved into a single
 //! bridge call.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -38,9 +39,10 @@ use tokio::task::JoinHandle;
 use tungstenite::Message;
 
 use crate::direct_at;
+use crate::log::LogHandle;
 use crate::log::schema::{
-    Category, ClosedBy as LogClosedBy, CooldownKind, Ctx, ErrorCode, Level, Peer,
-    Reason as LogReason, Tier as LogTier,
+    Category, ClosedBy as LogClosedBy, CooldownArmed, CooldownCleared, CooldownKind, Ctx,
+    ErrorCode, Event, Level, Peer, ProbeKind, ProbeResult, Reason as LogReason, Tier as LogTier,
 };
 use crate::log_event;
 
@@ -59,7 +61,7 @@ use crate::pool::{CfTarget, CfTier, WsPool};
 use crate::runtime::Runtime;
 use crate::splitter::MsgSplitter;
 use crate::ws_client::{
-    CfDialOpts, CooldownMap, EdgeReporter, RungFailure, TgWsStream, TlsCost, WsAttempt,
+    CfDialOpts, CooldownMap, EdgeReporter, RungFailure, TgWsStream, TlsCost, WsAttempt, cf_record,
     connect_cf_worker_ws_for_dc_with_outbound_classified,
     connect_cf_ws_for_dc_with_outbound_ordered, connect_ws_for_dc_with_outbound, media_tag,
 };
@@ -117,6 +119,168 @@ static CF_WORKER_FAIL: CooldownMap<String> = CooldownMap::new();
 
 fn upstream_key(host: &str, port: u16) -> String {
     format!("{}:{}", host, port)
+}
+
+// ─── Cooled-address probe ────────────────────────────────────────────────────
+
+/// `--dc-ip` addresses with an [`IpProbe`] waiting on them.
+static IP_PROBES: StdMutex<BTreeSet<String>> = StdMutex::new(BTreeSet::new());
+
+/// Decides, off the client path, when a cooled `--dc-ip` address comes back.
+///
+/// Without it the cooldown simply ran out, and the next client to arrive
+/// dialled the address on the full connect timeout.  On a box whose address
+/// stays dark, that was one client an hour, on the dot, sitting through ten
+/// seconds of silence that Telegram's own proxy check does not wait for
+/// (#148).  So the entry is held for as long as a probe needs, and only the
+/// probe ends it: an answer clears it, another timeout re-arms it.
+///
+/// A client's own direct connect still clears it as before — the "every
+/// fallback failed" re-probe and the no-fallback path both dial regardless —
+/// and a probe that finds its entry gone simply stops.
+struct IpProbe {
+    runtime: Arc<Runtime>,
+    ip: String,
+    dc: u32,
+    is_media: bool,
+    skip_tls_verify: bool,
+    connect_timeout: Duration,
+    cooldown: Duration,
+    /// Taken from the client's scope before the spawn: [`tokio::spawn`] does not
+    /// carry a task-local, and a probe that cannot record is the one line the
+    /// console would say and the segment never hear.
+    log: Option<Arc<LogHandle>>,
+}
+
+/// Releases an address from [`IP_PROBES`] however its probe ends, including
+/// the runtime dropping the task on shutdown — an embedder that restarts the
+/// proxy in the same process would otherwise never probe that address again.
+struct IpProbeGuard(String);
+
+impl Drop for IpProbeGuard {
+    fn drop(&mut self) {
+        IP_PROBES.lock().unwrap().remove(&self.0);
+    }
+}
+
+impl IpProbe {
+    /// How long past the cooldown the entry is held: enough for one probe to
+    /// finish, so a client arriving mid-probe still steps over the address.
+    fn grace(&self) -> Duration {
+        self.connect_timeout * 2
+    }
+
+    /// Start or extend the cooldown, and make sure a probe waits at its end.
+    fn arm(self) {
+        // `--ip-fail-cooldown 0` turns the skipping off; there is no window
+        // for a probe to close.
+        if self.cooldown.is_zero() {
+            return;
+        }
+
+        IP_FAIL.set(self.ip.clone(), self.cooldown + self.grace());
+        if !IP_PROBES.lock().unwrap().insert(self.ip.clone()) {
+            return;
+        }
+
+        let guard = IpProbeGuard(self.ip.clone());
+        tokio::spawn(async move {
+            let _guard = guard;
+            self.run().await;
+        });
+    }
+
+    async fn run(self) {
+        loop {
+            tokio::time::sleep(self.cooldown).await;
+            if !IP_FAIL.active(&self.ip) {
+                return;
+            }
+
+            let started = Instant::now();
+            let attempt = tokio::time::timeout(
+                self.grace(),
+                connect_ws_for_dc_with_outbound(
+                    &self.ip,
+                    self.runtime.websocket_dc(self.dc),
+                    self.is_media,
+                    self.skip_tls_verify,
+                    self.connect_timeout,
+                    self.runtime.outbound(),
+                    self.runtime.fronting_domain(),
+                ),
+            )
+            .await;
+            // Same verdict `direct_ws` reaches: only a connect that ran out
+            // the clock says the address is still dark.
+            let still_dark = attempt.map_or(true, |a| a.ws.is_none() && a.connect_timed_out);
+            let took = started.elapsed();
+
+            if !IP_FAIL.active(&self.ip) {
+                return;
+            }
+            if !still_dark {
+                IP_FAIL.clear(&self.ip);
+                self.emit(
+                    Level::Info,
+                    Event::CooldownCleared(CooldownCleared {
+                        ctx: self.ctx(),
+                        kind: CooldownKind::IpFail as i32,
+                        key_display: self.ip.clone(),
+                    }),
+                );
+                self.report(true, took);
+                return;
+            }
+
+            let held = self.cooldown + self.grace();
+            IP_FAIL.set(self.ip.clone(), held);
+            // Info, not the Warn a client's timeout arms: the address answered
+            // no more than it did an hour ago, and nothing is lost by it.
+            self.emit(
+                Level::Info,
+                Event::CooldownArmed(CooldownArmed {
+                    ctx: self.ctx(),
+                    kind: CooldownKind::IpFail as i32,
+                    key_display: self.ip.clone(),
+                    dur_s: held.as_secs().min(u32::MAX as u64) as u32,
+                    err: ErrorCode::TcpConnectTimeout as i32,
+                    err_code: 0,
+                }),
+            );
+            self.report(false, took);
+        }
+    }
+
+    /// The probe belongs to the process, not to the session that armed it, so
+    /// its records carry no connection: [`crate::log::emit_global`] emits them
+    /// with `conn_id = 0`, and only the DC and the media flag identify the work.
+    fn emit(&self, level: Level, event: Event) {
+        crate::log::emit_global(self.log.as_ref(), Category::Cooldown, level, event);
+    }
+
+    fn ctx(&self) -> Option<Ctx> {
+        Some(Ctx::new(self.dc, self.is_media, LogTier::Ws))
+    }
+
+    /// `EVT:probe_result` — how long the re-test took and what it found.
+    fn report(&self, ok: bool, took: Duration) {
+        self.emit(
+            Level::Info,
+            Event::ProbeResult(ProbeResult {
+                kind: ProbeKind::IpFail as i32,
+                target: self.ip.clone(),
+                ok,
+                dur_ns: u64::try_from(took.as_nanos()).unwrap_or(u64::MAX),
+                err: if ok {
+                    ErrorCode::Unspecified as i32
+                } else {
+                    ErrorCode::TcpConnectTimeout as i32
+                },
+                err_code: 0,
+            }),
+        );
+    }
 }
 
 // ─── Cloudflare domain balancing ─────────────────────────────────────────────
@@ -682,7 +846,7 @@ enum WsFraming {
 /// Everything the fallback ladder needs to route one client connection.
 struct Route<'a> {
     config: &'a Config,
-    runtime: &'a Runtime,
+    runtime: &'a Arc<Runtime>,
     pool: &'a Arc<WsPool>,
     timeouts: Timeouts,
     dc: u32,
@@ -845,10 +1009,17 @@ impl Route<'_> {
     /// Each tier runs with the same pool, cooldown and fronting behavior it
     /// has in the default ladder; the first tier that produces a connection
     /// wins.  A tier that is not configured — or not reachable, like `ws` for
-    /// a DC without a `--dc-ip` target — is skipped with a log line, so the
-    /// user can see the pin referring to nothing.  When every listed tier
+    /// a DC without a `--dc-ip` target — is skipped with a debug line: a pin
+    /// plus `--dc-ip` for only some DCs is an ordinary setup, and a warning
+    /// per connection would only repeat what the banner's `Target DC IPs`
+    /// already says (#160).  When every listed tier
     /// fails, the connection is dropped: pinning is opt-in, so tiers the user
     /// left out are not quietly re-added as fallbacks.
+    ///
+    /// A cooled `--dc-ip` address follows the default ladder's two-step rule
+    /// here as well: the `ws` rung steps over it while a later rung can still
+    /// connect, and comes back for it once every rung has failed — see the
+    /// ip-cooling block of `select_upstream`, which the default ladder uses.
     ///
     /// The one departure from the default cooldown behavior is on the last
     /// tier that can still connect: the Worker and upstream-MTProto rungs
@@ -862,6 +1033,12 @@ impl Route<'_> {
         tiers: &[UpstreamTier],
         target_ip: Option<&str>,
     ) -> Option<Upstream> {
+        // A pinned ladder *replaces* the default one, so it has to carry the
+        // same two rules about a cooled `--dc-ip` address that `select_upstream`
+        // applies: step over it (otherwise every cold-pool client waits out
+        // `--ws-connect-timeout`, twice — once per `kws` record), and come back
+        // for it when every other pinned rung has failed.
+        let mut cooled_ws = None;
         for (index, tier) in tiers.iter().enumerate() {
             // The pin is a ladder of its own: each step here is the previous
             // one having failed or been skipped, and the reason is the same
@@ -881,6 +1058,28 @@ impl Route<'_> {
                         );
                         continue;
                     };
+                    // Only worth skipping while a later rung can still connect;
+                    // as the last rung this address is the client's only way
+                    // out, and the doomed attempt beats dropping the client.
+                    if !last_resort && IP_FAIL.active(target_ip) {
+                        // The default ladder records this skip three ways: the
+                        // rung not dialled, the cooldown it obeyed, and the step
+                        // down it forced. A pin's step down is the loop's own
+                        // `pinned` fallback on the next iteration, so these two
+                        // are what is left to say.
+                        log_attempt_skipped(
+                            self.ctx(UpstreamTier::Ws),
+                            UpstreamTier::Ws,
+                            LogReason::IpCooldown,
+                        );
+                        log_cooldown_skipped(
+                            self.ctx(UpstreamTier::Ws),
+                            CooldownKind::IpFail,
+                            target_ip,
+                        );
+                        cooled_ws = Some(target_ip);
+                        continue;
+                    }
                     if let Some(upstream) = self.direct_ws_tier(target_ip).await {
                         return Some(upstream);
                     }
@@ -929,6 +1128,18 @@ impl Route<'_> {
                     };
                     return Some(self.tcp_fallback(dst));
                 }
+            }
+        }
+
+        // Stepped over, not written off: a direct connect is the only thing
+        // that clears the cooldown, so something has to keep asking.  Every
+        // pinned rung has now failed, which makes this the last chance — the
+        // raw TCP rung the default ladder would leave the client on is not
+        // reached from here, a pin dials exactly what it lists.
+        if let Some(target_ip) = cooled_ws {
+            log_cooldown_reprobe(self.ctx(UpstreamTier::Ws), CooldownKind::IpFail, target_ip);
+            if let Some(upstream) = self.direct_ws_tier(target_ip).await {
+                return Some(upstream);
             }
         }
 
@@ -1091,6 +1302,12 @@ impl Route<'_> {
     /// balancing — roughly every other connection is a pool hit — so the spare
     /// is opened through the next domain in the rotation instead.
     ///
+    /// `domain` is what the pool dials as-is: the Worker's own hostname, or
+    /// for the proxy tier the expanded `kws{N}` record.  The rotation holds
+    /// bare `--cf-domain` zones, so a proxy-tier pick from it has to be
+    /// expanded the same way the inline walk does — dialled bare, it hit the
+    /// zone apex, which has no record, and every balanced spare failed (#161).
+    ///
     /// `dst` is only meaningful for [`CfTier::Worker`] — the DC IP its tunnel
     /// opens onto.
     fn cf_target(
@@ -1101,13 +1318,15 @@ impl Route<'_> {
         rotation: &[String],
         counter: &AtomicUsize,
     ) -> CfTarget {
-        let domain = if self.config.cf_balance {
-            domain_order(rotation, balance_offset(rotation, true, counter))
-                .next()
-                .unwrap_or(domain)
-                .to_string()
-        } else {
-            domain.to_string()
+        let next = self
+            .config
+            .cf_balance
+            .then(|| domain_order(rotation, balance_offset(rotation, true, counter)).next())
+            .flatten();
+        let domain = match (next, tier) {
+            (Some(zone), CfTier::Proxy) => cf_record(self.dc, zone),
+            (Some(worker), CfTier::Worker) => worker.to_string(),
+            (None, _) => domain.to_string(),
         };
 
         CfTarget {
@@ -1482,7 +1701,8 @@ impl Route<'_> {
         );
     }
 
-    /// Back off from a target IP whose TCP connect timed out.
+    /// Back off from a target IP whose TCP connect timed out, leaving an
+    /// [`IpProbe`] to decide when it comes back.
     ///
     /// Recorded even with no fallback tier configured, where nothing will skip
     /// the address: the pool reads the same cooldown to stop pre-connecting
@@ -1490,7 +1710,19 @@ impl Route<'_> {
     /// where the skipping decision — the part that does need a fallback — is
     /// made.
     fn cool_down_ip(&self, target_ip: &str, failure: Option<RungFailure>) {
-        IP_FAIL.set(target_ip.to_string(), self.timeouts.ip_fail_cooldown);
+        // Arming is what starts (or extends) the background probe, so the
+        // record below always has one waiting behind it.
+        IpProbe {
+            runtime: Arc::clone(self.runtime),
+            ip: target_ip.to_string(),
+            dc: self.dc,
+            is_media: self.is_media,
+            skip_tls_verify: self.config.skip_tls_verify,
+            connect_timeout: self.timeouts.ws_connect,
+            cooldown: self.timeouts.ip_fail_cooldown,
+            log: crate::log::current_handle(),
+        }
+        .arm();
         log_cooldown_armed(
             self.ctx(UpstreamTier::Ws),
             CooldownKind::IpFail,
@@ -2381,6 +2613,24 @@ fn log_cooldown_skipped(ctx: Option<Ctx>, kind: CooldownKind, key_display: &str)
         Category::Cooldown,
         Level::Debug,
         Event::CooldownSkipped {
+            ctx,
+            kind: kind as i32,
+            key_display: key_display.to_string(),
+        }
+    );
+}
+
+/// `EVT:cooldown_reprobe` — a cooled rung dialled again, out of turn.
+///
+/// The default ladder says the same thing as the step back up from TCP, which
+/// a pin cannot record: it has no TCP rung below the pin, so a `tier_fallback`
+/// would name a rung the operator asked it not to take. One event says exactly
+/// what the last attempt is.
+fn log_cooldown_reprobe(ctx: Option<Ctx>, kind: CooldownKind, key_display: &str) {
+    log_event!(
+        Category::Cooldown,
+        Level::Info,
+        Event::CooldownReprobe {
             ctx,
             kind: kind as i32,
             key_display: key_display.to_string(),

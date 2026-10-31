@@ -772,3 +772,455 @@ async fn a_session_with_nowhere_to_route_closes_as_no_route() {
 
     std::fs::remove_dir_all(&dir).expect("the temp dir is ours");
 }
+
+// ─── A pinned ladder and a cooled `--dc-ip` ──────────────────────────────────
+
+// `WS_FAIL` and `IP_FAIL` are process-global maps shared by every test in this
+// binary, so each ladder test uses its own DC number (non-canonical test DCs)
+// and its own IP address to prevent concurrent runs in libtest from wiping each
+// other's state.
+const LADDER_DC_STEP_OVER: u32 = 201;
+const LADDER_IP_STEP_OVER: &str = "192.0.2.10"; // RFC 5737
+
+const LADDER_DC_NO_LATER_RUNG: u32 = 202;
+const LADDER_IP_NO_LATER_RUNG: &str = "192.0.2.11";
+
+const LADDER_DC_RE_PROBE: u32 = 203;
+const LADDER_IP_RE_PROBE: &str = "192.0.2.12";
+
+fn ladder_config(extra: &[&str]) -> Config {
+    let mut args = vec![
+        "tg-ws-proxy",
+        "--secret",
+        "00112233445566778899aabbccddeeff",
+        // A dial to a blackholed address has to be bounded by the test, not by
+        // the default ten seconds.
+        "--ws-connect-timeout",
+        "1",
+        "--pool-size",
+        "0",
+        "--no-outbound-proxy",
+    ];
+    args.extend_from_slice(extra);
+    Config::try_parse_from(args).unwrap()
+}
+
+fn ladder_route<'a>(
+    config: &'a Config,
+    runtime: &'a Arc<Runtime>,
+    pool: &'a Arc<WsPool>,
+    dc: u32,
+) -> Route<'a> {
+    Route {
+        config,
+        runtime,
+        pool,
+        timeouts: Timeouts::from_config(config),
+        dc,
+        is_media: false,
+        media: media_tag(false),
+        dc_idx: dc as i16,
+        proto: ProtoTag::Intermediate,
+    }
+}
+
+#[tokio::test]
+async fn a_pinned_ladder_steps_over_a_cooled_dc_ip() {
+    // A pin replaces the default ladder, and the cooldown skip lives in the
+    // default ladder.  Without it here, `--pinned-upstream ws,…` re-dials an
+    // address that has already timed out on every cold-pool client, and each of
+    // those waits out `--ws-connect-timeout` once per `kws` record before the
+    // pin's next rung gets a turn.
+    let config = ladder_config(&[]);
+    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(55),
+        Arc::clone(&runtime),
+    ));
+    let route = ladder_route(&config, &runtime, &pool, LADDER_DC_STEP_OVER);
+    let ws_fail_key = (LADDER_DC_STEP_OVER, false);
+
+    WS_FAIL.clear(&ws_fail_key);
+    IP_FAIL.set(LADDER_IP_STEP_OVER.to_string(), Duration::from_secs(60));
+
+    let upstream = route
+        .pinned_ladder(
+            &[UpstreamTier::Ws, UpstreamTier::Tcp],
+            Some(LADDER_IP_STEP_OVER),
+        )
+        .await;
+
+    // A dial is what arms `WS_FAIL`, so leaving it clear is proof that the
+    // cooled address never reached the connector -- the same signal the log's
+    // "skipping direct WS" line carries, without needing a network.
+    let dialled_the_cooled_ip = WS_FAIL.active(&ws_fail_key);
+    IP_FAIL.clear(LADDER_IP_STEP_OVER);
+
+    assert!(
+        matches!(upstream, Some(Upstream::Tcp(_))),
+        "the rung after the skipped one is the one that connects"
+    );
+    assert!(
+        !dialled_the_cooled_ip,
+        "the pinned ladder dialled the cooled {LADDER_IP_STEP_OVER} again"
+    );
+}
+
+#[tokio::test]
+async fn a_pin_with_no_later_rung_dials_its_cooled_dc_ip_anyway() {
+    // Stepped over, not written off: the cooldown is worth honouring only while
+    // a later rung can connect.  A `ws`-only pin has no later rung, so the
+    // cooled address is the client's only way out, and the doomed attempt beats
+    // dropping the connection.
+    let config = ladder_config(&[]);
+    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(55),
+        Arc::clone(&runtime),
+    ));
+    let route = ladder_route(&config, &runtime, &pool, LADDER_DC_NO_LATER_RUNG);
+    let ws_fail_key = (LADDER_DC_NO_LATER_RUNG, false);
+
+    WS_FAIL.clear(&ws_fail_key);
+    IP_FAIL.set(LADDER_IP_NO_LATER_RUNG.to_string(), Duration::from_secs(60));
+
+    let upstream = route
+        .pinned_ladder(&[UpstreamTier::Ws], Some(LADDER_IP_NO_LATER_RUNG))
+        .await;
+
+    let dialled_the_cooled_ip = WS_FAIL.active(&ws_fail_key);
+    WS_FAIL.clear(&ws_fail_key);
+    IP_FAIL.clear(LADDER_IP_NO_LATER_RUNG);
+
+    assert!(upstream.is_none(), "a pin has nothing to fall back to");
+    assert!(
+        dialled_the_cooled_ip,
+        "the only rung was skipped, which leaves the client nowhere to go"
+    );
+}
+
+#[tokio::test]
+async fn a_pinned_ladder_re_probes_a_cooled_dc_ip_when_every_rung_fails() {
+    // The other half of the rule: a skip must not become a dead end for the
+    // rest of the cooldown.  An `--mtproto-proxy` on a closed local port fails
+    // without a network the way a dead upstream does, so the last thing the
+    // ladder has left is the address it stepped over — and asking it is what
+    // keeps the cooldown self-healing, since only a successful direct connect
+    // clears it.
+    let config = ladder_config(&[
+        "--mtproto-proxy",
+        "127.0.0.1:1:00112233445566778899aabbccddeeff",
+    ]);
+    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(55),
+        Arc::clone(&runtime),
+    ));
+    let route = ladder_route(&config, &runtime, &pool, LADDER_DC_RE_PROBE);
+    let ws_fail_key = (LADDER_DC_RE_PROBE, false);
+
+    WS_FAIL.clear(&ws_fail_key);
+    IP_FAIL.set(LADDER_IP_RE_PROBE.to_string(), Duration::from_secs(60));
+
+    let upstream = route
+        .pinned_ladder(
+            &[UpstreamTier::Ws, UpstreamTier::Mtproto],
+            Some(LADDER_IP_RE_PROBE),
+        )
+        .await;
+
+    let re_probed_the_cooled_ip = WS_FAIL.active(&ws_fail_key);
+    WS_FAIL.clear(&ws_fail_key);
+    IP_FAIL.clear(LADDER_IP_RE_PROBE);
+
+    assert!(upstream.is_none(), "nothing in the pin can connect");
+    assert!(
+        re_probed_the_cooled_ip,
+        "the cooled address was never asked again, so nothing can clear it"
+    );
+}
+
+// ─── The background probe of a cooled `--dc-ip` ──────────────────────────────
+
+/// An outbound HTTP proxy that counts CONNECTs and either holds them open
+/// without a word — a dark address, as far as the dialler can tell — or
+/// refuses them, which is an address that answers.
+async fn probe_outbound(answer: bool) -> (Arc<Runtime>, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dials = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&dials);
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            seen.fetch_add(1, Ordering::SeqCst);
+            if answer {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request).await;
+                let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+            } else {
+                held.push(stream);
+            }
+        }
+    });
+
+    let outbound = OutboundConnector::from_config(Some(&format!("http://{addr}")), None, false);
+    (Arc::new(Runtime::new(outbound.unwrap())), dials)
+}
+
+fn probe(runtime: &Arc<Runtime>, ip: &str, cooldown: Duration) -> IpProbe {
+    IpProbe {
+        runtime: Arc::clone(runtime),
+        ip: ip.to_string(),
+        dc: 2,
+        is_media: false,
+        skip_tls_verify: false,
+        connect_timeout: Duration::from_millis(500),
+        cooldown,
+        // The probe records through the handle a scope hands it; a test starts
+        // one outside any scope, so there is nothing to record into.
+        log: None,
+    }
+}
+
+async fn probe_finished(ip: &str) -> bool {
+    for _ in 0..60 {
+        if !IP_PROBES.lock().unwrap().contains(ip) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn a_cooled_dc_ip_stays_cooled_while_the_probe_finds_it_dark() {
+    // #148: the cooldown used to simply run out, and the next client dialled
+    // the address on the full connect timeout.  The entry now outlives the
+    // window until the probe has its answer, and a probe that times out again
+    // re-arms it.
+    const IP: &str = "192.0.2.20";
+    let (runtime, dials) = probe_outbound(false).await;
+    let cooldown = Duration::from_millis(200);
+
+    probe(&runtime, IP, cooldown).arm();
+    // A second timeout while the first probe waits must not start another.
+    probe(&runtime, IP, cooldown).arm();
+
+    // Mid-probe: past the bare cooldown, before the 500 ms connect gives up.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    assert!(
+        IP_FAIL.active(IP),
+        "a client could dial the address mid-probe"
+    );
+    assert_eq!(dials.load(Ordering::SeqCst), 1, "one probe per address");
+
+    // The probe gave up at ~700 ms and re-armed the entry.
+    tokio::time::sleep(Duration::from_millis(550)).await;
+    assert!(IP_FAIL.active(IP), "a dark address came back by itself");
+
+    // A client's direct connect clearing the entry ends the probe.
+    IP_FAIL.clear(IP);
+    assert!(probe_finished(IP).await, "the probe outlived its entry");
+}
+
+#[tokio::test]
+async fn a_cooled_dc_ip_that_answers_the_probe_comes_back() {
+    // Any answer clears it, exactly as in `direct_ws`: only a connect that ran
+    // out the clock says the address itself is gone.
+    const IP: &str = "192.0.2.21";
+    let (runtime, dials) = probe_outbound(true).await;
+
+    probe(&runtime, IP, Duration::from_millis(50)).arm();
+
+    assert!(probe_finished(IP).await, "the probe never finished");
+    assert!(dials.load(Ordering::SeqCst) >= 1);
+    assert!(
+        !IP_FAIL.active(IP),
+        "an address that answered stayed cooled"
+    );
+}
+
+#[tokio::test]
+async fn a_zero_ip_fail_cooldown_starts_no_probe() {
+    // `--ip-fail-cooldown 0` turns the skipping off.  Holding the entry for a
+    // probe's grace period would quietly turn it back on.
+    const IP: &str = "192.0.2.22";
+    let (runtime, dials) = probe_outbound(false).await;
+
+    probe(&runtime, IP, Duration::ZERO).arm();
+
+    assert!(!IP_FAIL.active(IP));
+    assert!(!IP_PROBES.lock().unwrap().contains(IP));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(dials.load(Ordering::SeqCst), 0);
+}
+
+// ─── Pool spares under `--cf-balance` ────────────────────────────────────────
+
+#[test]
+fn a_balanced_cf_proxy_spare_is_dialled_at_the_kws_record() {
+    // #161: with `--cf-balance` the spare's domain comes from the rotation,
+    // which holds bare zones.  The pool dials it as-is, so every balanced
+    // spare went to the zone apex — no record there, a 530 from Cloudflare,
+    // and half of the `/apiws` requests in the reporter's analytics failing.
+    let config = ladder_config(&[
+        "--cf-domain",
+        "a.example",
+        "--cf-domain",
+        "b.example",
+        "--cf-balance",
+    ]);
+    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(55),
+        Arc::clone(&runtime),
+    ));
+    let route = ladder_route(&config, &runtime, &pool, 203);
+    let counter = AtomicUsize::new(0);
+
+    let picks: Vec<_> = (0..2)
+        .map(|_| {
+            route
+                .cf_target(
+                    CfTier::Proxy,
+                    "",
+                    "kws203.a.example",
+                    &config.cf_domains,
+                    &counter,
+                )
+                .domain
+        })
+        .collect();
+    assert_eq!(picks, ["kws203.a.example", "kws203.b.example"]);
+
+    // A Worker is dialled at its own name; there is no record to expand.
+    let workers = vec!["w.example".to_string()];
+    let worker = route.cf_target(
+        CfTier::Worker,
+        "149.154.167.51",
+        "w.example",
+        &workers,
+        &counter,
+    );
+    assert_eq!(worker.domain, "w.example");
+}
+
+#[test]
+fn an_unbalanced_cf_proxy_spare_keeps_the_record_that_answered() {
+    let config = ladder_config(&["--cf-domain", "a.example", "--cf-domain", "b.example"]);
+    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(55),
+        Arc::clone(&runtime),
+    ));
+    let route = ladder_route(&config, &runtime, &pool, 2);
+
+    let target = route.cf_target(
+        CfTier::Proxy,
+        "",
+        "kws2.b.example",
+        &config.cf_domains,
+        &AtomicUsize::new(0),
+    );
+    assert_eq!(target.domain, "kws2.b.example");
+}
+
+// ─── The re-probe as a record ────────────────────────────────────────────────
+
+/// The re-probe is not only a dial: a pinned ladder that stepped over a cooled
+/// address has to say it came back for it. Without the record a segment shows
+/// the skip and then a session that never routed, which is exactly the shape a
+/// dead end has — and the one thing that could still save the client is lost.
+#[cfg(feature = "log-disk")]
+#[tokio::test]
+async fn a_pinned_re_probe_lands_in_the_segment() {
+    let dir = std::env::temp_dir().join(format!("tgws-reprobe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let config = ladder_config(&[
+        "--mtproto-proxy",
+        "127.0.0.1:1:00112233445566778899aabbccddeeff",
+        "--log-dir",
+        dir.to_str().expect("a utf-8 temp path"),
+        "--log-level",
+        "debug",
+        "--log-batch-max",
+        "16",
+        "--log-durability",
+        "immediate",
+    ])
+    .with_defaults();
+
+    let handle = crate::log::init(config.log_settings(), config.log_disk())
+        .expect("a writable temp dir accepts a segment");
+    let runtime = Arc::new(Runtime::new(OutboundConnector::direct()));
+    let pool = Arc::new(WsPool::with_runtime(
+        0,
+        Duration::from_secs(55),
+        Arc::clone(&runtime),
+    ));
+    let route = ladder_route(&config, &runtime, &pool, LADDER_DC_RE_PROBE);
+
+    WS_FAIL.clear(&(LADDER_DC_RE_PROBE, false));
+    IP_FAIL.set(LADDER_IP_RE_PROBE.to_string(), Duration::from_secs(60));
+
+    const CONN: u64 = 7;
+    let upstream = crate::log::scope(CONN, Arc::clone(&handle), async {
+        route
+            .pinned_ladder(
+                &[UpstreamTier::Ws, UpstreamTier::Mtproto],
+                Some(LADDER_IP_RE_PROBE),
+            )
+            .await
+    })
+    .await;
+
+    WS_FAIL.clear(&(LADDER_DC_RE_PROBE, false));
+    IP_FAIL.clear(LADDER_IP_RE_PROBE);
+    assert!(upstream.is_none(), "nothing in the pin can connect");
+    handle.shutdown().await;
+
+    let day = std::fs::read_dir(&dir)
+        .expect("the segment directory")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .find_map(|name| name.strip_suffix(".seg").map(str::to_string))
+        .expect("one segment for today");
+
+    let records: Vec<_> = crate::log::storage::iter_batches(&dir, &day)
+        .expect("the segment it just wrote is readable")
+        .into_iter()
+        .flat_map(|batch| batch.records)
+        .collect();
+
+    let (record, reprobe) = records
+        .iter()
+        .find_map(|record| match &record.event {
+            Some(Event::CooldownReprobe(reprobe)) => Some((record, reprobe)),
+            _ => None,
+        })
+        .expect("the re-probe emitted its record");
+
+    assert_eq!(record.conn_id, CONN, "attributed to the pinned session");
+    assert_eq!(record.category, Category::Cooldown as i32);
+    assert_eq!(record.level, Level::Info as i32);
+    assert_eq!(reprobe.kind, CooldownKind::IpFail as i32);
+    assert_eq!(reprobe.key_display, LADDER_IP_RE_PROBE);
+    assert_eq!(
+        reprobe.ctx.as_ref().map(|ctx| ctx.tier),
+        Some(LogTier::Ws as i32)
+    );
+    assert_eq!(
+        reprobe.ctx.as_ref().map(|ctx| ctx.dc),
+        Some(LADDER_DC_RE_PROBE)
+    );
+
+    std::fs::remove_dir_all(&dir).expect("the temp dir is ours");
+}

@@ -12,15 +12,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinHandle;
 
 use crate::check;
 use crate::config::{Config, UpstreamTier};
 use crate::default_domains::{self, Fetched};
 use crate::limits::{auto_max_connections, open_fds, soft_nofile_limit};
 use crate::log::schema::{
-    Category, DcIp, DomainListFetched, DomainSource, ErrorCode, Event, Level, Shutdown,
-    ShutdownPhase, ShutdownSignal,
+    Category, DcIp, DomainListFetched, DomainRefetch, DomainSource, ErrorCode, Event, Level,
+    Shutdown, ShutdownPhase, ShutdownSignal,
 };
 use crate::log::{self, LogHandle};
 use crate::log_event;
@@ -520,6 +521,9 @@ async fn serve(
     // Done once here so both --check mode and the normal server path share
     // the same fetched list.  The fetch selects on `shutdown` so an embedder
     // can cancel a slow fetch instead of blocking a stop for the full timeout.
+    // A failed fetch serves from the built-in list and, once serving, keeps
+    // retrying in the background — see `default_domains::refetch_delays`.
+    let mut refetch_onto = None;
     if config.default_domains {
         let fetched = tokio::select! {
             signal = &mut shutdown => {
@@ -542,6 +546,13 @@ async fn serve(
         };
 
         log_domain_list(log, &fetched);
+        if fetched.source == DomainSource::Builtin {
+            // Serving from the built-in list. The record above already said so;
+            // the retry exists so that it does not have to stay that way until
+            // the next restart. `own_domains` is the `--cf-domain` list the
+            // fetched one is appended to, exactly as here.
+            refetch_onto = Some(config.cf_domains.clone());
+        }
         config.cf_domains.extend(fetched.domains);
     }
 
@@ -700,6 +711,18 @@ async fn serve(
     // Shared for the rest of the process: every connection reads the same
     // settings, so they are behind one `Arc` instead of a per-connection clone.
     let config = Arc::new(config);
+    // Connections take their settings from here, so a re-fetched domain list
+    // reaches every connection accepted after it lands.
+    let (config_tx, config_rx) = watch::channel(Arc::clone(&config));
+    let _refetch = match refetch_onto {
+        Some(own_domains) if !config.check => Some(AbortOnDrop(tokio::spawn(refetch_domains(
+            config_tx,
+            own_domains,
+            Arc::clone(&runtime),
+            Arc::clone(log),
+        )))),
+        _ => None,
+    };
     {
         let pool_clone = pool.clone();
         let config_clone = Arc::clone(&config);
@@ -808,7 +831,7 @@ async fn serve(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, peer_addr)) => {
-                        let cfg = Arc::clone(&config);
+                        let cfg = Arc::clone(&config_rx.borrow());
                         let pool = pool.clone();
                         let runtime = Arc::clone(&runtime);
                         let log = log.clone();
@@ -919,4 +942,104 @@ fn log_domain_list(log: &Arc<LogHandle>, fetched: &Fetched) {
             err_code,
         }),
     );
+}
+
+/// Aborts the task when dropped, so a background task started by
+/// [`run_with_listen`] ends with it rather than outliving a stopped proxy in
+/// an embedder that keeps its runtime.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Re-fetch the `--default-domains` list after the startup fetch failed, and
+/// swap it in for the built-in one once it arrives.
+///
+/// `own_domains` is the `--cf-domain` list the fetched one is appended to,
+/// exactly as at startup.  The pool's spares were opened through the built-in
+/// domains and are left alone: they still work, and refill through whichever
+/// domain the next connection answers on.
+///
+/// Every attempt is a record — at debug while it keeps failing, at info for the
+/// success, at warn for the give-up — because the console said the built-in
+/// list is in use once at startup, and an hour later nothing else would.
+async fn refetch_domains(
+    config_tx: watch::Sender<Arc<Config>>,
+    own_domains: Vec<String>,
+    runtime: Arc<Runtime>,
+    log: Arc<LogHandle>,
+) {
+    let delays: Vec<Duration> = default_domains::refetch_delays().collect();
+    let mut last_attempt = 0usize;
+    let mut last_error = None;
+
+    let fetched = default_domains::refetch_observed(
+        delays,
+        || default_domains::try_fetch_default_domains(runtime.outbound()),
+        |attempt, failure| {
+            last_attempt = attempt;
+            let Some(failure) = failure else {
+                return;
+            };
+            last_error = Some((failure.err as i32, failure.err_code));
+            log::emit_global(
+                Some(&log),
+                Category::Config,
+                Level::Debug,
+                Event::DomainRefetch(DomainRefetch {
+                    attempt: attempt.min(u32::MAX as usize) as u32,
+                    ok: false,
+                    count: 0,
+                    err: failure.err as i32,
+                    err_code: failure.err_code,
+                    exhausted: false,
+                }),
+            );
+        },
+    )
+    .await;
+
+    let Some(fetched) = fetched else {
+        // The hour is up: whatever the last failure was is the reason the
+        // built-in list stays, and the count is what that list holds.
+        let (err, err_code) = last_error.unwrap_or((ErrorCode::Unspecified as i32, 0));
+        log::emit_global(
+            Some(&log),
+            Category::Config,
+            Level::Warn,
+            Event::DomainRefetch(DomainRefetch {
+                attempt: last_attempt.min(u32::MAX as usize) as u32,
+                ok: false,
+                count: default_domains::fallback_domains()
+                    .len()
+                    .min(u32::MAX as usize) as u32,
+                err,
+                err_code,
+                exhausted: true,
+            }),
+        );
+        return;
+    };
+
+    log::emit_global(
+        Some(&log),
+        Category::Config,
+        Level::Info,
+        Event::DomainRefetch(DomainRefetch {
+            attempt: last_attempt.min(u32::MAX as usize) as u32,
+            ok: true,
+            count: fetched.len().min(u32::MAX as usize) as u32,
+            err: ErrorCode::Unspecified as i32,
+            err_code: 0,
+            exhausted: false,
+        }),
+    );
+
+    let mut next = Config::clone(&config_tx.borrow());
+    next.cf_domains = own_domains;
+    next.cf_domains.extend(fetched);
+    config_tx.send_replace(Arc::new(next));
 }

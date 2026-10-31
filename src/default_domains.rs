@@ -14,6 +14,9 @@ mod http;
 
 pub use http::FetchError;
 
+use std::future::Future;
+use std::time::Duration;
+
 use crate::log::schema::DomainSource;
 use crate::outbound::OutboundConnector;
 use http::https_get;
@@ -73,7 +76,9 @@ fn parse_domain_list(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn fallback_domains() -> Vec<String> {
+/// The decoded built-in list `--default-domains` serves from until a fetch
+/// succeeds.
+pub fn fallback_domains() -> Vec<String> {
     FALLBACK_ENCODED
         .iter()
         .filter_map(|s| deobfuscate(s))
@@ -115,29 +120,95 @@ pub async fn fetch_default_domains_with_outbound(outbound: &OutboundConnector) -
 /// fetch produced nothing usable, so the built-in list is what runs, and the
 /// record has to say so rather than claim a fetch that returned zero domains.
 pub async fn fetch_domains_with_source(outbound: &OutboundConnector) -> Fetched {
-    let fallback = |failure: Option<FetchError>| Fetched {
-        domains: fallback_domains(),
-        source: DomainSource::Builtin,
-        failure,
-    };
-
-    match https_get(DOMAINS_URL_HOST, DOMAINS_URL_PATH, outbound).await {
-        Ok(body) => {
-            let domains = parse_domain_list(&body);
-            if domains.is_empty() {
-                fallback(Some(FetchError::protocol(
-                    "the community list came back empty",
-                )))
-            } else {
-                Fetched {
-                    domains,
-                    source: DomainSource::Github,
-                    failure: None,
-                }
-            }
-        }
-        Err(error) => fallback(Some(error)),
+    match try_fetch_default_domains(outbound).await {
+        Ok(domains) => Fetched {
+            domains,
+            source: DomainSource::Github,
+            failure: None,
+        },
+        Err(failure) => Fetched {
+            domains: fallback_domains(),
+            source: DomainSource::Builtin,
+            failure: Some(failure),
+        },
     }
+}
+
+/// Fetch and decode the default CF-proxy domain list, without falling back.
+///
+/// An empty list is an error too: it would leave `--default-domains`
+/// contributing nothing, which is worse than the built-in five.
+pub async fn try_fetch_default_domains(
+    outbound: &OutboundConnector,
+) -> Result<Vec<String>, FetchError> {
+    let body = https_get(DOMAINS_URL_HOST, DOMAINS_URL_PATH, outbound).await?;
+    let domains = parse_domain_list(&body);
+    if domains.is_empty() {
+        return Err(FetchError::protocol("the list from GitHub was empty"));
+    }
+    Ok(domains)
+}
+
+/// Delays between background re-fetches after the startup fetch failed.
+///
+/// The startup fetch runs before the listener binds, which on a router is
+/// routinely before the uplink or DNS is up (#159).  The built-in list keeps
+/// the proxy serving meanwhile, but it is the smallest list there is, and
+/// without a retry it stayed in use until the next restart.  Doubling from
+/// 15 s reaches a 5-minute cap and gives up after about an hour: past that the
+/// network is up and GitHub itself is what is unreachable, and one more GET
+/// every few minutes for the rest of the run would buy nothing.
+pub fn refetch_delays() -> impl Iterator<Item = Duration> {
+    const FIRST: Duration = Duration::from_secs(15);
+    const CAP: Duration = Duration::from_secs(300);
+    const ATTEMPTS: usize = 15;
+    std::iter::successors(Some(FIRST), |d| Some((*d * 2).min(CAP))).take(ATTEMPTS)
+}
+
+/// Retry `fetch` after each of `delays` until it yields a list.
+///
+/// Returns `None` once `delays` runs out.  Nothing is logged here: this module
+/// has no sink, and the caller already warned once that the built-in list is in
+/// use.  The per-attempt view is [`refetch_observed`].
+pub async fn refetch<F, Fut, E>(
+    delays: impl IntoIterator<Item = Duration>,
+    fetch: F,
+) -> Option<Vec<String>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<String>, E>>,
+{
+    refetch_observed(delays, fetch, |_, _| {}).await
+}
+
+/// [`refetch`] with an observer for the attempts it makes.
+///
+/// `on_attempt` is called with the 1-based attempt number and the failure that
+/// ended it, or `None` for the success that stopped the loop.  The caller turns
+/// those into records — the startup warning has already said the built-in list
+/// is in use, and each retry is worth a debug record only because a segment can
+/// say it without repeating what the console already printed.
+pub async fn refetch_observed<F, Fut, E, O>(
+    delays: impl IntoIterator<Item = Duration>,
+    mut fetch: F,
+    mut on_attempt: O,
+) -> Option<Vec<String>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<String>, E>>,
+    O: FnMut(usize, Option<&E>),
+{
+    for (index, delay) in delays.into_iter().enumerate() {
+        tokio::time::sleep(delay).await;
+        match fetch().await {
+            Ok(domains) => {
+                on_attempt(index + 1, None);
+                return Some(domains);
+            }
+            Err(error) => on_attempt(index + 1, Some(&error)),
+        }
+    }
+    None
 }
 
 #[cfg(test)]

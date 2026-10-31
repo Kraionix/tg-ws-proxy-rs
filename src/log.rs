@@ -655,24 +655,46 @@ tokio::task_local! {
     /// library does not own: the text view is the proxy's observer, not the
     /// pipeline's built-in.
     static TEXT_FLOOR: Filter;
+    /// The handle the scope was opened with, for the one thing a record cannot
+    /// do from inside its own task: outlive it. `tokio::spawn` does not inherit
+    /// task-locals, so a task a connection starts — the cooled-IP probe — has to
+    /// ask for the handle while it is still in scope, and carry it.
+    static SCOPE_HANDLE: Arc<LogHandle>;
 }
 
 /// Runs future with the library's scope planted, so every log_event! inside it
-/// -- in this task or in any task spawned from it -- is attributed to conn_id.
+/// is attributed to conn_id.
 ///
 /// This is the one place a connection's logging is set up: the accept arm in
 /// server.rs wraps the per-connection task in it, and
 /// proxy::handle_client_with_runtime needs no logging parameter because of it.
 /// Callers that forget to scope lose the attribution, not correctness.
+///
+/// Tasks the future hands to `tokio::spawn` do **not** inherit the scope — a
+/// task-local belongs to the task it was entered in. One such task needs to
+/// record (the cooled-IP probe, which outlives its connection); it takes the
+/// handle from [`current_handle`] before it is spawned and emits through
+/// [`emit_global`].
 pub fn scope<F>(conn_id: u64, handle: Arc<LogHandle>, future: F) -> impl Future<Output = F::Output>
 where
     F: Future,
 {
     let text = handle.text;
-    TEXT_FLOOR.scope(
-        text,
-        logreel::scope(conn_id, Arc::clone(&handle.inner), future),
+    let inner = Arc::clone(&handle.inner);
+    SCOPE_HANDLE.scope(
+        Arc::clone(&handle),
+        TEXT_FLOOR.scope(text, logreel::scope(conn_id, inner, future)),
     )
+}
+
+/// The handle of the innermost scope on this task, for a task that will outlive
+/// it.
+///
+/// `None` outside a scope — an embedder that drives a connection without
+/// [`scope`] — and the caller then records nothing rather than opening a sink
+/// of its own.
+pub fn current_handle() -> Option<Arc<LogHandle>> {
+    SCOPE_HANDLE.try_with(Arc::clone).ok()
 }
 
 /// LogHandle::emit for process-wide events, tolerating a caller that has no
