@@ -37,13 +37,13 @@
 //! # How a record travels
 //!
 //! A producer calls [`log_event!`], which checks the filter and hands the
-//! payload to [`emit`](LogHandle::emit). That stamps the wall clock and the
-//! process-wide sequence number and pushes onto a bounded channel with
+//! payload to [`emit`](LogHandle::emit). The library stamps the wall clock and
+//! the process-wide sequence number and pushes onto a bounded channel with
 //! `try_send` — never a lock, never an `await`, because this runs on the routing
 //! path in the middle of connection setup. The writer task at the far end
-//! batches records, writes them through a [`writer::BatchSink`], and hands them
-//! to whatever sink the caller chose; a full channel drops records and counts
-//! them, which is a counter and not an error (`INV:errors.drop_not_error`).
+//! batches records and hands them to whatever sink the caller chose; the
+//! channel, the filters and the batching are the library's, so this module owns
+//! the settings and the view and not a second pipeline.
 //!
 //! The session a record belongs to is not a parameter. [`scope`] plants the
 //! handle and the connection id in a task-local that the whole connection task
@@ -55,15 +55,13 @@
 use std::future::Future;
 #[cfg(feature = "log-disk")]
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
-
-use schema::{Category, Event, Level, LogRecord};
-use view::{TEXT_RING_DEFAULT, TextTarget};
+use schema::{Category, Event, Level};
+use view::{TEXT_RING_DEFAULT, TextTarget, View};
 
 pub mod event;
 pub mod render;
@@ -71,7 +69,6 @@ pub mod schema;
 #[cfg(feature = "log-disk")]
 pub mod storage;
 pub mod view;
-mod writer;
 
 #[cfg(test)]
 mod tests;
@@ -81,27 +78,44 @@ mod tests;
 pub const CATEGORY_COUNT: usize = Category::Overflow as usize + 1;
 const _: () = assert!(CATEGORY_COUNT == 11);
 
-/// Records accepted per flush by [`Settings::batch_max`]'s default.
+/// Records accepted per flush by Settings::batch_max's default.
 pub const DEFAULT_BATCH_MAX: usize = 256;
-/// Bounds of [`Settings::batch_max`]. The lower bound keeps a batch from being
-/// so small that every record becomes its own write; the upper one keeps one
-/// flush from holding a whole second of records in a batch header.
+/// Bounds of Settings::batch_max. The lower bound keeps a batch from being so
+/// small that every record becomes its own write; the upper one keeps one flush
+/// from holding a whole second of records in a batch.
 pub const MIN_BATCH_MAX: usize = 16;
 pub const MAX_BATCH_MAX: usize = 4096;
 
 /// How long a record may sit unwritten before the writer flushes it.
 pub const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Depth of the producer→writer channel.
+/// Depth of the producer to writer channel.
 ///
-/// Sized in *records*, which is what actually costs memory here: one
-/// `LogRecord` carries its payload inline, so the channel is
-/// `CHANNEL_CAPACITY × size_of::<LogRecord>()` bytes of worst-case RAM on a
-/// device that may have 64 MB of it. 1024 is two flushes' worth of steady-state
-/// traffic (5 ev/s × 2 s) with two orders of magnitude of headroom for the
-/// reconnect storm that follows a network change; a longer burst is a burst the
-/// log is allowed to lose records from.
+/// Sized in *records*, which is what actually costs memory here: one record
+/// carries its payload inline, so the channel is CHANNEL_CAPACITY times
+/// size_of::<Record>() bytes of worst-case RAM on a device that may have 64 MB
+/// of it. 1024 is two flushes' worth of steady-state traffic (5 ev/s over 2 s)
+/// with two orders of magnitude of headroom for the reconnect storm that
+/// follows a network change; a longer burst is a burst the log may lose.
 pub(crate) const CHANNEL_CAPACITY: usize = 1024;
+
+/// Version of the bytes a batch carries outside its records.
+///
+/// The domain field of every batch names the app version, the record schema and
+/// this number: the reader prints them and a converter checks them before
+/// trusting a file. It is independent of the segment format, which the library
+/// versions itself.
+pub const WRITER_PROTOCOL: u32 = 1;
+
+/// How long a stop keeps draining after the channel goes quiet.
+///
+/// The accept loop stops before a session that is still tearing down, so the
+/// moment between "stop" and "the writer exits" is exactly when the last
+/// session's close record is produced. A hundred milliseconds, not twenty-five:
+/// an earlier round measured the tail on a slow host and 25 ms was not enough.
+const SHUTDOWN_QUIET: Duration = Duration::from_millis(100);
+/// The longest a stop may wait for that tail, however busy the producers are.
+const SHUTDOWN_LIMIT: Duration = Duration::from_millis(250);
 
 /// Why the log subsystem could not be started.
 ///
@@ -113,7 +127,7 @@ pub(crate) const CHANNEL_CAPACITY: usize = 1024;
 pub enum LogError {
     /// The log directory could not be created or opened.
     Io(std::io::Error),
-    /// The filesystem cannot carry a segment — see [`storage::check_filesystem`].
+    /// The filesystem cannot carry a segment; see storage::check_filesystem.
     #[cfg(feature = "log-disk")]
     FsUnsupported(String),
     /// Another process is already writing today's segment.
@@ -126,6 +140,8 @@ pub enum LogError {
     /// reason the segment's is: an operator who asked for a log file and did
     /// not get one has to hear about it at startup, not at the first warning.
     TextSink(String),
+    /// The library refused its configuration before the writer started.
+    Pipeline(String),
 }
 
 impl std::fmt::Display for LogError {
@@ -137,13 +153,13 @@ impl std::fmt::Display for LogError {
             #[cfg(feature = "log-disk")]
             Self::WriterConflict(path) => write!(
                 f,
-                "another process is writing {}; use a different --log-dir for \
-                 multi-instance deployments",
+                "another process is writing {}; use a different --log-dir for multi-instance deployments",
                 path.display()
             ),
             #[cfg(feature = "log-disk")]
             Self::Segment(reason) => f.write_str(reason),
             Self::TextSink(reason) => f.write_str(reason),
+            Self::Pipeline(reason) => f.write_str(reason),
         }
     }
 }
@@ -159,11 +175,11 @@ impl std::error::Error for LogError {
 
 /// One consumer's level policy.
 ///
-/// The stream has three consumers — the segment on disk, the text view and the
-/// RAM ring — and each has its own floor, so a single `Level` table is no
-/// longer enough to describe one. `Off` is a policy and not the absence of one:
-/// the producer gate is the union of the three, so a consumer nobody asked for
-/// must not be the reason a payload is built.
+/// The stream has three consumers -- the segment on disk, the text view and the
+/// RAM ring -- and each has its own floor, so a single Level table is no longer
+/// enough to describe one. Off is a policy and not the absence of one: the
+/// producer gate is the union of the three, so a consumer nobody asked for must
+/// not be the reason a payload is built.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Filter {
     /// Keeps nothing, whatever the level.
@@ -173,7 +189,7 @@ pub enum Filter {
 }
 
 impl Filter {
-    /// Keeps `level` and above.
+    /// Keeps level and above.
     pub const fn at(level: Level) -> Self {
         Self::At(level)
     }
@@ -188,7 +204,7 @@ impl Filter {
         matches!(self, Self::Off)
     }
 
-    /// The lowest level kept, or `None` when nothing is.
+    /// The lowest level kept, or None when nothing is.
     pub fn floor(self) -> Option<Level> {
         match self {
             Self::Off => None,
@@ -196,8 +212,8 @@ impl Filter {
         }
     }
 
-    /// True when a record at `level` is kept: a floor, not a ceiling, so
-    /// `warn` keeps warnings and errors and drops the rest.
+    /// True when a record at this level is kept: a floor, not a ceiling, so
+    /// warn keeps warnings and errors and drops the rest.
     pub fn keeps(self, level: Level) -> bool {
         match self {
             Self::Off => false,
@@ -205,7 +221,7 @@ impl Filter {
         }
     }
 
-    /// The name the banner prints — the level's own, or `off`.
+    /// The name the banner prints: the level's own, or off.
     pub fn name(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -217,40 +233,40 @@ impl Filter {
 /// What the subsystem is configured with.
 ///
 /// One filter per consumer, plus the writer's batching policy. Which consumer
-/// sees which record is decided here and in the writer task: the producers only
-/// ask whether *anyone* wants the payload.
+/// sees which record is decided in the library's writer from these tables: the
+/// producers only ask whether *anyone* wants the payload.
 #[derive(Clone, Debug)]
 pub struct Settings {
-    /// Lowest level the segment sink records, indexed by [`Category`]. The only
+    /// Lowest level the segment sink records, indexed by Category. The only
     /// consumer with per-category exceptions, because it is the one an operator
-    /// tunes — a flat table rather than a map so the filter on the emit path is
-    /// an index and a compare.
+    /// tunes: a flat table rather than a map, so the filter is an index and a
+    /// compare.
     ///
-    /// Only a build with the `log-disk` feature has a segment to record into,
-    /// so only such a build has this table: without it the producer gate is the
+    /// Only a build with the log-disk feature has a segment to record into, so
+    /// only such a build has this table: without it the producer gate is the
     /// text view's floor and the ring's.
     #[cfg(feature = "log-disk")]
     pub disk: [Filter; CATEGORY_COUNT],
     /// Lowest level the text view renders. One floor for every category: the
     /// view is read by a human watching a terminal, not queried.
     pub text: Filter,
-    /// Lowest level the RAM ring keeps, for the `SIGUSR1` dump.
+    /// Lowest level the RAM ring keeps, for the SIGUSR1 dump.
     pub ring: Filter,
     /// Where the rendered lines go.
     ///
-    /// [`Settings::default`] is the quiet configuration — the text view is
+    /// Settings::default is the quiet configuration: the text view is
     /// something an embedder opts into, and the binary's own default lives with
     /// its command line.
     pub text_log: TextTarget,
-    /// Records the RAM ring holds, clamped to
-    /// [`view::TEXT_RING_MIN`]..=[`view::TEXT_RING_MAX`].
+    /// Records the RAM ring holds, clamped to view::TEXT_RING_MIN and
+    /// view::TEXT_RING_MAX.
     pub ring_capacity: usize,
-    /// Records per flush, clamped to [`MIN_BATCH_MAX`]..=[`MAX_BATCH_MAX`].
+    /// Records per flush, clamped to MIN_BATCH_MAX and MAX_BATCH_MAX.
     pub batch_max: usize,
     /// Records older than this are flushed even if the batch is not full.
     pub flush_interval: Duration,
-    /// Flush as soon as a record at [`Level::Warn`] or above arrives, instead of
-    /// waiting for the interval — a warning that reaches the file two seconds
+    /// Flush as soon as a record at Level::Warn or above arrives, instead of
+    /// waiting for the interval: a warning that reaches the file two seconds
     /// after the crash that followed it is not much of a warning.
     pub flush_on_warn: bool,
 }
@@ -271,48 +287,60 @@ impl Default for Settings {
     }
 }
 
-/// The producer-side handle: one per process, shared as an `Arc`.
-///
-/// Deliberately not `Clone` — `INV:log.single_writer` says there is one writer
-/// per process, and the writer's half of this struct is a `JoinHandle` that
-/// cannot be duplicated. Share the `Arc` instead.
-pub struct LogHandle {
-    tx: mpsc::Sender<LogRecord>,
-    counters: Arc<Counters>,
-    /// The consumers' floors, copied out of [`Settings`] so that the producer
-    /// gate needs no lock and no second lookup.
-    #[cfg(feature = "log-disk")]
-    disk: [Filter; CATEGORY_COUNT],
-    text: Filter,
-    ring: Filter,
-    shutdown: watch::Sender<bool>,
-    /// Bumped to ask the writer for a ring dump; a counter rather than a flag
-    /// so that two `SIGUSR1`s in a row are two dumps.
-    dump: watch::Sender<u64>,
-    join: StdMutex<Option<JoinHandle<()>>>,
+impl Settings {
+    /// Lowest level any consumer keeps, or None when all three are off.
+    fn gate(&self) -> Option<Level> {
+        let mut floor: Option<Level> = None;
+        let mut take = |filter: Filter| {
+            if let Some(level) = filter.floor() {
+                floor = Some(match floor {
+                    Some(current) if (current as i32) <= (level as i32) => current,
+                    _ => level,
+                });
+            }
+        };
+        #[cfg(feature = "log-disk")]
+        for filter in self.disk {
+            take(filter);
+        }
+        take(self.text);
+        take(self.ring);
+        floor
+    }
 }
 
-/// Shared with the writer task, which needs the same sequence numbering and
-/// reports from the same drop counter the producers add to.
+/// The producer-side handle: one per process, shared as an Arc.
+///
+/// Deliberately not Clone: INV:log.single_writer says there is one writer per
+/// process, and the writer's half of this struct is the library's Logger, which
+/// cannot be duplicated. Share the Arc instead.
+pub struct LogHandle {
+    /// The library's producer handle: filter table, sequence counter, channel.
+    inner: Arc<logreel::Handle<Event>>,
+    /// Session numbering, which the library does not do.
+    counters: Counters,
+    /// The text view's floor, copied out of Settings so direct_at! needs no lock
+    /// and no second lookup.
+    text: Filter,
+    /// The library's writer, taken by LogHandle::shutdown.
+    logger: StdMutex<Option<logreel::Logger<Event>>>,
+}
+
+/// Session numbering. The sequence number moved into the library with the
+/// channel; only the connection id is still this crate's, because a session is
+/// a proxy concept and not a logging one.
 #[derive(Default)]
 struct Counters {
-    seq: AtomicU32,
-    dropped: AtomicU32,
-    /// `AtomicU32` rather than `AtomicU64` because the OpenWrt tier has to
-    /// build: `mips-unknown-linux-musl` and its little-endian twin are 32-bit
-    /// targets without 64-bit atomics, where `AtomicU64` does not exist at all.
-    /// Four billion connections is a thousand years of a busy home router, and
-    /// a wrap is handled rather than assumed away.
+    /// AtomicU32 rather than AtomicU64 because the OpenWrt tier has to build:
+    /// mips-unknown-linux-musl and its little-endian twin are 32-bit targets
+    /// without 64-bit atomics, where AtomicU64 does not exist at all. Four
+    /// billion connections is a thousand years of a busy home router, and a
+    /// wrap is handled rather than assumed away.
     conn: AtomicU32,
 }
 
 impl Counters {
-    /// Zero is reserved for "not a session", so numbering starts at one.
-    fn next_seq(&self) -> u32 {
-        self.seq.fetch_add(1, Relaxed).wrapping_add(1)
-    }
-
-    /// The next session id, never zero — which is what makes `conn_id == 0`
+    /// The next session id, never zero: that is what makes conn_id == 0
     /// readable as "not a session" for the life of the process, wrap included.
     fn next_conn(&self) -> u64 {
         match self.conn.fetch_add(1, Relaxed) {
@@ -324,30 +352,18 @@ impl Counters {
 
 impl LogHandle {
     /// True when a record of this category and level would be kept by *any*
-    /// consumer — the segment, the text view or the ring.
+    /// consumer: the segment, the text view or the ring.
     ///
-    /// A level is a floor, not a ceiling: a threshold of `info` keeps `info`,
-    /// `warn` and `error` and drops `debug`, which is what every operator
-    /// means by "log level info".
+    /// A level is a floor, not a ceiling: a threshold of info keeps info, warn
+    /// and error and drops debug, which is what every operator means by
+    /// "log level info".
     ///
-    /// Callers use this to skip building a payload — the `key_display` strings
-    /// and the `format!` behind them — that no consumer wants. What each
-    /// consumer keeps is a narrower question, answered in the writer task where
+    /// Callers use this to skip building a payload that no consumer wants. What
+    /// each consumer keeps is a narrower question, answered in the writer where
     /// the record is delivered: getting the widening right here is what makes
     /// three consumers cost no more than one.
     pub fn enabled(&self, category: Category, level: Level) -> bool {
-        // The one per-category floor belongs to the segment, so a build without
-        // one has nothing to index: the category is then only in the signature
-        // because callers should not have to care which build this is.
-        #[cfg(feature = "log-disk")]
-        let disk = self.disk[category as usize].keeps(level);
-        #[cfg(not(feature = "log-disk"))]
-        let disk = {
-            let _ = category;
-            false
-        };
-
-        disk || self.text.keeps(level) || self.ring.keeps(level)
+        self.inner.enabled(category as u8, logreel_level(level))
     }
 
     /// True when the *text view* would render a record at this level. Its own
@@ -358,7 +374,7 @@ impl LogHandle {
     }
 
     /// Next session id, allocated once per accepted connection. Never zero,
-    /// which is what makes `conn_id == 0` readable as "not a session".
+    /// which is what makes conn_id == 0 readable as "not a session".
     pub fn next_conn_id(&self) -> u64 {
         self.counters.next_conn()
     }
@@ -366,174 +382,256 @@ impl LogHandle {
     /// Records that did not fit the channel. Not an error: the alternative
     /// would be blocking a connection on a logging write.
     pub fn dropped(&self) -> u32 {
-        self.counters.dropped.load(Relaxed)
+        self.inner.dropped().min(u64::from(u32::MAX)) as u32
     }
 
     /// Appends one record. Never awaits, never blocks, never allocates.
     ///
     /// Takes the session id rather than reading the task-local so that
-    /// process-wide emitters and tests can call it directly; [`emit`] is the
-    /// scope-aware wrapper producers normally reach through [`log_event!`].
+    /// process-wide emitters and tests can call it directly; emit is the
+    /// scope-aware wrapper producers normally reach through log_event!.
     pub fn emit(&self, conn_id: u64, category: Category, level: Level, event: Event) {
-        if !self.enabled(category, level) {
-            return;
-        }
-
-        let record = LogRecord {
-            ts_ns: now_ns(),
-            conn_id,
-            seq: self.counters.next_seq(),
-            level: level as i32,
-            category: category as i32,
-            event: Some(event),
-        };
-
-        // A full channel and a writer that has already stopped are the same
-        // thing from here: the record did not get written, and the count is how
-        // the next successful flush says so.
-        if self.tx.try_send(record).is_err() {
-            self.counters.dropped.fetch_add(1, Relaxed);
-        }
+        let _ = self
+            .inner
+            .emit(logreel_level(level), category as u8, conn_id, event);
     }
 
     /// Prints the last records the ring holds, through the text sink.
     ///
-    /// Asynchronous by construction: this only asks, and the writer task — the
-    /// only owner of the ring — answers when it next runs. A signal handler
-    /// must never wait for a task that may be mid-flush.
+    /// Asynchronous by construction: this only asks, and the writer -- the only
+    /// owner of the ring -- answers when it next runs. A signal handler must
+    /// never wait for a task that may be mid-flush.
     pub fn dump_ring(&self) {
-        self.dump
-            .send_modify(|requested| *requested = requested.wrapping_add(1));
+        let _ = self.inner.request_dump();
     }
 
     /// Stops the writer, flushing what is already queued, and waits for it.
     ///
-    /// Idempotent, and safe to call when a shutdown is already in progress:
-    /// the second caller finds no task left to join. On return the file
-    /// contains everything this process emitted before the call.
+    /// Idempotent, and safe to call when a shutdown is already in progress: the
+    /// second caller finds no writer left to stop. On return the file contains
+    /// everything this process emitted before the call, up to the grace window
+    /// that lets a session mid-teardown emit its close record.
     pub async fn shutdown(&self) {
-        let _ = self.shutdown.send(true);
-        let task = self
-            .join
+        let logger = self
+            .logger
             .lock()
-            .expect("log writer join mutex cannot be poisoned by `take`")
+            .expect("log writer mutex cannot be poisoned")
             .take();
-        if let Some(task) = task {
-            let _ = task.await;
+        let Some(logger) = logger else {
+            return;
+        };
+
+        // The writer is a std thread and its stop is an fsync: blocking a tokio
+        // worker on it would stall every other task sharing that thread.
+        match tokio::task::spawn_blocking(move || {
+            logger.shutdown_with(SHUTDOWN_QUIET, SHUTDOWN_LIMIT)
+        })
+        .await
+        {
+            Ok(report) if report.sink_errors > 0 => crate::direct!(
+                "log sink failed {} time(s) during shutdown: {}",
+                report.sink_errors,
+                report.error.as_deref().unwrap_or("no detail")
+            ),
+            Ok(_) => {}
+            Err(error) => crate::direct!("log writer did not join: {error}"),
         }
     }
 }
 
-/// Starts the writer task and returns the producer-side handle.
-///
-/// The sink is whatever the caller wants the batches written to. The one thing
-/// that can fail here is the text view's own destination: a `--text-log` path
-/// that cannot be opened is a startup error, like the segment's.
-fn start<S: writer::BatchSink + 'static>(
-    sink: S,
-    settings: Settings,
-) -> Result<LogHandle, LogError> {
-    let view = view::View::open(&settings).map_err(|error| {
-        LogError::TextSink(format!(
-            "{} could not be opened: {error}",
-            settings.text_log
-        ))
-    })?;
-    let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-    let (shutdown, shutdown_rx) = watch::channel(false);
-    let (dump, dump_rx) = watch::channel(0_u64);
-    let counters = Arc::new(Counters::default());
-
-    let handle = LogHandle {
-        tx,
-        counters: Arc::clone(&counters),
-        #[cfg(feature = "log-disk")]
-        disk: settings.disk,
-        text: settings.text,
-        ring: settings.ring,
-        shutdown,
-        dump,
-        join: StdMutex::new(None),
-    };
-
-    let control = writer::Control {
-        shutdown: shutdown_rx,
-        dump: dump_rx,
-    };
-    let task = tokio::spawn(writer::run(sink, rx, counters, settings, control, view));
-    *handle
-        .join
-        .lock()
-        .expect("log writer join mutex cannot be poisoned by `take`") = Some(task);
-
-    Ok(handle)
-}
-
 /// Where the on-disk sink writes, and how.
 ///
-/// A wrapper rather than two more parameters on [`init`], because the storage
-/// policy types live behind the `log-disk` feature and the caller that starts
-/// the subsystem should not have to know whether this build has a sink at all.
+/// A wrapper rather than two more parameters on init, because the storage
+/// policy types live behind the log-disk feature and the caller that starts the
+/// subsystem should not have to know whether this build has a sink at all.
 #[cfg(feature = "log-disk")]
 #[derive(Clone, Debug)]
 pub struct Disk {
-    /// Directory holding one `<date>.seg` per UTC day.
+    /// Directory holding one <date>.seg per UTC day.
     pub dir: PathBuf,
     /// Compression, durability and retention for those segments.
     pub options: storage::Options,
 }
 
-/// The sink a build without the `log-disk` feature does not have — see the
-/// variant with fields above. It has no public constructor, so `None` is the
-/// only value [`init`] can be given in such a build; it exists so that the call
-/// has one shape whether or not the feature is there.
+/// The sink a build without the log-disk feature does not have: see the variant
+/// with fields above. It has no public constructor, so None is the only value
+/// init can be given in such a build; it exists so that the call has one shape
+/// whether or not the feature is there.
 #[cfg(not(feature = "log-disk"))]
 #[derive(Clone, Debug)]
 pub struct Disk(());
 
-/// Starts the subsystem: opens today's segment if there is a [`Disk`], and the
-/// writer task behind it, or reports why it could not.
+/// Starts the subsystem: opens today's segment if there is a Disk, and the
+/// library's writer behind it, or reports why it could not.
 ///
-/// `disk` is the only optional part. Without one the records go nowhere but the
-/// text view and the ring — the pipeline itself is unconditional, because the
+/// disk is the only optional part. Without one the records go nowhere but the
+/// text view and the ring: the pipeline itself is unconditional, because the
 /// text a human reads is a projection of it and a run without a segment is
 /// still a run somebody has to be able to read.
 ///
 /// This is the only fallible step in the module, and it is fallible for exactly
 /// one reason: a destination. A directory that cannot be created, a filesystem
 /// that cannot carry a segment, another process already writing today's file, a
-/// text log that cannot be opened — all of them are startup errors with an exit
+/// text log that cannot be opened -- all of them are startup errors with an exit
 /// code, which is what lets the caller refuse to run rather than run without
 /// logs. Everything after this point degrades instead: a write that fails later
 /// is a backoff and a warning.
-///
-/// Must be called from within a Tokio runtime — the writer is a spawned task.
 pub fn init(settings: Settings, disk: Option<Disk>) -> Result<Arc<LogHandle>, LogError> {
+    let view = View::open(&settings).map_err(|error| {
+        LogError::TextSink(format!(
+            "{} could not be opened: {error}",
+            settings.text_log
+        ))
+    })?;
+
     #[cfg(feature = "log-disk")]
-    let handle = match disk {
-        Some(disk) => start(storage::FileSink::open(&disk.dir, disk.options)?, settings)?,
-        None => start(writer::MemorySink, settings)?,
+    let (sink, durability): (Box<dyn logreel::BatchSink>, logreel::Durability) = match disk {
+        Some(disk) => {
+            let durability = storage::durability_of(disk.options.durability);
+            (
+                Box::new(storage::FileSink::open(&disk.dir, disk.options)?),
+                durability,
+            )
+        }
+        None => (
+            Box::new(logreel::SharedSink::new()),
+            logreel::Durability::Eventual,
+        ),
     };
     #[cfg(not(feature = "log-disk"))]
-    let handle = {
-        // Nothing outside this crate can build the `Disk` this arm would need,
+    let (sink, durability): (Box<dyn logreel::BatchSink>, logreel::Durability) = {
+        // Nothing outside this crate can build the Disk this arm would need,
         // which is the point: without the feature there is no sink to hand over.
         let _ = disk;
-        start(writer::MemorySink, settings)?
+        (
+            Box::new(logreel::SharedSink::new()),
+            logreel::Durability::Eventual,
+        )
     };
 
-    let handle = Arc::new(handle);
+    let logger = logreel::init_with(
+        logreel_settings(&settings, durability),
+        None,
+        Some(Box::new(view)),
+        sink,
+    )
+    .map_err(|error| LogError::Pipeline(error.to_string()))?;
+
+    let handle = Arc::new(LogHandle {
+        inner: Arc::clone(logger.handle()),
+        counters: Counters::default(),
+        text: settings.text,
+        logger: StdMutex::new(Some(logger)),
+    });
     dump_on_usr1(Arc::clone(&handle));
     Ok(handle)
 }
 
-/// Answers `SIGUSR1` with the ring's contents.
+/// init with a caller-chosen sink: the tests' way in.
 ///
-/// A signal handler runs in a context where almost nothing may be done — not
-/// writing to a file, not allocating — so this is a task waiting on the signal
-/// rather than a handler doing the work: it asks, and the writer task prints
-/// the ring the next time it wakes. Nothing is lost if the signal arrives while
-/// the process is stopping; the dump is a diagnostic, not a record.
+/// The production entry point picks the sink from the Disk it is given; a test
+/// that wants to see the batches has to hand its own, which is the one
+/// difference between this and init.
+#[cfg(test)]
+fn start_with_sink<S: logreel::BatchSink + 'static>(
+    sink: S,
+    settings: Settings,
+) -> Result<LogHandle, LogError> {
+    let view = View::open(&settings).map_err(|error| {
+        LogError::TextSink(format!(
+            "{} could not be opened: {error}",
+            settings.text_log
+        ))
+    })?;
+    let logger = logreel::init_with(
+        logreel_settings(&settings, logreel::Durability::Eventual),
+        None,
+        Some(Box::new(view)),
+        Box::new(sink),
+    )
+    .map_err(|error| LogError::Pipeline(error.to_string()))?;
+    Ok(LogHandle {
+        inner: Arc::clone(logger.handle()),
+        counters: Counters::default(),
+        text: settings.text,
+        logger: StdMutex::new(Some(logger)),
+    })
+}
+
+/// The proxy's settings as the library's.
+///
+/// Two tables leave: the producer gate, which is the union of the three
+/// consumers, and the sink's, which is the segment's per-category policy. The
+/// text view and the ring are not the library's built-ins -- the proxy's View is
+/// its observer -- so they contribute only to the gate.
+fn logreel_settings(settings: &Settings, durability: logreel::Durability) -> logreel::Settings {
+    let mut builder = logreel::Settings::builder()
+        .channel_capacity(CHANNEL_CAPACITY)
+        .batch_max(settings.batch_max)
+        .flush_interval(settings.flush_interval)
+        .flush_on_warn(settings.flush_on_warn)
+        .durability(durability)
+        .domain(domain())
+        .on_internal(|error| crate::direct!("log internal error: {}", error.message));
+
+    match settings.gate() {
+        Some(level) => builder = builder.min_level(logreel_level(level)),
+        None => {
+            // No consumer wants anything: one floor, then every category off.
+            builder = builder.min_level(logreel::Level::Error);
+            for category in 0..CATEGORY_COUNT {
+                builder = builder.filter(category as u8, None);
+            }
+        }
+    }
+
+    #[cfg(feature = "log-disk")]
+    {
+        let floor = settings
+            .disk
+            .iter()
+            .filter_map(|filter| filter.floor())
+            .min_by_key(|level| *level as i32)
+            .unwrap_or(Level::Error);
+        builder = builder.sink_min_level(logreel_level(floor));
+        for (category, filter) in settings.disk.iter().enumerate() {
+            builder = builder.sink_filter(category as u8, filter.floor().map(logreel_level));
+        }
+    }
+    #[cfg(not(feature = "log-disk"))]
+    {
+        let floor = settings.gate().unwrap_or(Level::Error);
+        builder = builder.sink_min_level(logreel_level(floor));
+    }
+
+    builder.build()
+}
+
+/// The opaque domain bytes every batch carries: who wrote it and in what shape.
+fn domain() -> Box<[u8]> {
+    format!(
+        "app={};schema={};protocol={}",
+        env!("CARGO_PKG_VERSION"),
+        schema::SCHEMA_VERSION,
+        WRITER_PROTOCOL
+    )
+    .into_bytes()
+    .into_boxed_slice()
+}
+
+/// The proxy's level as the library's. They share the four named levels and
+/// differ only in the name of zero: unspecified here, trace there.
+fn logreel_level(level: Level) -> logreel::Level {
+    logreel::Level::from_u8(level as u8).unwrap_or(logreel::Level::Trace)
+}
+
+/// Answers SIGUSR1 with the ring's contents.
+///
+/// A signal handler runs in a context where almost nothing may be done -- not
+/// writing to a file, not allocating -- so this is a task waiting on the signal
+/// rather than a handler doing the work: it asks, and the writer prints the ring
+/// the next time it wakes. Nothing is lost if the signal arrives while the
+/// process is stopping; the dump is a diagnostic, not a record.
 #[cfg(unix)]
 fn dump_on_usr1(handle: Arc<LogHandle>) {
     use tokio::signal::unix::{SignalKind, signal};
@@ -561,14 +659,13 @@ struct LogCtx {
     conn_id: u64,
 }
 
-/// Runs `future` with the log context planted, so every [`log_event!`] inside
-/// it — in this task or in any task spawned from it — is attributed to
-/// `conn_id`.
+/// Runs future with the log context planted, so every log_event! inside it --
+/// in this task or in any task spawned from it -- is attributed to conn_id.
 ///
 /// This is the one place a connection's logging is set up: the accept arm in
-/// `server.rs` wraps the per-connection task in it, and
-/// `proxy::handle_client_with_runtime` needs no logging parameter because of
-/// it. Callers that forget to scope lose the attribution, not correctness.
+/// server.rs wraps the per-connection task in it, and
+/// proxy::handle_client_with_runtime needs no logging parameter because of it.
+/// Callers that forget to scope lose the attribution, not correctness.
 pub fn scope<F>(conn_id: u64, handle: Arc<LogHandle>, future: F) -> impl Future<Output = F::Output>
 where
     F: Future,
@@ -576,14 +673,14 @@ where
     LOG_CTX.scope(LogCtx { handle, conn_id }, future)
 }
 
-/// [`LogHandle::emit`] for process-wide events, tolerating a caller that has no
+/// LogHandle::emit for process-wide events, tolerating a caller that has no
 /// handle at all.
 ///
-/// The binary starts the subsystem only when there is somewhere to put it —
-/// `--log-dir` today, always after stage 5 — and the process-wide emitters (the
-/// banner record, the accept loop's own errors) run whether or not there is a
-/// sink. A record nobody can receive is not built: the payload's `Vec`s and the
-/// `String`s behind them cost an allocation each on a path that has no reader.
+/// The binary starts the subsystem only when there is somewhere to put it, and
+/// the process-wide emitters (the banner record, the accept loop's own errors)
+/// run whether or not there is a sink. A record nobody can receive is not built:
+/// the payload's Vecs and the Strings behind them cost an allocation each on a
+/// path that has no reader.
 pub fn emit_global(
     handle: Option<&Arc<LogHandle>>,
     category: Category,
@@ -595,9 +692,9 @@ pub fn emit_global(
     }
 }
 
-/// [`scope`] for work that belongs to no session — the accept loop's own
-/// errors, the descriptor snapshot, pool refills, the `--check` probes. Their
-/// records carry `conn_id = 0`, which is the documented way to say so.
+/// scope for work that belongs to no session: the accept loop's own errors, the
+/// descriptor snapshot, pool refills, the --check probes. Their records carry
+/// conn_id = 0, which is the documented way to say so.
 pub fn scope_global<F>(handle: Arc<LogHandle>, future: F) -> impl Future<Output = F::Output>
 where
     F: Future,
@@ -605,7 +702,7 @@ where
     scope(0, handle, future)
 }
 
-/// True when the current task is inside a [`scope`]. Used by the process-wide
+/// True when the current task is inside a scope. Used by the process-wide
 /// emitters to assert they were set up, since forgetting is otherwise silent.
 pub fn inside_scope() -> bool {
     LOG_CTX.try_with(|_| ()).is_ok()
@@ -620,34 +717,33 @@ pub fn emit(category: Category, level: Level, event: Event) {
     let _ = LOG_CTX.try_with(|ctx| ctx.handle.emit(ctx.conn_id, category, level, event));
 }
 
-/// [`LogHandle::enabled`] for the current scope. Without a scope nothing is
-/// enabled, so a producer outside one does not even build its payload.
+/// LogHandle::enabled for the current scope. Without a scope nothing is enabled,
+/// so a producer outside one does not even build its payload.
 pub fn enabled(category: Category, level: Level) -> bool {
     LOG_CTX
         .try_with(|ctx| ctx.handle.enabled(category, level))
         .unwrap_or(false)
 }
 
-/// True when the *text view* renders records at `level` and above.
+/// True when the *text view* renders records at level and above.
 ///
-/// The producer gate is the union of three policies; this is one of them, and
-/// it is the one that governs the few console lines that are not records — a
-/// handshake refused before a session existed. Without a scope, or with the
-/// text log off, nothing is written.
+/// The producer gate is the union of three policies; this is one of them, and it
+/// is the one that governs the few console lines that are not records: a
+/// handshake refused before a session existed. Without a scope, or with the text
+/// log off, nothing is written.
 pub fn text_keeps(level: Level) -> bool {
     LOG_CTX
         .try_with(|ctx| ctx.handle.text_keeps(level))
         .unwrap_or(false)
 }
 
-/// Writes one line that is not a record: stderr, one write, `tg-ws-proxy:` in
+/// Writes one line that is not a record: stderr, one write, tg-ws-proxy: in
 /// front of it.
 ///
 /// The prefix is what tells a reader which lines came from this process rather
-/// than from a record's own rendering, and it is the same prefix the Android
-/// shim tags logcat with. Never gated by a level: what uses this either has
-/// nowhere else to go (a sink that failed) or has already decided
-/// ([`direct_at!`]).
+/// than from a record's own rendering, and it is the same prefix the Android shim
+/// tags logcat with. Never gated by a level: what uses this either has nowhere
+/// else to go (a sink that failed) or has already decided (direct_at!).
 #[macro_export]
 macro_rules! direct {
     ($($arg:tt)*) => {
@@ -655,13 +751,12 @@ macro_rules! direct {
     };
 }
 
-/// [`direct!`] for a line that belongs to no session but would be a record at
-/// `level` if it did — the refused-handshake diagnostics.
+/// direct! for a line that belongs to no session but would be a record at level
+/// if it did: the refused-handshake diagnostics.
 ///
 /// They follow the text view's floor rather than a policy of their own: at the
-/// default `info` a port scanner leaves nothing behind, and at
-/// `--text-level debug` the operator gets exactly the lines `--verbose` used to
-/// print.
+/// default info a port scanner leaves nothing behind, and at --text-level debug
+/// the operator gets exactly the lines --verbose used to print.
 #[macro_export]
 macro_rules! direct_at {
     ($level:expr, $($arg:tt)*) => {
@@ -673,22 +768,14 @@ macro_rules! direct_at {
 
 /// Logs one structured event, if the current scope's filter keeps it.
 ///
-/// ```ignore
-/// log_event!(Category::Routing, Level::Info, Event::TierFallback {
-///     from_tier: Tier::Ws as i32,
-///     to_tier: Tier::Cfworker as i32,
-///     reason: Reason::WsFail as i32,
-/// });
-/// ```
-///
 /// The payload struct is named after its oneof variant, so the macro can take
-/// the variant and build the struct — one `log_event!` line per call site
-/// instead of a nested constructor. The level and category come from the
-/// artifact's event catalog rather than from the payload, because they belong
-/// to the event, not to its data.
+/// the variant and build the struct: one log_event! line per call site instead of
+/// a nested constructor. The level and category come from the artifact's event
+/// catalog rather than from the payload, because they belong to the event, not
+/// to its data.
 ///
-/// The payload is only built when the record would be kept, which is what makes
-/// a `DEBUG` line that formats a domain or an address free when `DEBUG` is off.
+/// The payload is only built when the record would be kept, which is what makes a
+/// DEBUG line that formats a domain or an address free when DEBUG is off.
 #[macro_export]
 macro_rules! log_event {
     ($category:expr, $level:expr, Event::$variant:ident { $($field:ident $(: $value:expr)?),* $(,)? } $(,)?) => {
@@ -704,9 +791,9 @@ macro_rules! log_event {
     };
 }
 
-/// Wall clock in unix nanoseconds, which is what `LogRecord.ts_ns` carries.
-/// A clock before 1970 is not a case worth a branch on the emit path.
-fn now_ns() -> u64 {
+/// Wall clock in unix nanoseconds. The view stamps the overflow record with
+/// this; every other record's timestamp comes from the library's writer.
+pub(crate) fn now_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| since.as_nanos() as u64)

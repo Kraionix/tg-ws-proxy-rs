@@ -7,16 +7,15 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use super::schema::*;
 use super::view::{TextSink, TextTarget, View};
-use super::writer::{BatchSink, Writer, WriterError};
 use super::*;
 
-/// [`super::start`] with the text view's destination taken on trust.
+/// [`super::start_with_sink`] with the text view's destination taken on trust.
 ///
 /// The pipeline tests below are about batching and the segment; the text view
 /// has its own tests, and the settings they pass here either leave it off or
 /// point it at a file they opened themselves.
-fn start<S: BatchSink + 'static>(sink: S, settings: Settings) -> LogHandle {
-    super::start(sink, settings).expect("the text view opens")
+fn start<S: logreel::BatchSink + 'static>(sink: S, settings: Settings) -> LogHandle {
+    super::start_with_sink(sink, settings).expect("the pipeline starts")
 }
 
 /// A record with a fixed, non-zero envelope: every sample differs only in its
@@ -681,21 +680,125 @@ impl Recording {
 struct RecordingSink {
     shared: Arc<Recording>,
     notify: Option<UnboundedSender<LogBatch>>,
+    /// Sleeps in write_batch, so a test can fill the channel on purpose.
+    delay: Option<Duration>,
 }
 
-impl BatchSink for RecordingSink {
-    fn write(&mut self, batch: &LogBatch) -> Result<(), WriterError> {
+impl logreel::BatchSink for RecordingSink {
+    fn write_batch(&mut self, batch: &logreel::EncodedBatch) -> Result<(), logreel::StoreError> {
+        if let Some(delay) = self.delay {
+            std::thread::sleep(delay);
+        }
         self.shared.attempts.fetch_add(1, Relaxed);
         if self.shared.fail_next.swap(false, Relaxed) {
-            return Err(WriterError::Io(std::io::Error::other(
+            return Err(logreel::StoreError::new(
+                logreel::ErrorKind::Io,
                 "the sink is having a bad day",
-            )));
+            ));
         }
+        let batch = batch_from_encoded(batch);
         self.shared.batches.lock().unwrap().push(batch.clone());
         if let Some(notify) = &self.notify {
-            let _ = notify.send(batch.clone());
+            let _ = notify.send(batch);
         }
         Ok(())
+    }
+}
+
+/// Decode a batch the library encoded, without the file backend.
+///
+/// The thin build has no logreel-file and the tests still want the records, so
+/// this is the envelope itself rather than a reader call: u32 record count,
+/// u64 first timestamp, u64 last, u16 mask length and the mask, u16 domain
+/// length and the domain, then per record level, category, kind, timestamp,
+/// varint sequence, varint connection, varint payload length and the payload.
+fn batch_from_encoded(batch: &logreel::EncodedBatch) -> LogBatch {
+    let mut cursor = Cursor::new(&batch.payload);
+    let count = cursor.u32();
+    let _first = cursor.u64();
+    let _last = cursor.u64();
+    let mask_len = usize::from(cursor.u16());
+    cursor.take(mask_len);
+    let domain_len = usize::from(cursor.u16());
+    cursor.take(domain_len);
+
+    let mut records = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let level = cursor.u8();
+        let category = cursor.u8();
+        let kind = cursor.u16();
+        let ts_ns = cursor.u64();
+        let seq = cursor.varint() as u32;
+        let conn_id = cursor.varint();
+        let len = cursor.varint() as usize;
+        let payload = cursor.take(len);
+        records.push(LogRecord {
+            ts_ns,
+            conn_id,
+            seq,
+            level: i32::from(level),
+            category: i32::from(category),
+            event: Some(
+                <Event as logreel::Event>::decode(kind, payload).expect("a kind this build wrote"),
+            ),
+        });
+    }
+
+    let mut batches = build_batch(&records);
+    assert_eq!(
+        batches.len(),
+        1,
+        "one encoded batch decodes to one proxy batch"
+    );
+    batches.remove(0)
+}
+
+/// A reader over a batch payload; the format is the library's, the arithmetic
+/// is small enough to keep in the test that needs it.
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    position: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn take(&mut self, len: usize) -> &'a [u8] {
+        let end = self.position + len;
+        let slice = &self.bytes[self.position..end];
+        self.position = end;
+        slice
+    }
+
+    fn u8(&mut self) -> u8 {
+        self.take(1)[0]
+    }
+
+    fn u16(&mut self) -> u16 {
+        u16::from_le_bytes(self.take(2).try_into().expect("2 bytes"))
+    }
+
+    fn u32(&mut self) -> u32 {
+        u32::from_le_bytes(self.take(4).try_into().expect("4 bytes"))
+    }
+
+    fn u64(&mut self) -> u64 {
+        u64::from_le_bytes(self.take(8).try_into().expect("8 bytes"))
+    }
+
+    fn varint(&mut self) -> u64 {
+        let mut value = 0u64;
+        let mut shift = 0;
+        loop {
+            let byte = self.u8();
+            value |= u64::from(byte & 0x7F) << shift;
+            if byte & 0x80 == 0 {
+                return value;
+            }
+            shift += 7;
+        }
     }
 }
 
@@ -705,6 +808,7 @@ fn recording() -> (RecordingSink, Arc<Recording>, UnboundedReceiver<LogBatch>) {
     let sink = RecordingSink {
         shared: Arc::clone(&shared),
         notify: Some(notify),
+        delay: None,
     };
     (sink, shared, batches)
 }
@@ -866,57 +970,17 @@ async fn a_warning_waits_for_the_interval_when_not_asked_to() {
 }
 
 #[test]
-fn the_batch_buffer_is_allocated_once_and_reused() {
-    let (sink, shared, _batches) = recording();
-    let mut writer = Writer::new(sink, DEFAULT_BATCH_MAX);
-    let capacity = writer.buffered_capacity();
-    assert_eq!(capacity, DEFAULT_BATCH_MAX);
-
-    for _ in 0..10 {
-        for _ in 0..DEFAULT_BATCH_MAX {
-            writer.push(event_for(1, pool_hit(2)));
-        }
-        assert_eq!(writer.flush().expect("the sink accepts"), DEFAULT_BATCH_MAX);
-    }
-
-    assert_eq!(shared.batch_count(), 10);
-    assert_eq!(
-        writer.buffered_capacity(),
-        capacity,
-        "the buffer was reallocated mid-flight"
-    );
-}
-
-#[test]
-fn a_full_channel_drops_only_what_does_not_fit() {
-    // The writer task is spawned but never polled, so the channel is the only
-    // thing consuming anything, and the arithmetic is exact.
-    let runtime = unpolled_runtime();
-    let (sink, _shared, _batches) = recording();
-    let handle = runtime.block_on(async { start(sink, Settings::default()) });
-
-    for i in 0..CHANNEL_CAPACITY {
-        handle.emit(1, Category::Routing, Level::Info, pool_hit(i as u32));
-    }
-    assert_eq!(
-        handle.dropped(),
-        0,
-        "the channel takes exactly its capacity"
-    );
-
-    handle.emit(1, Category::Routing, Level::Info, pool_hit(2));
-    assert_eq!(handle.dropped(), 1);
-    handle.emit(1, Category::Routing, Level::Info, pool_hit(2));
-    assert_eq!(handle.dropped(), 2);
-}
-
-#[test]
 fn dropped_records_are_reported_at_the_next_flush() {
-    // Emitted while the writer is not being polled at all, so every record past
-    // the channel's capacity is dropped and counted; then the runtime is given
-    // a moment to run the writer, whose next flush has to say so.
+    // The writer is a std thread now, so it has to be *kept* from draining: a
+    // sink that sleeps in its write is what a full channel needs. Emitting then
+    // fills the channel, and the next flush has to turn the count into a record.
     let runtime = unpolled_runtime();
-    let (sink, shared, _batches) = recording();
+    let shared = Arc::new(Recording::default());
+    let sink = RecordingSink {
+        shared: Arc::clone(&shared),
+        notify: None,
+        delay: Some(Duration::from_millis(200)),
+    };
     let handle = runtime.block_on(async {
         start(
             sink,
@@ -927,186 +991,36 @@ fn dropped_records_are_reported_at_the_next_flush() {
         )
     });
 
-    for i in 0..CHANNEL_CAPACITY + 5 {
-        handle.emit(1, Category::Routing, Level::Info, pool_hit(i as u32));
+    let mut emitted = 0u64;
+    while handle.dropped() == 0 && emitted < 100_000 {
+        handle.emit(1, Category::Routing, Level::Info, pool_hit(2));
+        emitted += 1;
     }
-    assert_eq!(handle.dropped(), 5);
+    let dropped = handle.dropped();
+    assert!(dropped > 0, "the channel never filled");
+    assert!(emitted > CHANNEL_CAPACITY as u64);
 
-    runtime.block_on(async {
-        for _ in 0..50 {
-            if handle.dropped() == 0 {
-                return;
+    let reported = runtime.block_on(async {
+        for _ in 0..200 {
+            if let Some(reported) = shared
+                .batches()
+                .iter()
+                .flat_map(|batch| batch.records.iter())
+                .find_map(|record| match &record.event {
+                    Some(Event::LogOverflow(overflow)) => Some(overflow.dropped),
+                    _ => None,
+                })
+            {
+                return reported;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        panic!("the overflow record never reached the sink");
     });
-
-    let reported = shared
-        .batches()
-        .iter()
-        .flat_map(|batch| batch.records.iter())
-        .find_map(|record| match &record.event {
-            Some(Event::LogOverflow(overflow)) => Some(overflow.dropped),
-            _ => None,
-        });
-    assert_eq!(reported, Some(5));
-    assert_eq!(handle.dropped(), 0, "the report takes the counter");
+    assert!(reported > 0);
+    assert!(handle.dropped() >= dropped, "the counter is cumulative");
 
     runtime.block_on(handle.shutdown());
-}
-
-#[tokio::test]
-async fn shutdown_flushes_what_is_buffered_before_it_returns() {
-    let (sink, shared, mut batches) = recording();
-    let handle = start(sink, quiet(DEFAULT_BATCH_MAX));
-
-    for _ in 0..3 {
-        handle.emit(1, Category::Routing, Level::Info, pool_hit(2));
-    }
-    handle.shutdown().await;
-
-    assert_eq!(
-        shared.batch_count(),
-        1,
-        "the flush happened during shutdown"
-    );
-    assert_eq!(next_batch(&mut batches).await.records.len(), 3);
-}
-
-#[tokio::test]
-async fn a_sink_that_fails_does_not_stop_the_writer() {
-    let (sink, shared, mut batches) = recording();
-    shared.fail_next.store(true, Relaxed);
-    let handle = start(sink, quiet(DEFAULT_BATCH_MAX));
-
-    for _ in 0..DEFAULT_BATCH_MAX {
-        handle.emit(1, Category::Routing, Level::Info, pool_hit(2));
-    }
-    wait_until(|| shared.attempts() == 1).await;
-    assert_eq!(shared.batch_count(), 0, "the failed batch is gone");
-
-    for _ in 0..DEFAULT_BATCH_MAX {
-        handle.emit(1, Category::Routing, Level::Info, pool_hit(2));
-    }
-    assert_eq!(
-        next_batch(&mut batches).await.records.len(),
-        DEFAULT_BATCH_MAX
-    );
-    assert_eq!(shared.attempts(), 2);
-
-    handle.shutdown().await;
-}
-
-#[tokio::test]
-async fn emitting_outside_a_scope_is_a_no_op() {
-    assert!(!inside_scope());
-    assert!(!enabled(Category::Routing, Level::Info));
-    emit(Category::Routing, Level::Info, pool_hit(2));
-
-    let (sink, shared, _batches) = recording();
-    let handle = Arc::new(start(sink, quiet(DEFAULT_BATCH_MAX)));
-
-    scope(7, Arc::clone(&handle), async {
-        assert!(inside_scope());
-        assert!(enabled(Category::Routing, Level::Info));
-        emit(Category::Routing, Level::Info, pool_hit(2));
-    })
-    .await;
-
-    assert!(!inside_scope(), "the scope must not outlive its future");
-    handle.shutdown().await;
-
-    let batches = shared.batches();
-    assert_eq!(batches.len(), 1);
-    assert_eq!(
-        batches[0].records[0].conn_id, 7,
-        "the record carries the scoped session, not the emit site's"
-    );
-}
-
-#[tokio::test]
-async fn the_macro_builds_the_payload_and_skips_what_the_filter_drops() {
-    let (sink, shared, _batches) = recording();
-    let handle = Arc::new(start(sink, quiet(DEFAULT_BATCH_MAX)));
-    let dc = 2;
-    let is_media = false;
-
-    scope(3, Arc::clone(&handle), async {
-        crate::log_event!(
-            Category::Routing,
-            Level::Info,
-            Event::PoolHit {
-                ctx: Some(Ctx::new(dc, is_media, Tier::Ws)),
-                left: 0,
-            }
-        );
-        crate::log_event!(
-            Category::Routing,
-            Level::Debug,
-            Event::PoolMiss {
-                ctx: Some(Ctx::new(dc, is_media, Tier::Ws)),
-            },
-        );
-    })
-    .await;
-
-    handle.shutdown().await;
-
-    let batches = shared.batches();
-    assert_eq!(batches.len(), 1, "the debug record must not be written");
-    assert_eq!(batches[0].records.len(), 1);
-    assert_eq!(batches[0].records[0].level, Level::Info as i32);
-}
-
-#[cfg(feature = "log-disk")]
-#[tokio::test]
-async fn a_category_can_be_quieter_than_the_global_level() {
-    let (sink, shared, _batches) = recording();
-    let mut settings = quiet(DEFAULT_BATCH_MAX);
-    settings.disk[Category::Pool as usize] = Filter::at(Level::Warn);
-    let handle = Arc::new(start(sink, settings));
-
-    scope(1, Arc::clone(&handle), async {
-        crate::log_event!(
-            Category::Pool,
-            Level::Info,
-            Event::PoolHit {
-                ctx: Some(Ctx::new(2, false, Tier::Ws)),
-                left: 0,
-            }
-        );
-        crate::log_event!(
-            Category::Routing,
-            Level::Info,
-            Event::PoolHit {
-                ctx: Some(Ctx::new(2, false, Tier::Ws)),
-                left: 0,
-            }
-        );
-        crate::log_event!(
-            Category::Pool,
-            Level::Warn,
-            Event::PoolHit {
-                ctx: Some(Ctx::new(2, false, Tier::Ws)),
-                left: 0,
-            }
-        );
-    })
-    .await;
-
-    handle.shutdown().await;
-
-    let batches = shared.batches();
-    let kept: Vec<i32> = batches
-        .iter()
-        .flat_map(|batch| batch.records.iter())
-        .map(|record| record.category)
-        .collect();
-    assert_eq!(
-        kept,
-        vec![Category::Routing as i32, Category::Pool as i32],
-        "the pool's info record is below its own threshold, its warning is not"
-    );
 }
 
 #[test]
@@ -1289,7 +1203,7 @@ fn emit_does_not_wait_for_the_text_view() {
                 text: Filter::at(Level::Debug),
                 ..quiet(DEFAULT_BATCH_MAX)
             };
-            let handle = runtime.block_on(async { super::start(sink, settings).expect("opens") });
+            let handle = runtime.block_on(async { start(sink, settings) });
 
             let started = Instant::now();
             for _ in 0..CHANNEL_CAPACITY {
@@ -1478,7 +1392,7 @@ async fn a_text_target_that_cannot_be_opened_is_a_startup_error() {
         ..quiet(DEFAULT_BATCH_MAX)
     };
 
-    let error = match super::start(sink, settings) {
+    let error = match super::start_with_sink(sink, settings) {
         Err(error) => error,
         Ok(_) => panic!("a directory is not a log file"),
     };
@@ -1502,6 +1416,44 @@ use std::path::{Path, PathBuf};
 use super::storage::Compression;
 #[cfg(feature = "log-disk")]
 use super::storage::{self, DurabilityMode, FileSink, Options};
+
+/// The old sink interface, for the storage tests: a LogBatch encoded the way
+/// the library's writer would encode it. The library's own BatchSink takes the
+/// encoded form, and the tests still speak batches of records.
+#[cfg(feature = "log-disk")]
+trait SinkWrite {
+    fn write(&mut self, batch: &LogBatch) -> Result<(), logreel::StoreError>;
+}
+
+#[cfg(feature = "log-disk")]
+impl SinkWrite for FileSink {
+    fn write(&mut self, batch: &LogBatch) -> Result<(), logreel::StoreError> {
+        let encoded = encoded(batch);
+        logreel::BatchSink::write_batch(self, &encoded)
+    }
+}
+
+/// Encode a proxy batch the way the library's writer does.
+#[cfg(feature = "log-disk")]
+fn encoded(batch: &LogBatch) -> logreel::EncodedBatch {
+    let records: Vec<logreel::Record<Event>> = batch
+        .records
+        .iter()
+        .map(|record| {
+            let event = record.event.clone().expect("the fixture has an event");
+            logreel::Record::new(
+                super::logreel_level(Level::try_from(record.level).unwrap_or(Level::Info)),
+                record.category as u8,
+                <Event as logreel::Event>::kind(&event),
+                record.ts_ns,
+                record.seq,
+                record.conn_id,
+                event,
+            )
+        })
+        .collect();
+    logreel::BatchEncoder::new().encode(&records, &super::domain())
+}
 
 /// A directory under the system temp dir, removed when the test ends.
 struct TempDir(PathBuf);
@@ -1970,7 +1922,7 @@ fn the_segment_records_its_provenance() {
         "{domain}"
     );
     assert!(
-        domain.contains(&format!("protocol={}", storage::WRITER_PROTOCOL)),
+        domain.contains(&format!("protocol={}", super::WRITER_PROTOCOL)),
         "{domain}"
     );
 }
@@ -2423,6 +2375,160 @@ fn reading_a_segment_leaves_its_bytes_alone() {
     // And the copy the old reader made of the file is gone with it: the
     // directory holds the segment and nothing else.
     assert_eq!(dir.entries(), vec![format!("{date}.seg")]);
+}
+
+#[tokio::test]
+async fn shutdown_flushes_what_is_buffered_before_it_returns() {
+    let (sink, shared, mut batches) = recording();
+    let handle = start(sink, quiet(DEFAULT_BATCH_MAX));
+
+    for _ in 0..3 {
+        handle.emit(1, Category::Routing, Level::Info, pool_hit(2));
+    }
+    handle.shutdown().await;
+
+    assert_eq!(
+        shared.batch_count(),
+        1,
+        "the flush happened during shutdown"
+    );
+    assert_eq!(next_batch(&mut batches).await.records.len(), 3);
+}
+
+#[tokio::test]
+async fn a_sink_that_fails_does_not_stop_the_writer() {
+    let (sink, shared, mut batches) = recording();
+    shared.fail_next.store(true, Relaxed);
+    let handle = start(sink, quiet(DEFAULT_BATCH_MAX));
+
+    for _ in 0..DEFAULT_BATCH_MAX {
+        handle.emit(1, Category::Routing, Level::Info, pool_hit(2));
+    }
+    wait_until(|| shared.attempts() == 1).await;
+    assert_eq!(shared.batch_count(), 0, "the failed batch is gone");
+
+    for _ in 0..DEFAULT_BATCH_MAX {
+        handle.emit(1, Category::Routing, Level::Info, pool_hit(2));
+    }
+    assert_eq!(
+        next_batch(&mut batches).await.records.len(),
+        DEFAULT_BATCH_MAX
+    );
+    assert_eq!(shared.attempts(), 2);
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn emitting_outside_a_scope_is_a_no_op() {
+    assert!(!inside_scope());
+    assert!(!enabled(Category::Routing, Level::Info));
+    emit(Category::Routing, Level::Info, pool_hit(2));
+
+    let (sink, shared, _batches) = recording();
+    let handle = Arc::new(start(sink, quiet(DEFAULT_BATCH_MAX)));
+
+    scope(7, Arc::clone(&handle), async {
+        assert!(inside_scope());
+        assert!(enabled(Category::Routing, Level::Info));
+        emit(Category::Routing, Level::Info, pool_hit(2));
+    })
+    .await;
+
+    assert!(!inside_scope(), "the scope must not outlive its future");
+    handle.shutdown().await;
+
+    let batches = shared.batches();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0].records[0].conn_id, 7,
+        "the record carries the scoped session, not the emit site's"
+    );
+}
+
+#[tokio::test]
+async fn the_macro_builds_the_payload_and_skips_what_the_filter_drops() {
+    let (sink, shared, _batches) = recording();
+    let handle = Arc::new(start(sink, quiet(DEFAULT_BATCH_MAX)));
+    let dc = 2;
+    let is_media = false;
+
+    scope(3, Arc::clone(&handle), async {
+        crate::log_event!(
+            Category::Routing,
+            Level::Info,
+            Event::PoolHit {
+                ctx: Some(Ctx::new(dc, is_media, Tier::Ws)),
+                left: 0,
+            }
+        );
+        crate::log_event!(
+            Category::Routing,
+            Level::Debug,
+            Event::PoolMiss {
+                ctx: Some(Ctx::new(dc, is_media, Tier::Ws)),
+            },
+        );
+    })
+    .await;
+
+    handle.shutdown().await;
+
+    let batches = shared.batches();
+    assert_eq!(batches.len(), 1, "the debug record must not be written");
+    assert_eq!(batches[0].records.len(), 1);
+    assert_eq!(batches[0].records[0].level, Level::Info as i32);
+}
+
+#[cfg(feature = "log-disk")]
+#[tokio::test]
+async fn a_category_can_be_quieter_than_the_global_level() {
+    let (sink, shared, _batches) = recording();
+    let mut settings = quiet(DEFAULT_BATCH_MAX);
+    settings.disk[Category::Pool as usize] = Filter::at(Level::Warn);
+    let handle = Arc::new(start(sink, settings));
+
+    scope(1, Arc::clone(&handle), async {
+        crate::log_event!(
+            Category::Pool,
+            Level::Info,
+            Event::PoolHit {
+                ctx: Some(Ctx::new(2, false, Tier::Ws)),
+                left: 0,
+            }
+        );
+        crate::log_event!(
+            Category::Routing,
+            Level::Info,
+            Event::PoolHit {
+                ctx: Some(Ctx::new(2, false, Tier::Ws)),
+                left: 0,
+            }
+        );
+        crate::log_event!(
+            Category::Pool,
+            Level::Warn,
+            Event::PoolHit {
+                ctx: Some(Ctx::new(2, false, Tier::Ws)),
+                left: 0,
+            }
+        );
+    })
+    .await;
+
+    handle.shutdown().await;
+
+    let batches = shared.batches();
+    let kept: Vec<i32> = batches
+        .iter()
+        .flat_map(|batch| batch.records.iter())
+        .map(|record| record.category)
+        .collect();
+    assert_eq!(
+        kept,
+        vec![Category::Routing as i32, Category::Pool as i32],
+        "the pool's info record is below its own threshold, its warning is not"
+    );
 }
 
 /// The connection counter is 32 bits wide, because the MIPS release targets

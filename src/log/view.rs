@@ -36,7 +36,7 @@ use std::io::{self, Write as _};
 use std::path::PathBuf;
 
 use super::render;
-use super::schema::{Event, Level, LogRecord};
+use super::schema::{Category, Event, Level, LogOverflow, LogRecord};
 use super::{Filter, Settings};
 
 /// Last records the view keeps in RAM for the `SIGUSR1` dump.
@@ -263,23 +263,51 @@ impl View {
     /// view with a floor of `warn` sees warnings here that the segment may have
     /// dropped, and a ring at `debug` keeps records the text never prints.
     pub fn show(&mut self, record: &LogRecord) {
+        let Some(event) = record.event.as_ref() else {
+            return;
+        };
+        self.show_parts(
+            record.ts_ns,
+            record.conn_id,
+            record.seq,
+            record.level,
+            record.category,
+            event,
+        );
+    }
+
+    /// [`View::show`] over the parts of a record.
+    ///
+    /// The library's writer hands its observer a borrowed event and never builds
+    /// a `LogRecord`; cloning the payload just to hand this function the struct
+    /// would put an allocation on the writer's path for every record. So the
+    /// parts are the interface and [`View::show`] is the convenience.
+    pub fn show_parts(
+        &mut self,
+        ts_ns: u64,
+        conn_id: u64,
+        seq: u32,
+        level: i32,
+        category: i32,
+        event: &Event,
+    ) {
         // Learned before the record is rendered and forgotten after it: the
         // session's own close line is the one where the prefix is worth the
         // most, and it is the record that ends the session.
-        self.remember(record);
+        self.remember(conn_id, event);
 
-        let level = Level::try_from(record.level);
+        let known = Level::try_from(level);
         // A level this build does not know is kept rather than dropped, exactly
         // as the segment's filter keeps it: the filter exists to keep the view
         // small, not to lose what it cannot classify.
-        let kept = |filter: Filter| match level {
+        let kept = |filter: Filter| match known {
             Ok(level) => filter.keeps(level),
             Err(_) => true,
         };
 
         if kept(self.text) {
-            self.write_record(record);
-            if matches!(level, Ok(Level::Warn | Level::Error)) {
+            self.write_parts(ts_ns, conn_id, level, event);
+            if matches!(known, Ok(Level::Warn | Level::Error)) {
                 self.flush();
             }
         }
@@ -287,10 +315,17 @@ impl View {
             if self.ring.len() == self.ring_capacity {
                 self.ring.pop_front();
             }
-            self.ring.push_back(record.clone());
+            self.ring.push_back(LogRecord {
+                ts_ns,
+                conn_id,
+                seq,
+                level,
+                category,
+                event: Some(event.clone()),
+            });
         }
 
-        self.forget(record);
+        self.forget(conn_id, event);
     }
 
     /// Writes everything the ring holds to the sink, oldest first.
@@ -345,10 +380,10 @@ impl View {
     }
 
     /// Remembers the client address of a session the stream has just opened.
-    fn remember(&mut self, record: &LogRecord) {
-        match &record.event {
-            Some(Event::SessionOpened(opened)) => {
-                if record.conn_id == 0 {
+    fn remember(&mut self, conn_id: u64, event: &Event) {
+        match event {
+            Event::SessionOpened(opened) => {
+                if conn_id == 0 {
                     return;
                 }
                 let Some(peer) = opened.peer.as_ref() else {
@@ -357,20 +392,20 @@ impl View {
                 if self.peers.len() >= PEER_MAP_MAX {
                     self.peers.clear();
                 }
-                self.peers.insert(record.conn_id, render::peer_text(peer));
+                self.peers.insert(conn_id, render::peer_text(peer));
             }
             // A new run numbers its connections from one again, so every entry
             // in the map is a prefix that would be attached to the wrong
             // session from here on.
-            Some(Event::StartupSummary(_)) => self.peers.clear(),
+            Event::StartupSummary(_) => self.peers.clear(),
             _ => {}
         }
     }
 
     /// Forgets a session once its last record has been rendered.
-    fn forget(&mut self, record: &LogRecord) {
-        if matches!(record.event, Some(Event::SessionClosed(_))) {
-            self.peers.remove(&record.conn_id);
+    fn forget(&mut self, conn_id: u64, event: &Event) {
+        if matches!(event, Event::SessionClosed(_)) {
+            self.peers.remove(&conn_id);
         }
     }
 
@@ -388,12 +423,55 @@ impl View {
         learned
     }
 
-    fn write_record(&mut self, record: &LogRecord) {
+    fn write_parts(&mut self, ts_ns: u64, conn_id: u64, level: i32, event: &Event) {
         self.line.clear();
-        let peer = self.peers.get(&record.conn_id).map(String::as_str);
-        if render::render(record, peer, &mut self.line) {
+        let peer = self.peers.get(&conn_id).map(String::as_str);
+        if render::render_into(ts_ns, conn_id, level, event, peer, &mut self.line) {
             write_all(&mut self.sink, &mut self.failures, &self.line);
         }
+    }
+}
+
+impl logreel::Observer<Event> for View {
+    fn record(&mut self, record: &logreel::Record<Event>) {
+        self.show_parts(
+            record.ts_ns,
+            record.conn_id,
+            record.seq,
+            i32::from(record.level.as_u8()),
+            i32::from(record.category),
+            &record.event,
+        );
+    }
+
+    fn flush(&mut self) {
+        View::flush(self);
+    }
+
+    fn dump(&mut self) {
+        View::dump(self);
+    }
+
+    /// The record that says the channel overflowed.
+    ///
+    /// The library reports the drops; the shape of the record is this crate's,
+    /// because it is the crate's schema: `LogOverflow` at `warn`, in the
+    /// `overflow` category, with no session.
+    fn overflow(&mut self, dropped: u64, window_ns: u64) -> Option<logreel::Record<Event>> {
+        let event = Event::LogOverflow(LogOverflow {
+            dropped: dropped.min(u64::from(u32::MAX)) as u32,
+            window_ns,
+        });
+        let kind = <Event as logreel::Event>::kind(&event);
+        Some(logreel::Record::new(
+            logreel::Level::Warn,
+            Category::Overflow as u32 as u8,
+            kind,
+            super::now_ns(),
+            0,
+            0,
+            event,
+        ))
     }
 }
 

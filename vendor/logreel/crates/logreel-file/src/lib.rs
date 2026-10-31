@@ -27,7 +27,7 @@ mod varint;
 pub use batch::RecordView;
 pub use header::{HEADER_LEN, Header, MAX_PAYLOAD};
 pub use reader::{
-    DecodedBatch, OwnedRecord, Probe, Scan, SegmentReader, TailState, dump_raw, probe,
+    DecodedBatch, OwnedRecord, Probe, Scan, SegmentReader, TailState, decode_batch, dump_raw, probe,
 };
 pub use store::{Clock, FileStore, FileStoreConfig, SystemClock, segments};
 

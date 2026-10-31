@@ -312,6 +312,18 @@ pub struct DecodedBatch {
     pub records: Vec<OwnedRecord>,
 }
 
+/// Decode a batch that is already in memory.
+///
+/// The same envelope a segment frame carries, without a file around it: a
+/// converter, a test sink or a tool that holds an [EncodedBatch] can read its
+/// records without writing it out first.
+pub fn decode_batch(batch: &EncodedBatch) -> Result<DecodedBatch, StoreError> {
+    Ok(DecodedBatch {
+        batch: batch.clone(),
+        records: decode_records(&batch.payload, batch.record_count)?,
+    })
+}
+
 fn decode_records(payload: &[u8], count: u32) -> Result<Vec<OwnedRecord>, StoreError> {
     let info = parse_batch(payload, 0)?;
     let mut position = info.header_len;

@@ -33,7 +33,7 @@ fn filtered_records_are_not_emitted() {
     assert!(!handle.emit(Level::Info, 0, 1, TestEvent::Ping(1)));
     assert!(handle.emit(Level::Warn, 0, 1, TestEvent::Ping(2)));
     assert!(!handle.emit(Level::Debug, 0, 1, TestEvent::Ping(3)));
-    assert_eq!(handle.sequence(), 1);
+    assert_eq!(handle.sequence(), 2);
     let report = logger.shutdown();
     assert_eq!(report.records, 1);
     let batches = batches.lock().expect("batches");
@@ -130,9 +130,9 @@ fn sequence_is_monotonic_and_filtered_calls_do_not_consume_it() {
     for value in 0..3 {
         assert!(handle.emit(Level::Warn, 0, 0, TestEvent::Ping(value)));
     }
-    assert_eq!(handle.sequence(), 3);
+    assert_eq!(handle.sequence(), 4);
     assert!(!handle.emit(Level::Info, 0, 0, TestEvent::Ping(9)));
-    assert_eq!(handle.sequence(), 3);
+    assert_eq!(handle.sequence(), 4);
     assert_eq!(handle.dropped(), 0);
     let _ = logger.shutdown();
 }

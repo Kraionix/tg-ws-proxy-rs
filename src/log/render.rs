@@ -52,15 +52,31 @@ pub fn render(record: &LogRecord, peer: Option<&str>, out: &mut String) -> bool 
     let Some(event) = record.event.as_ref() else {
         return false;
     };
+    render_into(record.ts_ns, record.conn_id, record.level, event, peer, out)
+}
 
+/// [`render`] over the parts of a record, without a `LogRecord` to build.
+///
+/// The library's writer hands the observer a borrowed event and its envelope,
+/// and a view that wants the line must not clone the payload to get one. This
+/// is the one renderer; [`render`] is the convenience for callers that already
+/// have the struct.
+pub fn render_into(
+    ts_ns: u64,
+    conn_id: u64,
+    level: i32,
+    event: &Event,
+    peer: Option<&str>,
+    out: &mut String,
+) -> bool {
     // Written first, rolled back if the event turns out to have no line: that
     // keeps the "no line" decision in one place instead of asking twice.
     let start = out.len();
-    write_timestamp(record.ts_ns, out);
+    write_timestamp(ts_ns, out);
     out.push(' ');
-    out.push_str(level_tag(record.level));
+    out.push_str(level_tag(level));
     out.push(' ');
-    if record.conn_id == 0 {
+    if conn_id == 0 {
         let tag = event_tag(event);
         if !tag.is_empty() {
             out.push_str(tag);

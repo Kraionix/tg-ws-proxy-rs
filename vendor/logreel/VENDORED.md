@@ -9,8 +9,8 @@ tools/sync-logreel.sh ../logreel
 
 | item | value |
 |---|---|
-| source commit | `4834ccc0d99eabb8b656666512317da32dc86650` |
-| source tree | `42b0a93a22048c257dee08e9e0721e17443bb92c` |
+| source commit | `a19accb257f8d5945ff2c9338c76687b730ddd46` |
+| source tree | `5fc68474afc4347004a0089f6b2e63368cc2d154` |
 | version | `0.2.0` |
 | crates | `logreel`, `logreel-core`, `logreel-derive`, `logreel-store`, `logreel-file` |
 

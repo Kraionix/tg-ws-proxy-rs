@@ -32,15 +32,10 @@ use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use logreel::file::{FileStore, FileStoreConfig, SegmentReader};
-use logreel::{BatchEncoder, Durability, ErrorKind, Event as _, Record, Store as _};
+use logreel::{Durability, ErrorKind, Store as _};
 
 use super::LogError;
 use super::schema::{self, BatchHeader, Event, LogBatch, LogRecord};
-use super::writer::{BatchSink, WriterError};
-
-/// Container version: the file format, the domain fields and the envelope.
-/// Independent of `schema::SCHEMA_VERSION`, which is about the records inside.
-pub const WRITER_PROTOCOL: u32 = 1;
 
 /// Segments kept by default, counting today.
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
@@ -132,8 +127,6 @@ pub(crate) struct FileSink {
     observed_day: Option<i64>,
     backoff: usize,
     retry_at: Option<Instant>,
-    encoder: BatchEncoder,
-    domain: Box<[u8]>,
     /// Set only by the tests, which move the day the store writes to.
     clock: Option<std::sync::Arc<dyn logreel::file::Clock>>,
 }
@@ -171,18 +164,13 @@ impl FileSink {
             observed_day: None,
             backoff: 0,
             retry_at: None,
-            encoder: BatchEncoder::new(),
-            domain: domain_bytes(),
             clock,
         };
 
         let day = sink.today();
-        let store = sink.connect().map_err(|error| {
-            start_error(
-                error,
-                &dir.join(format!("{}{SEGMENT_SUFFIX}", day_name(day))),
-            )
-        })?;
+        let store = sink
+            .connect()
+            .map_err(|error| start_error(error, dir, day))?;
         sink.store = Some(store);
         sink.written.push(day);
         sink.observed_day = sink.active_day();
@@ -191,7 +179,7 @@ impl FileSink {
     }
 
     /// Builds and opens the store, creating (or validating) today's file.
-    fn connect(&self) -> Result<FileStore, WriterError> {
+    fn connect(&self) -> Result<FileStore, logreel::StoreError> {
         let mut config = FileStoreConfig::new(&self.dir);
         // The proxy sweeps with its own window, which counts from the archive
         // rather than from the clock; two windows would disagree.
@@ -203,15 +191,12 @@ impl FileSink {
         let mut store = match &self.clock {
             Some(clock) => FileStore::with_clock(config, std::sync::Arc::clone(clock)),
             None => FileStore::open(config),
-        }
-        .map_err(store_error)?;
-        store
-            .prime(
-                <Event as logreel::Event>::CODEC_ID,
-                <Event as logreel::Event>::KINDS,
-                <Event as logreel::Event>::SCHEMA_HASH,
-            )
-            .map_err(store_error)?;
+        }?;
+        store.prime(
+            <Event as logreel::Event>::CODEC_ID,
+            <Event as logreel::Event>::KINDS,
+            <Event as logreel::Event>::SCHEMA_HASH,
+        )?;
 
         // The file holds every session's metadata, so it keeps the owner-only
         // mode the redb sink used to set before opening: the library creates it
@@ -238,12 +223,12 @@ impl FileSink {
         day_of_name(stem)
     }
 
-    fn on_failure(&mut self, error: WriterError) -> WriterError {
+    fn on_failure(&mut self, error: logreel::StoreError) -> logreel::StoreError {
         // A file that cannot be written to is not necessarily one that cannot be
         // reopened: a removed USB stick becomes writable again when it is
         // plugged back in. Dropping the handle makes the next attempt go through
         // the full open, which is what that recovery needs.
-        if matches!(error, WriterError::Io(_)) {
+        if matches!(error.kind(), ErrorKind::Io) {
             self.store = None;
         }
         let delay = BACKOFF_STEPS[self.backoff.min(BACKOFF_STEPS.len() - 1)];
@@ -277,31 +262,11 @@ impl FileSink {
     fn sweep_retention(&self, day: i64) {
         sweep_retention(&self.dir, self.options.retention_days, day, &self.written);
     }
-
-    /// The records of one batch as the library's envelope wants them.
-    fn records_of(&self, batch: &LogBatch) -> Vec<Record<Event>> {
-        batch
-            .records
-            .iter()
-            .filter_map(|record| {
-                let event = record.event.clone()?;
-                Some(Record::new(
-                    level_of(record.level),
-                    u8::try_from(record.category).unwrap_or(u8::MAX),
-                    event.kind(),
-                    record.ts_ns,
-                    record.seq,
-                    record.conn_id,
-                    event,
-                ))
-            })
-            .collect()
-    }
 }
 
-impl BatchSink for FileSink {
-    fn write(&mut self, batch: &LogBatch) -> Result<(), WriterError> {
-        if batch.records.is_empty() {
+impl logreel::BatchSink for FileSink {
+    fn write_batch(&mut self, batch: &logreel::EncodedBatch) -> Result<(), logreel::StoreError> {
+        if batch.is_empty() {
             return Ok(());
         }
 
@@ -323,25 +288,26 @@ impl BatchSink for FileSink {
             }
         }
 
-        let records = self.records_of(batch);
-        if records.is_empty() {
-            return Ok(());
-        }
-        let encoded = self.encoder.encode(&records, &self.domain);
-        let durability = durability_of(self.options.durability);
         let store = self.store.as_mut().expect("a store was opened above");
-        let mut result = store.append(&encoded);
-        if result.is_ok() {
-            result = store.sync(durability);
-        }
-
+        let result = store.append(batch);
         match result {
             Ok(()) => {
                 self.on_success();
                 self.after_write();
                 Ok(())
             }
-            Err(error) => Err(self.on_failure(store_error(error))),
+            Err(error) => Err(self.on_failure(error)),
+        }
+    }
+
+    fn sync(&mut self, mode: Durability) -> Result<(), logreel::StoreError> {
+        let result = match self.store.as_mut() {
+            Some(store) => logreel::Store::sync(store, mode),
+            None => Ok(()),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(self.on_failure(error)),
         }
     }
 }
@@ -406,48 +372,22 @@ fn compressed(mode: Compression) -> bool {
     }
 }
 
-fn level_of(raw: i32) -> logreel::Level {
-    u8::try_from(raw)
-        .ok()
-        .and_then(logreel::Level::from_u8)
-        .unwrap_or(logreel::Level::Error)
-}
-
-fn domain_bytes() -> Box<[u8]> {
-    format!(
-        "app={};schema={};protocol={}",
-        env!("CARGO_PKG_VERSION"),
-        schema::SCHEMA_VERSION,
-        WRITER_PROTOCOL
-    )
-    .into_bytes()
-    .into_boxed_slice()
-}
-
-fn durability_of(mode: DurabilityMode) -> Durability {
+pub(crate) fn durability_of(mode: DurabilityMode) -> Durability {
     match mode {
         DurabilityMode::Eventual => Durability::Eventual,
         DurabilityMode::Immediate => Durability::Immediate,
     }
 }
 
-/// The library's error, flattened for the write path: it becomes a
-/// `tg-ws-proxy:` line and a backoff, and nothing above matches on it.
-fn store_error(error: logreel::StoreError) -> WriterError {
+/// The startup path reports to the operator, so the library's error is widened
+/// back into something with a file name and an exit code attached.
+fn start_error(error: logreel::StoreError, dir: &Path, day: i64) -> LogError {
     match error.kind() {
-        ErrorKind::Locked => WriterError::Conflict,
-        ErrorKind::Io => WriterError::Io(std::io::Error::other(error.to_string())),
-        _ => WriterError::Segment(error.to_string()),
-    }
-}
-
-/// The startup path reports to the operator, so the sink's own error type is
-/// widened back into something with a file name and an exit code attached.
-fn start_error(error: WriterError, path: &Path) -> LogError {
-    match error {
-        WriterError::Io(error) => LogError::Io(error),
-        WriterError::Conflict => LogError::WriterConflict(path.to_path_buf()),
-        WriterError::Segment(reason) => LogError::Segment(reason),
+        ErrorKind::Locked => {
+            LogError::WriterConflict(dir.join(format!("{}{SEGMENT_SUFFIX}", day_name(day))))
+        }
+        ErrorKind::Io => LogError::Io(std::io::Error::other(error.to_string())),
+        _ => LogError::Segment(error.to_string()),
     }
 }
 
