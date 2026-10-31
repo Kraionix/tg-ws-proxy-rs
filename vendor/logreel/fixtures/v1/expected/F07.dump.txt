@@ -1,0 +1,2 @@
+# F07_empty.seg
+refused: header: file is 0 bytes, shorter than 56

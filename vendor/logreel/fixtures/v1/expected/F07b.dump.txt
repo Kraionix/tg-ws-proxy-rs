@@ -1,0 +1,2 @@
+# F07_bad_magic.seg
+refused: header: bad magic

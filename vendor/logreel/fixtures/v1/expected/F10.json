@@ -1,0 +1,52 @@
+{
+  "bytes": 122,
+  "dump": "decoded",
+  "file": "F10_producer_zero.seg",
+  "fixture": "F10",
+  "header": {
+    "codec_id": 1,
+    "created_ns": 1700000000000000000,
+    "flags": 0,
+    "format": 1,
+    "header_len": 56,
+    "kind_count": 8,
+    "magic": "TGSLOG01",
+    "producer_id": 0,
+    "schema_hash": "11111111111111111111111111111111",
+    "session_nonce": 1592590337
+  },
+  "probe": {
+    "conn_ids": [
+      0
+    ],
+    "corrupt_offset": null,
+    "first_ts_ns": 1700000000000000000,
+    "frames": 1,
+    "kinds": {
+      "0": 1
+    },
+    "last_ts_ns": 1700000000000000000,
+    "records": 1,
+    "sha256": "a8d857c9d38e85466fd8a0e90b8564c9087b18c8581662d56d3c7e2013091c87",
+    "tail": "clean",
+    "truncated_bytes": 0,
+    "unknown_records": 0,
+    "valid_end": 122
+  },
+  "records": [
+    {
+      "category": 0,
+      "conn_id": 0,
+      "frame": 0,
+      "kind": 0,
+      "level": 2,
+      "offset": 89,
+      "payload_hex": "616e6f6e796d6f75732070726f6475636572",
+      "seq": 1,
+      "ts_ns": 1700000000000000000
+    }
+  ],
+  "refusal_reason": null,
+  "refused": false,
+  "sha256": "a8d857c9d38e85466fd8a0e90b8564c9087b18c8581662d56d3c7e2013091c87"
+}

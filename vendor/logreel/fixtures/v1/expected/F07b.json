@@ -1,0 +1,12 @@
+{
+  "bytes": 56,
+  "dump": "refused",
+  "file": "F07_bad_magic.seg",
+  "fixture": "F07b",
+  "header": null,
+  "probe": null,
+  "records": [],
+  "refusal_reason": "header: bad magic",
+  "refused": true,
+  "sha256": "06f2f0a3a1c853e4e73e9da0b2e0169cfa37f285655f8de53e4a857488755964"
+}

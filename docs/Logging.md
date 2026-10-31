@@ -232,10 +232,10 @@ The binary reads its own segments. Two verbs, both answering in JSON Lines so `j
 tg-ws-proxy probe-segment /mnt/usb/tgws-logs
 ```
 ```json
-{"batches":1020,"bytes":1298432,"conns":2510,"date":"2026-10-13","error":null,
+{"batches":1020,"bytes":365395,"conns":2510,"date":"2026-10-13","error":null,
  "events":{"PoolRefill":1736,"SessionClosed":2489,"SessionOpened":2510,…},
- "file":"2026-10-13.redb","first_ns":1791855111473720307,"last_ns":1791891131980655208,
- "records":12986,"sha256":"b611b048…","type":"segment"}
+ "file":"2026-10-13.seg","first_ns":1791855111473720307,"last_ns":1791891131980655208,
+ "records":12986,"sha256":"4186d5bb…","type":"segment"}
 ```
 
 ```sh
@@ -253,15 +253,7 @@ Field names are the schema's own (`src/log/schema.rs`), an enum prints under its
 number rather than failing the read — so a later binary's segment still dumps. `--records-only` leaves
 the batch lines out; without `--date` the whole directory is dumped in date order.
 
-**Reading does not write.** `redb` has no read-only mode: opening a database opens the file for
-writing, and the recovery pass on the way in writes the commit slots it examined. Measured on the
-reference router: about 2 % of a 500 KB segment's bytes differed after every read, from offset 10 (the
-database header) down into the pages. The reader therefore copies the segment first and gives `redb`
-the copy, which is deleted on the way out — the archive keeps the hash it was archived with, and the
-copy is where a repair of a half-written file happens. The copy is made beside the segment, falling
-back to `TMPDIR` if that directory cannot be written to; both names are hidden and do not look like
-segments, so a sweep or a `probe-segment` ignores them. A read costs the segment's size in free space
-while it runs.
+**Reading does not write.** The reader opens the segment read-only, validates each frame's CRC and stops at the first one it cannot prove whole: a segment's bytes are the archive, and a hash taken before a read still describes the file afterwards. A tail cut mid-frame is what a power cut leaves, not corruption — `probe-segment` reports the valid prefix and how many bytes followed it, and the next writer truncates the file back to that prefix before appending.
 
 A segment written with `zstd-l1` needs a build that has the codec, so keep the `log-zstd` feature in
 the same configuration as the binary that wrote it; a build without it refuses a compressed segment by
@@ -348,8 +340,10 @@ toolchain, each end of a row from the same profile — the musl targets against 
 
 Read the second column as what the logging rework itself costs: the schema, the pipeline, the text
 projection and the ring are **92…113 KB** — 2–3 % of the binary — and that build has no storage engine
-in it at all. The third column is the sink: redb, the day segments, the retention sweep, the reader
-verbs and the `prost` decode they need, **0.99…1.22 MB** depending on the target. The fourth is the
+in it at all. The third column is the sink: the segment file, day rotation, the retention sweep, the
+reader verbs and the `prost` decode they need, **0.99…1.22 MB** when the table was measured with the
+previous storage engine; the current one is smaller (see `artifacts/INTEGRATION-RESULT-2026-11-01.md`
+for the measured x86-64 comparison). The fourth is the
 zstd codec, another **0.75…0.95 MB** (15–16 % of the sink build), which is why it is a feature of its
 own and why the armv7 and MIPS packages ship without it: 0.75 MB of flash on a router buys less than
 the compression saves.
@@ -373,7 +367,8 @@ descriptor snapshot once a minute. 1 000 connections/day is ≈ 0.3 MB/week at `
 `info`-level traffic; `--log-retention 7` is what actually bounds it.
 
 **Those are the record bytes, not what the medium sees.** A flush window that carries at least one
-record ends in one `redb` commit, and a commit dirties pages: on the reference router (OpenWrt,
+record ends in one append of one frame; the redb measurements below are kept as the reason the format
+changed, not as a description of the current sink. On the reference router (OpenWrt,
 aarch64, USB stick on f2fs, `debug`, `zstd-l1`) a seven-minute window with **51 commits, 328 records
 and 98 client sessions** cost the device **916 KiB** — about **18 KB per commit** — while the record
 payload in the same stretch was ~25 B/s. An idle proxy commits nothing at all (`flush` returns early on

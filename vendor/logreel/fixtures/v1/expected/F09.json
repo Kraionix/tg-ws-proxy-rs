@@ -1,0 +1,77 @@
+{
+  "bytes": 154,
+  "dump": "decoded",
+  "file": "F09_zstd.seg",
+  "fixture": "F09",
+  "header": {
+    "codec_id": 1,
+    "created_ns": 1700000000000000000,
+    "flags": 1,
+    "format": 1,
+    "header_len": 56,
+    "kind_count": 8,
+    "magic": "TGSLOG01",
+    "producer_id": 7,
+    "schema_hash": "11111111111111111111111111111111",
+    "session_nonce": 1592590337
+  },
+  "probe": {
+    "conn_ids": [
+      7,
+      42
+    ],
+    "corrupt_offset": null,
+    "first_ts_ns": 1700000000000000000,
+    "frames": 1,
+    "kinds": {
+      "0": 1,
+      "1": 1,
+      "2": 1
+    },
+    "last_ts_ns": 1700000000000000002,
+    "records": 3,
+    "sha256": "d7976d41402fe4e560b43a8232bb5356920a978e7a0f115b63df7e196bde5599",
+    "tail": "clean",
+    "truncated_bytes": 0,
+    "unknown_records": 0,
+    "valid_end": 154
+  },
+  "records": [
+    {
+      "category": 0,
+      "conn_id": 42,
+      "frame": 0,
+      "kind": 0,
+      "level": 2,
+      "offset": 93,
+      "payload_hex": "6f70656e65643a3432",
+      "seq": 1,
+      "ts_ns": 1700000000000000000
+    },
+    {
+      "category": 0,
+      "conn_id": 42,
+      "frame": 0,
+      "kind": 1,
+      "level": 3,
+      "offset": 117,
+      "payload_hex": "636c6f7365643a3432",
+      "seq": 2,
+      "ts_ns": 1700000000000000001
+    },
+    {
+      "category": 1,
+      "conn_id": 7,
+      "frame": 0,
+      "kind": 2,
+      "level": 4,
+      "offset": 141,
+      "payload_hex": "6469736b206661696c757265",
+      "seq": 3,
+      "ts_ns": 1700000000000000002
+    }
+  ],
+  "refusal_reason": null,
+  "refused": false,
+  "sha256": "d7976d41402fe4e560b43a8232bb5356920a978e7a0f115b63df7e196bde5599"
+}

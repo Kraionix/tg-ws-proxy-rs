@@ -1,0 +1,49 @@
+{
+  "cases": [
+    {
+      "clock_day": 20729,
+      "deleted": [
+        "F08_clock_jump/2026-10-01.seg"
+      ],
+      "keep_days": 1,
+      "kept": [
+        "F08_clock_jump/2026-10-02.seg"
+      ],
+      "max_total_bytes": 0
+    },
+    {
+      "clock_day": 20726,
+      "deleted": [],
+      "keep_days": 1,
+      "kept": [
+        "F08_clock_jump/2026-10-01.seg",
+        "F08_clock_jump/2026-10-02.seg"
+      ],
+      "max_total_bytes": 0
+    },
+    {
+      "clock_day": 20729,
+      "deleted": [
+        "F08_clock_jump/2026-10-01.seg"
+      ],
+      "keep_days": 10,
+      "kept": [
+        "F08_clock_jump/2026-10-02.seg"
+      ],
+      "max_total_bytes": 121
+    }
+  ],
+  "files": [
+    {
+      "bytes": 111,
+      "name": "F08_clock_jump/2026-10-01.seg",
+      "sha256": "fcfaa1543e4f62371127dbb84e30183b1d46dd3bc131e0fb1246ee7a5406a44b"
+    },
+    {
+      "bytes": 111,
+      "name": "F08_clock_jump/2026-10-02.seg",
+      "sha256": "ab516eb08d146b88df434803fbf1d58dd352d2d63a66572b183e1b91f46336c0"
+    }
+  ],
+  "fixture": "F08"
+}

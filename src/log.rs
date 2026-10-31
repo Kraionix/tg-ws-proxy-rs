@@ -12,7 +12,7 @@
 //! # What the `log-disk` feature adds
 //!
 //! The on-disk sink sits behind a cargo feature that is **off by default**:
-//! [`storage`] (redb day segments), the `--log-dir` flag family,
+//! [`storage`] (`.seg` day segments), the `--log-dir` flag family,
 //! `--log-level`/`--log-category` (the disk floor is the only per-category
 //! policy here), and the binary's `probe-segment`/`dump-segment` reader verbs.
 //! A build without it links no storage engine and its `--help` mentions none of

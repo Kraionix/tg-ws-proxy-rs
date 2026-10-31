@@ -1,0 +1,12 @@
+{
+  "bytes": 0,
+  "dump": "refused",
+  "file": "F07_empty.seg",
+  "fixture": "F07",
+  "header": null,
+  "probe": null,
+  "records": [],
+  "refusal_reason": "header: file is 0 bytes, shorter than 56",
+  "refused": true,
+  "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

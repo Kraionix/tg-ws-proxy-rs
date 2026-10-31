@@ -1,0 +1,7 @@
+# F03_unknown_kind.seg
+mode: decoded
+frame=0 offset=89 level=INFO category=0 kind=0 ts_ns=1700000000000000000 seq=1 conn=1 payload=6b6e6f776e
+frame=0 offset=109 level=INFO category=0 kind=1 ts_ns=1700000000000000001 seq=2 conn=1 payload=6b6e6f776e20746f6f
+frame=1 offset=166 level=INFO category=0 kind=0 ts_ns=1700000000000000002 seq=3 conn=9 payload=6265666f7265
+frame=1 offset=187 level=WARN category=0 kind=36865 ts_ns=1700000000000000003 seq=4 conn=9 payload=deadbeef
+frame=1 offset=206 level=INFO category=0 kind=1 ts_ns=1700000000000000004 seq=5 conn=9 payload=6166746572

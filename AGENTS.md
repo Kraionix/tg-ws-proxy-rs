@@ -33,9 +33,10 @@ src/
   default_domains.rs      Fetches + deobfuscates the community CF-proxy domain list from GitHub
   runtime.rs              Shared runtime state (outbound connector, fronting window, DC metadata)
   log.rs                 Record pipeline: settings/filters, `LogHandle`, `log_event!`/`direct!`, scope
-  log/                   schema.rs (record types), writer.rs (batching + `BatchSink`),
-                         storage.rs (redb day segments — `log-disk` only), view.rs (text sink +
-                         `SIGUSR1` ring), render.rs (record → text line) — see docs/Logging.md
+  log/                   schema.rs (record types), event.rs (schema → logreel event adapter),
+                         storage.rs (.seg day segments — `log-disk` only), view.rs (the writer's
+                         observer: text sink, `[peer]` map, `SIGUSR1` ring), render.rs (record →
+                         text line) — see docs/Logging.md
   dump.rs                The reader verbs `probe-segment`/`dump-segment` — `log-disk` only
   outbound/               Outbound TCP connector: HTTP/SOCKS5(h) proxy support, NO_PROXY matching
   default_domains/http.rs  Minimal HTTPS GET used only to fetch the default domain list

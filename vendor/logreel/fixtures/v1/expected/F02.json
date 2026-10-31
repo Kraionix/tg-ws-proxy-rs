@@ -1,0 +1,149 @@
+{
+  "bytes": 659,
+  "dump": "decoded",
+  "file": "F02_varints.seg",
+  "fixture": "F02",
+  "header": {
+    "codec_id": 1,
+    "created_ns": 1700000000000000000,
+    "flags": 0,
+    "format": 1,
+    "header_len": 56,
+    "kind_count": 4,
+    "magic": "TGSLOG01",
+    "producer_id": 7,
+    "schema_hash": "11111111111111111111111111111111",
+    "session_nonce": 1592590337
+  },
+  "probe": {
+    "conn_ids": [
+      0,
+      1,
+      127,
+      128,
+      16383,
+      16384,
+      18446744073709551614,
+      18446744073709551615
+    ],
+    "corrupt_offset": null,
+    "first_ts_ns": 1699999999999999900,
+    "frames": 3,
+    "kinds": {
+      "0": 5,
+      "1": 2,
+      "2": 2
+    },
+    "last_ts_ns": 1700000000000000200,
+    "records": 9,
+    "sha256": "d6ec0233a3bbc3fdb1a936414f41ab4f21af730b67f9e0ae6514f549bd7da591",
+    "tail": "clean",
+    "truncated_bytes": 0,
+    "unknown_records": 0,
+    "valid_end": 659
+  },
+  "records": [
+    {
+      "category": 0,
+      "conn_id": 0,
+      "frame": 0,
+      "kind": 0,
+      "level": 2,
+      "offset": 89,
+      "payload_hex": "",
+      "seq": 0,
+      "ts_ns": 1700000000000000000
+    },
+    {
+      "category": 1,
+      "conn_id": 127,
+      "frame": 0,
+      "kind": 0,
+      "level": 2,
+      "offset": 104,
+      "payload_hex": "78",
+      "seq": 127,
+      "ts_ns": 1700000000000000001
+    },
+    {
+      "category": 2,
+      "conn_id": 128,
+      "frame": 0,
+      "kind": 0,
+      "level": 2,
+      "offset": 120,
+      "payload_hex": "7979",
+      "seq": 128,
+      "ts_ns": 1700000000000000002
+    },
+    {
+      "category": 3,
+      "conn_id": 16383,
+      "frame": 0,
+      "kind": 0,
+      "level": 2,
+      "offset": 139,
+      "payload_hex": "78797a",
+      "seq": 16383,
+      "ts_ns": 1700000000000000003
+    },
+    {
+      "category": 4,
+      "conn_id": 16384,
+      "frame": 0,
+      "kind": 0,
+      "level": 2,
+      "offset": 159,
+      "payload_hex": "78797a",
+      "seq": 16384,
+      "ts_ns": 1700000000000000004
+    },
+    {
+      "category": 1,
+      "conn_id": 18446744073709551615,
+      "frame": 1,
+      "kind": 1,
+      "level": 3,
+      "offset": 218,
+      "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fa000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30",
+      "seq": 4294967295,
+      "ts_ns": 1700000000000000100
+    },
+    {
+      "category": 1,
+      "conn_id": 18446744073709551614,
+      "frame": 1,
+      "kind": 1,
+      "level": 2,
+      "offset": 547,
+      "payload_hex": "",
+      "seq": 4294967295,
+      "ts_ns": 1700000000000000101
+    },
+    {
+      "category": 2,
+      "conn_id": 1,
+      "frame": 2,
+      "kind": 2,
+      "level": 1,
+      "offset": 612,
+      "payload_hex": "6f7574206f66206f72646572",
+      "seq": 1,
+      "ts_ns": 1699999999999999900
+    },
+    {
+      "category": 2,
+      "conn_id": 1,
+      "frame": 2,
+      "kind": 2,
+      "level": 1,
+      "offset": 639,
+      "payload_hex": "6c61746572",
+      "seq": 2,
+      "ts_ns": 1700000000000000200
+    }
+  ],
+  "refusal_reason": null,
+  "refused": false,
+  "sha256": "d6ec0233a3bbc3fdb1a936414f41ab4f21af730b67f9e0ae6514f549bd7da591"
+}

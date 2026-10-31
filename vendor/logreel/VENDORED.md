@@ -13,6 +13,7 @@ tools/sync-logreel.sh ../logreel
 | source tree | `5fc68474afc4347004a0089f6b2e63368cc2d154` |
 | version | `0.2.0` |
 | crates | `logreel`, `logreel-core`, `logreel-derive`, `logreel-store`, `logreel-file` |
+| fixtures | `fixtures/` (the file crate's conformance corpus) |
 
 ## Patches
 

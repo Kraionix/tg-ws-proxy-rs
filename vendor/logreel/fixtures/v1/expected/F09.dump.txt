@@ -1,0 +1,5 @@
+# F09_zstd.seg
+mode: decoded
+frame=0 offset=93 level=INFO category=0 kind=0 ts_ns=1700000000000000000 seq=1 conn=42 payload=6f70656e65643a3432
+frame=0 offset=117 level=WARN category=0 kind=1 ts_ns=1700000000000000001 seq=2 conn=42 payload=636c6f7365643a3432
+frame=0 offset=141 level=ERROR category=1 kind=2 ts_ns=1700000000000000002 seq=3 conn=7 payload=6469736b206661696c757265

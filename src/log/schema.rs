@@ -380,7 +380,7 @@ pub enum ErrorCode {
     Resource = 11,
     /// Sink-side I/O (`ENOSPC` and friends).
     LocalIo = 12,
-    /// The `--log-dir` filesystem is one that cannot carry a redb segment.
+    /// The `--log-dir` filesystem is one that cannot carry a segment.
     FsUnsupported = 13,
     /// Another process holds the current day's segment.
     WriterConflict = 14,

@@ -1,0 +1,64 @@
+{
+  "bytes": 141,
+  "dump": "raw",
+  "file": "F04_schema_mismatch.seg",
+  "fixture": "F04",
+  "header": {
+    "codec_id": 1,
+    "created_ns": 1700000000000000000,
+    "flags": 0,
+    "format": 1,
+    "header_len": 56,
+    "kind_count": 8,
+    "magic": "TGSLOG01",
+    "producer_id": 7,
+    "schema_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "session_nonce": 1592590337
+  },
+  "probe": {
+    "conn_ids": [
+      42
+    ],
+    "corrupt_offset": null,
+    "first_ts_ns": 1700000000000000000,
+    "frames": 1,
+    "kinds": {
+      "0": 1,
+      "1": 1
+    },
+    "last_ts_ns": 1700000000000000001,
+    "records": 2,
+    "sha256": "b350738472393bde9efb2ae46ad44952eaca80a231fd5f56528daa453abb9caf",
+    "tail": "clean",
+    "truncated_bytes": 0,
+    "unknown_records": 0,
+    "valid_end": 141
+  },
+  "records": [
+    {
+      "category": 0,
+      "conn_id": 42,
+      "frame": 0,
+      "kind": 0,
+      "level": 2,
+      "offset": 93,
+      "payload_hex": "6f70656e65643a3432",
+      "seq": 1,
+      "ts_ns": 1700000000000000000
+    },
+    {
+      "category": 0,
+      "conn_id": 42,
+      "frame": 0,
+      "kind": 1,
+      "level": 3,
+      "offset": 117,
+      "payload_hex": "636c6f7365643a3432",
+      "seq": 2,
+      "ts_ns": 1700000000000000001
+    }
+  ],
+  "refusal_reason": null,
+  "refused": false,
+  "sha256": "b350738472393bde9efb2ae46ad44952eaca80a231fd5f56528daa453abb9caf"
+}

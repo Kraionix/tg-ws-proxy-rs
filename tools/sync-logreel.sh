@@ -33,6 +33,9 @@ for crate in "${crates[@]}"; do
     cp -R "$src/crates/$crate" "$dest/crates/$crate"
 done
 cp "$src/LICENSE" "$dest/LICENSE"
+# The file crate's conformance tests read the fixture segments, which live at
+# the workspace root; without them the vendored workspace's test job fails.
+cp -R "$src/fixtures" "$dest/fixtures"
 find "$dest" -name target -type d -prune -exec rm -rf {} +
 
 # Patch 1: no redb backend.
@@ -117,6 +120,7 @@ tools/sync-logreel.sh ../logreel
 | source tree | `@TREE@` |
 | version | `@VERSION@` |
 | crates | `logreel`, `logreel-core`, `logreel-derive`, `logreel-store`, `logreel-file` |
+| fixtures | `fixtures/` (the file crate's conformance corpus) |
 
 ## Patches
 

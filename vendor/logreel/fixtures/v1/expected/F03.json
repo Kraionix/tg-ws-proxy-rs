@@ -1,0 +1,99 @@
+{
+  "bytes": 226,
+  "dump": "decoded",
+  "file": "F03_unknown_kind.seg",
+  "fixture": "F03",
+  "header": {
+    "codec_id": 1,
+    "created_ns": 1700000000000000000,
+    "flags": 0,
+    "format": 1,
+    "header_len": 56,
+    "kind_count": 8,
+    "magic": "TGSLOG01",
+    "producer_id": 7,
+    "schema_hash": "11111111111111111111111111111111",
+    "session_nonce": 1592590337
+  },
+  "probe": {
+    "conn_ids": [
+      1,
+      9
+    ],
+    "corrupt_offset": null,
+    "first_ts_ns": 1700000000000000000,
+    "frames": 2,
+    "kinds": {
+      "0": 2,
+      "1": 2,
+      "36865": 1
+    },
+    "last_ts_ns": 1700000000000000004,
+    "records": 5,
+    "sha256": "f9cdc2713699335a617af4ea81776d4fc04a885f9a95f22bf633de2ec2f0d313",
+    "tail": "clean",
+    "truncated_bytes": 0,
+    "unknown_records": 1,
+    "valid_end": 226
+  },
+  "records": [
+    {
+      "category": 0,
+      "conn_id": 1,
+      "frame": 0,
+      "kind": 0,
+      "level": 2,
+      "offset": 89,
+      "payload_hex": "6b6e6f776e",
+      "seq": 1,
+      "ts_ns": 1700000000000000000
+    },
+    {
+      "category": 0,
+      "conn_id": 1,
+      "frame": 0,
+      "kind": 1,
+      "level": 2,
+      "offset": 109,
+      "payload_hex": "6b6e6f776e20746f6f",
+      "seq": 2,
+      "ts_ns": 1700000000000000001
+    },
+    {
+      "category": 0,
+      "conn_id": 9,
+      "frame": 1,
+      "kind": 0,
+      "level": 2,
+      "offset": 166,
+      "payload_hex": "6265666f7265",
+      "seq": 3,
+      "ts_ns": 1700000000000000002
+    },
+    {
+      "category": 0,
+      "conn_id": 9,
+      "frame": 1,
+      "kind": 36865,
+      "level": 3,
+      "offset": 187,
+      "payload_hex": "deadbeef",
+      "seq": 4,
+      "ts_ns": 1700000000000000003
+    },
+    {
+      "category": 0,
+      "conn_id": 9,
+      "frame": 1,
+      "kind": 1,
+      "level": 2,
+      "offset": 206,
+      "payload_hex": "6166746572",
+      "seq": 5,
+      "ts_ns": 1700000000000000004
+    }
+  ],
+  "refusal_reason": null,
+  "refused": false,
+  "sha256": "f9cdc2713699335a617af4ea81776d4fc04a885f9a95f22bf633de2ec2f0d313"
+}
