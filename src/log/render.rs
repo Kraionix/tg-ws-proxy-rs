@@ -72,7 +72,7 @@ pub fn render_into(
     // Written first, rolled back if the event turns out to have no line: that
     // keeps the "no line" decision in one place instead of asking twice.
     let start = out.len();
-    write_timestamp(ts_ns, out);
+    logreel::format_utc(ts_ns, out);
     out.push(' ');
     out.push_str(level_tag(level));
     out.push(' ');
@@ -143,53 +143,6 @@ pub fn peer_text(peer: &Peer) -> String {
     }
 
     text
-}
-
-/// `2026-10-12T11:23:16.612026Z` — UTC, ISO-8601, microseconds, from unix ns.
-///
-/// Hand-written because the crate has no date library and this is the only
-/// place that needs one; the calendar arithmetic is Howard Hinnant's
-/// `civil_from_days`, which is valid for the whole range of `i64` days and so
-/// has no case for a clock that is wrong in either direction.
-fn write_timestamp(ts_ns: u64, out: &mut String) {
-    let seconds = ts_ns / 1_000_000_000;
-    let micros = (ts_ns % 1_000_000_000) / 1_000;
-    let days = (seconds / 86_400) as i64;
-    let second_of_day = seconds % 86_400;
-
-    let (year, month, day) = civil_from_days(days);
-    let (hour, minute, second) = (
-        second_of_day / 3_600,
-        (second_of_day % 3_600) / 60,
-        second_of_day % 60,
-    );
-
-    let _ = write!(
-        out,
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{micros:06}Z"
-    );
-}
-
-/// Days since 1970-01-01 to a proleptic Gregorian date.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    // Shift the epoch to 0000-03-01, which puts the leap day at the end of the
-    // year and makes the month lengths a repeating pattern rather than a table.
-    let shifted = days + 719_468;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_position = (5 * day_of_year + 2) / 153;
-    let day = (day_of_year - (153 * month_position + 2) / 5 + 1) as u32;
-    let month = if month_position < 10 {
-        month_position + 3
-    } else {
-        month_position - 9
-    } as u32;
-
-    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 /// The five-character level column, which is what `tracing` printed and what

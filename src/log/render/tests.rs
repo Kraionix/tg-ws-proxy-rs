@@ -659,7 +659,7 @@ fn timestamps_are_iso_8601_utc_with_microseconds() {
 
     for (name, ts_ns, expected) in cases {
         let mut out = String::new();
-        write_timestamp(ts_ns, &mut out);
+        logreel::format_utc(ts_ns, &mut out);
         assert_eq!(out, expected, "case {name:?} stamped unexpectedly");
     }
 }

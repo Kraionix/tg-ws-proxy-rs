@@ -58,7 +58,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use schema::{Category, Event, Level};
 use view::{TEXT_RING_DEFAULT, TextTarget, View};
@@ -779,13 +779,4 @@ macro_rules! log_event {
             );
         }
     };
-}
-
-/// Wall clock in unix nanoseconds. The view stamps the overflow record with
-/// this; every other record's timestamp comes from the library's writer.
-pub(crate) fn now_ns() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_nanos() as u64)
-        .unwrap_or(0)
 }

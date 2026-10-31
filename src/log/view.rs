@@ -472,7 +472,7 @@ impl logreel::Observer<Event> for View {
             logreel::Level::Warn,
             Category::Overflow as u32 as u8,
             kind,
-            super::now_ns(),
+            logreel::now_ns(),
             0,
             0,
             event,
