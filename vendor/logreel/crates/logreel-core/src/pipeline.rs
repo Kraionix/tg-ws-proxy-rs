@@ -1,7 +1,7 @@
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -10,9 +10,7 @@ use logreel_store::{BatchSink, Durability};
 use crate::batch::BatchEncoder;
 use crate::filter::Filters;
 use crate::observer::Observer;
-use crate::ring::Ring;
 use crate::settings::{InternalError, InternalErrorKind, Settings};
-use crate::text::{TextSink, format_record};
 use crate::time::now_ns;
 use crate::{Event, Level, Record};
 
@@ -34,7 +32,6 @@ pub struct Handle<E: Event> {
     filters: Arc<Filters>,
     dropped: Arc<AtomicU64>,
     seq: AtomicU32,
-    ring: Option<Arc<Mutex<Ring>>>,
 }
 
 impl<E: Event> Handle<E> {
@@ -83,11 +80,9 @@ impl<E: Event> Handle<E> {
         self.tx.try_send(Msg::Flush).is_ok()
     }
 
-    /// Ask the writer to drain and render everything it holds.
-    ///
-    /// The dump itself belongs to the consumer: the built-in ring writes its
-    /// snapshot, an [Observer] gets [Observer::dump]. False means the writer
-    /// was already gone.
+    /// Ask the writer to drain everything it holds and hand the observer its
+    /// [Observer::dump] once the queue is empty. False means the writer was
+    /// already gone.
     #[must_use]
     pub fn request_dump(&self) -> bool {
         self.tx.try_send(Msg::Dump).is_ok()
@@ -104,24 +99,6 @@ impl<E: Event> Handle<E> {
     pub fn sequence(&self) -> u32 {
         self.seq.load(Ordering::Relaxed)
     }
-
-    /// Retained ring lines, oldest first.
-    #[must_use]
-    pub fn dump_ring(&self) -> Vec<String> {
-        match &self.ring {
-            Some(ring) => ring.lock().map(|ring| ring.snapshot()).unwrap_or_default(),
-            None => Vec::new(),
-        }
-    }
-
-    /// Ring lines dropped by the byte or count cap.
-    #[must_use]
-    pub fn ring_dropped(&self) -> u64 {
-        match &self.ring {
-            Some(ring) => ring.lock().map(|ring| ring.dropped()).unwrap_or(0),
-            None => 0,
-        }
-    }
 }
 
 impl<E: Event> fmt::Debug for Handle<E> {
@@ -130,7 +107,6 @@ impl<E: Event> fmt::Debug for Handle<E> {
             .debug_struct("Handle")
             .field("dropped", &self.dropped())
             .field("sequence", &self.sequence())
-            .field("ring", &self.ring.is_some())
             .finish()
     }
 }
@@ -148,10 +124,6 @@ pub struct ShutdownReport {
     pub dropped: u64,
     /// Sink write or sync failures.
     pub sink_errors: u64,
-    /// Text write failures.
-    pub text_errors: u64,
-    /// Ring lines dropped by its caps.
-    pub ring_dropped: u64,
     /// Last sink error, if any.
     pub error: Option<String>,
 }
@@ -201,7 +173,6 @@ impl<E: Event> Logger<E> {
             .unwrap_or_default();
         ShutdownReport {
             dropped: self.handle.dropped(),
-            ring_dropped: self.handle.ring_dropped(),
             ..result
         }
     }
@@ -225,10 +196,6 @@ pub enum InitError {
     ZeroBatch,
     /// The flush interval is zero.
     ZeroFlushInterval,
-    /// Text or ring is enabled without a render function.
-    MissingRender,
-    /// Text projection is configured but the text feature is off.
-    TextDisabled,
     /// The writer thread could not be spawned.
     Spawn(String),
 }
@@ -239,11 +206,6 @@ impl fmt::Display for InitError {
             Self::ZeroCapacity => formatter.write_str("channel capacity must be non-zero"),
             Self::ZeroBatch => formatter.write_str("batch size must be non-zero"),
             Self::ZeroFlushInterval => formatter.write_str("flush interval must be non-zero"),
-            Self::MissingRender => {
-                formatter.write_str("text or ring is enabled without a render function")
-            }
-            Self::TextDisabled => formatter
-                .write_str("text projection is configured but the logreel text feature is off"),
             Self::Spawn(message) => write!(formatter, "writer thread: {message}"),
         }
     }
@@ -252,27 +214,21 @@ impl fmt::Display for InitError {
 impl std::error::Error for InitError {}
 
 /// Start the pipeline.
-///
-/// The render function is required when text or the ring is enabled and is
-/// ignored otherwise. It is a plain function pointer, monomorphised per
-/// event type: no per-record trait object.
 pub fn init<E: Event + Send + 'static>(
     settings: Settings,
-    render: Option<fn(&E, &mut String)>,
     sink: Box<dyn BatchSink>,
 ) -> Result<Logger<E>, InitError> {
-    init_with(settings, render, None, sink)
+    init_with(settings, None, sink)
 }
 
-/// Start the pipeline with a second consumer.
+/// Start the pipeline with a consumer that sees records as they arrive.
 ///
-/// The observer runs on the writer thread, in addition to the built-in text
-/// projection and ring; see [Observer] for the ordering. The sink table in
-/// [Settings::sink_min_level] and the per-category overrides decide what
-/// reaches `sink`; the producer gate stays the union of every consumer.
+/// The observer runs on the writer thread; see [Observer] for the ordering.
+/// The sink table in [Settings::sink_min_level] and the per-category
+/// overrides decide what reaches `sink`; the producer gate stays the union of
+/// every consumer.
 pub fn init_with<E: Event + Send + 'static>(
     settings: Settings,
-    render: Option<fn(&E, &mut String)>,
     observer: Option<Box<dyn Observer<E> + Send>>,
     sink: Box<dyn BatchSink>,
 ) -> Result<Logger<E>, InitError> {
@@ -285,13 +241,6 @@ pub fn init_with<E: Event + Send + 'static>(
     if settings.flush_interval.is_zero() {
         return Err(InitError::ZeroFlushInterval);
     }
-    if (settings.text.is_some() || settings.ring.is_some()) && render.is_none() {
-        return Err(InitError::MissingRender);
-    }
-    if !cfg!(feature = "text") && settings.text.is_some() {
-        return Err(InitError::TextDisabled);
-    }
-
     let filters = Arc::new(Filters::new(settings.min_level));
     for &(category, level) in &settings.filter_overrides {
         filters.set(category, level);
@@ -300,9 +249,6 @@ pub fn init_with<E: Event + Send + 'static>(
     for &(category, level) in &settings.sink_filter_overrides {
         sink_filters.set(category, level);
     }
-    let ring = settings
-        .ring
-        .map(|settings| Arc::new(Mutex::new(Ring::new(settings))));
     let dropped = Arc::new(AtomicU64::new(0));
     let (tx, rx) = sync_channel(settings.channel_capacity);
     let handle = Arc::new(Handle {
@@ -313,22 +259,10 @@ pub fn init_with<E: Event + Send + 'static>(
         // "no sequence yet", and it keeps the first record's number stable
         // across the version that assigned it from outside.
         seq: AtomicU32::new(1),
-        ring: ring.clone(),
     });
     let join = thread::Builder::new()
         .name("logreel-writer".to_owned())
-        .spawn(move || {
-            writer_loop(
-                rx,
-                settings,
-                render,
-                observer,
-                sink,
-                ring,
-                sink_filters,
-                dropped,
-            )
-        })
+        .spawn(move || writer_loop(rx, settings, observer, sink, sink_filters, dropped))
         .map_err(|error| InitError::Spawn(error.to_string()))?;
     Ok(Logger {
         handle,
@@ -342,26 +276,21 @@ struct WriterResult {
     batches: u64,
     bytes: u64,
     sink_errors: u64,
-    text_errors: u64,
     error: Option<String>,
 }
 
 struct Writer<E: Event> {
     settings: Settings,
-    render: Option<fn(&E, &mut String)>,
     observer: Option<Box<dyn Observer<E> + Send>>,
     sink: Box<dyn BatchSink>,
     sink_filters: Arc<Filters>,
     encoder: BatchEncoder,
     batch: Vec<Record<E>>,
-    text: Option<TextSink>,
-    ring: Option<Arc<Mutex<Ring>>>,
     dropped: Arc<AtomicU64>,
     seen_dropped: u64,
     last_overflow: Instant,
     /// A stop absorbed by a drain, served by the loop before it exits.
     stop: Option<(Duration, Duration)>,
-    line: String,
     result: WriterResult,
 }
 
@@ -410,48 +339,20 @@ impl<E: Event> Writer<E> {
             }
         }
 
-        if let Some(text) = self.text.as_mut()
-            && let Err(error) = text.commit()
-        {
-            self.result.text_errors += 1;
-            self.report(InternalErrorKind::Text, error.to_string());
-        }
         if let Some(observer) = self.observer.as_mut() {
             observer.flush();
         }
         self.batch.clear();
     }
 
-    /// Take one record: every consumer that runs per record, then the batch.
+    /// Take one record: the observer, then the batch.
     ///
-    /// This is where the observer and the built-in text projection see a
-    /// record, which is on arrival and not at flush: a line that waits for the
-    /// next batch is a line a crash can still lose, and the text log exists to
-    /// be read while the process that wrote it is alive.
+    /// The observer sees a record on arrival, not at flush: a line that waits
+    /// for the next batch is a line a crash can still lose.
     fn push(&mut self, record: Record<E>) {
         if let Some(observer) = self.observer.as_mut() {
             observer.record(&record);
         }
-
-        let text_wants = self
-            .text
-            .as_ref()
-            .is_some_and(|text| text.wants(record.level));
-        let ring_wants = self.ring.is_some();
-        if (text_wants || ring_wants)
-            && let Some(render) = self.render
-        {
-            format_record(&record, render, &mut self.line);
-            if text_wants && let Some(text) = self.text.as_mut() {
-                text.push(&self.line);
-            }
-            if ring_wants && let Some(ring) = &self.ring {
-                ring.lock()
-                    .expect("ring lock")
-                    .push(record.level, &self.line);
-            }
-        }
-
         self.batch.push(record);
     }
 
@@ -541,33 +442,25 @@ impl<E: Event> Writer<E> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn writer_loop<E: Event>(
     rx: Receiver<Msg<E>>,
     settings: Settings,
-    render: Option<fn(&E, &mut String)>,
     observer: Option<Box<dyn Observer<E> + Send>>,
     sink: Box<dyn BatchSink>,
-    ring: Option<Arc<Mutex<Ring>>>,
     sink_filters: Arc<Filters>,
     dropped: Arc<AtomicU64>,
 ) -> WriterResult {
-    let text = settings.text.map(TextSink::new);
     let mut writer = Writer {
         batch: Vec::with_capacity(settings.batch_max),
         settings,
-        render,
         observer,
         sink,
         sink_filters,
         encoder: BatchEncoder::new(),
-        text,
-        ring,
         dropped,
         seen_dropped: 0,
         last_overflow: Instant::now(),
         stop: None,
-        line: String::with_capacity(256),
         result: WriterResult::default(),
     };
 
@@ -610,8 +503,6 @@ impl From<WriterResult> for ShutdownReport {
             bytes: result.bytes,
             dropped: 0,
             sink_errors: result.sink_errors,
-            text_errors: result.text_errors,
-            ring_dropped: 0,
             error: result.error,
         }
     }
@@ -762,7 +653,6 @@ mod tests {
         let batches = Batches::default();
         let logger = init_with::<TestEvent>(
             settings,
-            None,
             Some(Box::new(ArcProbe(probe))),
             Box::new(SlowSink {
                 batches: batches.clone(),
@@ -915,7 +805,6 @@ mod tests {
         let batches = Batches::default();
         let logger = init_with::<TestEvent>(
             settings,
-            None,
             Some(Box::new(ArcProbe(std::sync::Arc::clone(&probe)))),
             Box::new(SlowSink {
                 batches: batches.clone(),

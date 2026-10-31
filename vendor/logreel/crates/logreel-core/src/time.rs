@@ -9,10 +9,14 @@ pub fn now_ns() -> u64 {
         .map_or(0, |duration| duration.as_nanos() as u64)
 }
 
-/// Append an ISO-8601 UTC timestamp with nanosecond precision.
+/// Append an ISO-8601 UTC timestamp with microsecond precision.
+///
+/// Microseconds are the one precision every consumer prints: the proxy's
+/// text lines and the library's own, so a record rendered by either side
+/// looks the same. Sub-microsecond digits are truncated.
 pub fn format_utc(ts_ns: u64, out: &mut String) {
     let seconds = (ts_ns / 1_000_000_000) as i64;
-    let nanos = ts_ns % 1_000_000_000;
+    let micros = (ts_ns % 1_000_000_000) / 1_000;
     let days = seconds.div_euclid(86_400);
     let time_of_day = seconds.rem_euclid(86_400);
     let (year, month, day) = civil_from_days(days);
@@ -21,7 +25,7 @@ pub fn format_utc(ts_ns: u64, out: &mut String) {
     let second = time_of_day % 60;
     let _ = write!(
         out,
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{nanos:09}Z"
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{micros:06}Z"
     );
 }
 
@@ -52,20 +56,27 @@ mod tests {
     fn epoch_is_formatted() {
         let mut out = String::new();
         format_utc(0, &mut out);
-        assert_eq!(out, "1970-01-01T00:00:00.000000000Z");
+        assert_eq!(out, "1970-01-01T00:00:00.000000Z");
     }
 
     #[test]
-    fn nanoseconds_and_dates_are_formatted() {
+    fn microseconds_and_dates_are_formatted() {
         let mut out = String::new();
         format_utc(1_700_000_000_123_456_789, &mut out);
-        assert_eq!(out, "2023-11-14T22:13:20.123456789Z");
+        assert_eq!(out, "2023-11-14T22:13:20.123456Z");
+    }
+
+    #[test]
+    fn sub_microsecond_digits_are_truncated() {
+        let mut out = String::new();
+        format_utc(1_700_000_000_000_000_999, &mut out);
+        assert_eq!(out, "2023-11-14T22:13:20.000000Z");
     }
 
     #[test]
     fn leap_day_is_formatted() {
         let mut out = String::new();
         format_utc(1_709_164_800_000_000_000, &mut out);
-        assert_eq!(out, "2024-02-29T00:00:00.000000000Z");
+        assert_eq!(out, "2024-02-29T00:00:00.000000Z");
     }
 }

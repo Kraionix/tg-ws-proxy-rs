@@ -11,7 +11,7 @@ use logreel_store::{BatchScan, Durability, EncodedBatch, ErrorKind, Store, Store
 use crate::crc32c::crc32c;
 use crate::header::{Header, MAX_PAYLOAD};
 use crate::reader::{FrameReader, SegmentReader};
-use crate::time::{day_from_ns, day_name};
+use crate::time::{SEGMENT_SUFFIX, day_from_ns, day_name, day_of_name, segment_day};
 
 /// Time source for rotation and header creation.
 pub trait Clock: Send + Sync {
@@ -29,8 +29,24 @@ impl Clock for SystemClock {
     }
 }
 
+/// Receives one line from the store when it has something to say.
+pub type WarningSink = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Where the retention window starts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RetentionAnchor {
+    /// Count from what the clock says is today. A run that boots with a wrong
+    /// clock trusts it, for better and for worse.
+    #[default]
+    Clock,
+    /// Count from the day after the newest segment in the directory, capped
+    /// at the clock's day. A wrong clock can then keep an old segment one run
+    /// longer, but can never delete the archive or the segment just written.
+    NewestSegment,
+}
+
 /// File backend configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FileStoreConfig {
     /// Directory that holds YYYY-MM-DD.seg files.
     pub directory: PathBuf,
@@ -38,8 +54,8 @@ pub struct FileStoreConfig {
     pub producer_id: u32,
     /// Per-session nonce written into new headers.
     pub session_nonce: u32,
-    /// Number of day files to keep, including the active one; 0 disables the
-    /// day based rule.
+    /// Width of the retention window in days, including the window's last
+    /// day; 0 disables the day based rule.
     pub keep_days: usize,
     /// Total byte cap for the directory; 0 disables the cap.
     pub max_total_bytes: u64,
@@ -49,6 +65,29 @@ pub struct FileStoreConfig {
     /// The default, 3, is zstd's own; an application on a slow CPU passes 1
     /// and pays for fewer bytes rather than fewer instructions.
     pub zstd_level: i32,
+    /// Where the retention window starts; see [RetentionAnchor].
+    pub retention_anchor: RetentionAnchor,
+    /// Receives one line when the clock and the archive disagree enough to
+    /// matter. The store never logs by itself: the application owns the
+    /// wording of its own diagnostics.
+    pub on_warning: Option<WarningSink>,
+}
+
+impl std::fmt::Debug for FileStoreConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FileStoreConfig")
+            .field("directory", &self.directory)
+            .field("producer_id", &self.producer_id)
+            .field("session_nonce", &self.session_nonce)
+            .field("keep_days", &self.keep_days)
+            .field("max_total_bytes", &self.max_total_bytes)
+            .field("compress", &self.compress)
+            .field("zstd_level", &self.zstd_level)
+            .field("retention_anchor", &self.retention_anchor)
+            .field("on_warning", &self.on_warning.as_ref().map(|_| "callback"))
+            .finish()
+    }
 }
 
 impl FileStoreConfig {
@@ -64,6 +103,8 @@ impl FileStoreConfig {
             max_total_bytes: 256 * 1024 * 1024,
             compress: false,
             zstd_level: 3,
+            retention_anchor: RetentionAnchor::Clock,
+            on_warning: None,
         }
     }
 }
@@ -141,6 +182,10 @@ pub struct FileStore {
     active: Option<Active>,
     last_sync: Instant,
     rotations: u64,
+    /// Days this run wrote, and therefore must never delete. A wrong clock
+    /// makes the day name meaningless, but it does not make the records in
+    /// that file less ours.
+    written: Vec<i64>,
 }
 
 impl FileStore {
@@ -170,6 +215,7 @@ impl FileStore {
             active: None,
             last_sync: Instant::now(),
             rotations: 0,
+            written: Vec::new(),
         })
     }
 
@@ -222,7 +268,10 @@ impl FileStore {
         }
         self.sync(Durability::Immediate)?;
         self.active = None;
-        let path = self.config.directory.join(format!("{}.seg", day_name(day)));
+        let path = self
+            .config
+            .directory
+            .join(format!("{}{SEGMENT_SUFFIX}", day_name(day)));
         let lock = acquire_lock(&path)?;
         let file = self.open_segment(&path, batch)?;
         self.active = Some(Active {
@@ -231,6 +280,9 @@ impl FileStore {
             day,
             _lock: lock,
         });
+        if !self.written.contains(&day) {
+            self.written.push(day);
+        }
         self.rotations += 1;
         self.retention(day)?;
         Ok(())
@@ -345,38 +397,99 @@ impl FileStore {
         active.file.write_all(&frame).map_err(StoreError::io)
     }
 
+    /// Delete what fell out of the retention window.
+    ///
+    /// Only files this run did not write are candidates: the day name of a
+    /// file says which records it holds, not whether they are still wanted,
+    /// and a clock that boots at 1970 would otherwise delete the segment the
+    /// current boot just wrote.
+    ///
+    /// The window ends at the clock's day or, with
+    /// [`RetentionAnchor::NewestSegment`], at the day after the newest
+    /// segment that was already there -- whichever is earlier. Counting from
+    /// the archive means a late or early clock cannot shrink the archive to
+    /// nothing; counting from the clock means a correct clock after a long
+    /// outage still keeps everything the window covers.
     fn retention(&mut self, today: i64) -> Result<(), StoreError> {
-        let mut entries = read_segments(&self.config.directory)?;
+        if self.config.keep_days == 0 && self.config.max_total_bytes == 0 {
+            return Ok(());
+        }
+        let entries = read_segments(&self.config.directory)?;
         if entries.is_empty() {
             return Ok(());
         }
-        let newest = entries.last().map(|entry| entry.1).unwrap_or(today);
-        let window_end = today.min(newest.saturating_add(1));
+        let mut total: u64 = entries.iter().map(|entry| entry.2).sum();
         let active_path = self.active.as_ref().map(|active| active.path.clone());
-        loop {
-            let count = entries.len();
-            let total: u64 = entries.iter().map(|entry| entry.2).sum();
-            let over_count = self.config.keep_days > 0 && count > self.config.keep_days;
-            let over_cap = self.config.max_total_bytes > 0 && total > self.config.max_total_bytes;
-            if !over_count && !over_cap {
-                break;
+        let mut foreign: Vec<(PathBuf, i64, u64)> = entries
+            .into_iter()
+            .filter(|(path, day, _)| {
+                Some(path) != active_path.as_ref() && !self.written.contains(day)
+            })
+            .collect();
+        if foreign.is_empty() {
+            return Ok(());
+        }
+        let newest = foreign.iter().map(|(_, day, _)| *day).max();
+        if self.config.keep_days > 0
+            && self.config.retention_anchor == RetentionAnchor::NewestSegment
+            && let Some(newest) = newest
+            && (today - newest).abs() > self.config.keep_days as i64
+        {
+            self.warn(format!(
+                "log retention: the clock says {} but the newest segment is {}; \
+                 counting the window from the segment",
+                day_name(today),
+                day_name(newest)
+            ));
+        }
+        let base = match self.config.retention_anchor {
+            RetentionAnchor::Clock => today,
+            RetentionAnchor::NewestSegment => match newest {
+                // The day after the newest segment is where "now" is as far
+                // as the archive is concerned; the clock only caps it.
+                Some(newest) => (newest.saturating_add(1)).min(today),
+                None => return Ok(()),
+            },
+        };
+        if self.config.keep_days > 0 {
+            let cutoff = base - self.config.keep_days as i64 + 1;
+            let mut index = 0;
+            while index < foreign.len() {
+                if foreign[index].1 < cutoff {
+                    let (path, _, len) = foreign.remove(index);
+                    total = total.saturating_sub(len);
+                    remove_segment(&path)?;
+                } else {
+                    index += 1;
+                }
             }
-            let Some(index) = entries
-                .iter()
-                .position(|entry| entry.1 < window_end && Some(&entry.0) != active_path.as_ref())
-            else {
+        }
+        while self.config.max_total_bytes > 0 && total > self.config.max_total_bytes {
+            let Some(index) = foreign.iter().position(|entry| entry.1 < base) else {
                 break;
             };
-            let (path, _, _) = entries.remove(index);
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(StoreError::io(error)),
-            }
-            let _ = fs::remove_file(lock_path(&path));
+            let (path, _, len) = foreign.remove(index);
+            total = total.saturating_sub(len);
+            remove_segment(&path)?;
         }
         Ok(())
     }
+
+    fn warn(&self, message: String) {
+        if let Some(sink) = &self.config.on_warning {
+            sink(&message);
+        }
+    }
+}
+
+fn remove_segment(path: &Path) -> Result<(), StoreError> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(StoreError::io(error)),
+    }
+    let _ = fs::remove_file(lock_path(path));
+    Ok(())
 }
 
 fn read_segments(directory: &Path) -> Result<Vec<(PathBuf, i64, u64)>, StoreError> {
@@ -384,13 +497,10 @@ fn read_segments(directory: &Path) -> Result<Vec<(PathBuf, i64, u64)>, StoreErro
     for entry in fs::read_dir(directory).map_err(StoreError::io)? {
         let entry = entry.map_err(StoreError::io)?;
         let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("seg") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
             continue;
         };
-        let Some(day) = crate::time::day_from_name(stem) else {
+        let Some(day) = segment_day(name).and_then(day_of_name) else {
             continue;
         };
         let len = entry.metadata().map_err(StoreError::io)?.len();

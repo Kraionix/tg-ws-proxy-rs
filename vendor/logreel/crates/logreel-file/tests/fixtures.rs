@@ -5,7 +5,7 @@ mod support;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use logreel_file::{Scan, TailState, dump_raw, probe};
+use logreel_file::{Scan, SegmentReader, TailState, decode_batch, dump_raw, probe};
 use logreel_store::ErrorKind;
 use serde_json::Value;
 
@@ -211,6 +211,23 @@ fn fixtures_probe_and_scan_match_expectations() {
             assert!(text.contains("payload=6f70656e65643a3432"), "{name}");
         }
     }
+}
+
+#[test]
+fn an_encoded_batch_decodes_without_a_file_around_it() {
+    let path = fixtures().join("F01_normal.seg");
+    let mut reader = SegmentReader::open(&path).expect("reader");
+    let batch = reader.next_batch().expect("one batch").expect("valid");
+    let records = decode_batch(&batch).expect("decode");
+    assert_eq!(records.len(), batch.record_count as usize);
+    let mut scan = Scan::open(&path).expect("scan");
+    for record in &records {
+        let scanned = scan.next_record().expect("record").expect("valid");
+        assert_eq!(record.seq, scanned.seq);
+        assert_eq!(record.kind, scanned.kind);
+        assert_eq!(record.payload, scanned.payload);
+    }
+    assert!(scan.next_record().is_none());
 }
 
 #[test]

@@ -50,12 +50,20 @@ fn day_boundary_rotates() {
 fn keep_days_deletes_the_oldest() {
     let dir = TempDir::new("keep");
     let clock = Arc::new(ManualClock::at(2026, 10, 30));
-    let mut store = support::store(dir.path(), Arc::clone(&clock), 1, 0, false);
-    store.append(&one(1)).expect("day 1");
+    // One store per day: retention only deletes what the current run did not
+    // write, and a restart is the case the rule exists for.
+    {
+        let mut store = support::store(dir.path(), Arc::clone(&clock), 1, 0, false);
+        store.append(&one(1)).expect("day 1");
+    }
     clock.set(2026, 10, 31);
-    store.append(&one(2)).expect("day 2");
-    assert_eq!(names(dir.path()), vec!["2026-10-31.seg"]);
+    {
+        let mut store = support::store(dir.path(), Arc::clone(&clock), 1, 0, false);
+        store.append(&one(2)).expect("day 2");
+        assert_eq!(names(dir.path()), vec!["2026-10-31.seg"]);
+    }
     clock.set(2026, 11, 1);
+    let mut store = support::store(dir.path(), Arc::clone(&clock), 1, 0, false);
     store.append(&one(3)).expect("day 3");
     assert_eq!(names(dir.path()), vec!["2026-11-01.seg"]);
 }
@@ -71,10 +79,13 @@ fn byte_cap_bounds_the_directory() {
         .expect("metadata")
         .len();
     clock.set(2026, 10, 31);
-    let mut store = support::store(dir.path(), Arc::clone(&clock), 0, size + 10, false);
-    store.append(&one(2)).expect("day 2");
-    assert_eq!(names(dir.path()), vec!["2026-10-31.seg"]);
+    {
+        let mut store = support::store(dir.path(), Arc::clone(&clock), 0, size + 10, false);
+        store.append(&one(2)).expect("day 2");
+        assert_eq!(names(dir.path()), vec!["2026-10-31.seg"]);
+    }
     clock.set(2026, 11, 1);
+    let mut store = support::store(dir.path(), Arc::clone(&clock), 0, size + 10, false);
     store.append(&one(3)).expect("day 3");
     assert_eq!(names(dir.path()), vec!["2026-11-01.seg"]);
 }
@@ -129,6 +140,19 @@ fn backwards_clock_deletes_nothing() {
     assert!(files.contains(&"2026-10-01.seg".to_owned()), "{files:?}");
     assert!(files.contains(&"2026-10-02.seg".to_owned()), "{files:?}");
     assert!(files.contains(&"2026-09-30.seg".to_owned()), "{files:?}");
+}
+
+#[test]
+fn a_run_never_deletes_what_it_wrote_itself() {
+    let dir = TempDir::new("own-days");
+    let clock = Arc::new(ManualClock::at(2026, 10, 30));
+    let mut store = support::store(dir.path(), Arc::clone(&clock), 1, 0, false);
+    store.append(&one(1)).expect("day 1");
+    clock.set(2026, 11, 1);
+    store.append(&one(2)).expect("day 2");
+    // A two-day gap: the first file is outside a one-day window, but this run
+    // wrote it, so the window may not delete it.
+    assert_eq!(names(dir.path()), vec!["2026-10-30.seg", "2026-11-01.seg"]);
 }
 
 #[test]

@@ -7,11 +7,6 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[features]
-default = []
-text = []
-ring = []
-
 [dependencies]
 logreel-store.workspace = true
 tokio = { workspace = true }

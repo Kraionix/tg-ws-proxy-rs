@@ -9,10 +9,10 @@ tools/sync-logreel.sh ../logreel
 
 | item | value |
 |---|---|
-| source commit | `a19accb257f8d5945ff2c9338c76687b730ddd46` |
-| source tree | `5fc68474afc4347004a0089f6b2e63368cc2d154` |
-| version | `0.2.0` |
-| crates | `logreel`, `logreel-core`, `logreel-derive`, `logreel-store`, `logreel-file` |
+| source commit | `5b5ffc445f376168540e28bbdfc5809055288c3b` |
+| source tree | `721382bfd5dd4097587d2f3c135e01803a85350d` |
+| version | `0.3.0` |
+| crates | `logreel`, `logreel-core`, `logreel-store`, `logreel-file` |
 | fixtures | `fixtures/` (the file crate's conformance corpus) |
 
 ## Patches
@@ -22,6 +22,12 @@ tools/sync-logreel.sh ../logreel
    The proxy writes segments and has no use for a second storage engine, and a
    dependency the build can resolve but never use is one a rebuild may
    accidentally link.
+2. **No derive macro.** `logreel-derive` and its `logreel` re-export are
+   not vendored. The proxy implements `logreel::Event` by hand for its prost
+   oneof: the derive would require a second derive and a kind attribute on each
+   of the 22 schema messages, duplicating the tags the schema fixes. Vendoring
+   it would put `syn`, `quote` and `proc-macro2` in every build for a macro
+   this tree never expands.
 
 Nothing else differs from the source tree; `git diff` against the upstream
 commit is the check.

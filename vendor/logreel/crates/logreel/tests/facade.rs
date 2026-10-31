@@ -1,6 +1,6 @@
 //! Facade wiring: each backend and feature reaches the same pipeline.
 
-#![cfg(any(feature = "file", feature = "redb", feature = "ring"))]
+#![cfg(any(feature = "file", feature = "redb"))]
 
 use logreel::{DecodeError, Event, Level, Settings, init};
 
@@ -43,12 +43,8 @@ fn file_backend_through_the_facade() {
 
     let directory = temp("file");
     let store = FileStore::open(FileStoreConfig::new(&directory)).expect("store");
-    let logger = init::<Ping>(
-        Settings::builder().batch_max(2).build(),
-        None,
-        Box::new(store),
-    )
-    .expect("init");
+    let logger =
+        init::<Ping>(Settings::builder().batch_max(2).build(), Box::new(store)).expect("init");
     for value in 0..5 {
         assert!(logger.handle().emit(Level::Info, 0, value, Ping(value)));
     }
@@ -69,12 +65,8 @@ fn redb_backend_through_the_facade() {
 
     let path = temp("redb");
     let store = RedbStore::open(&path).expect("store");
-    let logger = init::<Ping>(
-        Settings::builder().batch_max(2).build(),
-        None,
-        Box::new(store),
-    )
-    .expect("init");
+    let logger =
+        init::<Ping>(Settings::builder().batch_max(2).build(), Box::new(store)).expect("init");
     for value in 0..4 {
         assert!(logger.handle().emit(Level::Info, 0, value, Ping(value)));
     }
@@ -90,31 +82,4 @@ fn redb_backend_through_the_facade() {
         4
     );
     let _ = std::fs::remove_file(&path);
-}
-
-#[cfg(feature = "ring")]
-#[test]
-fn ring_through_the_facade() {
-    use logreel::{RingSettings, SharedSink};
-
-    let logger = init::<Ping>(
-        Settings::builder()
-            .batch_max(1)
-            .ring(RingSettings {
-                capacity: 4,
-                max_bytes: 1024,
-                floor: Level::Trace,
-            })
-            .build(),
-        Some(|_: &Ping, out: &mut String| out.push_str("ping")),
-        Box::new(SharedSink::new()),
-    )
-    .expect("init");
-    logger.handle().emit(Level::Info, 0, 1, Ping(1));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while logger.handle().dump_ring().is_empty() {
-        assert!(std::time::Instant::now() < deadline, "ring stayed empty");
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    let _ = logger.shutdown();
 }

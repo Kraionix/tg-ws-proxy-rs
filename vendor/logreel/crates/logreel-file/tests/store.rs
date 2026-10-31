@@ -182,6 +182,8 @@ fn an_uncompressed_file_refuses_compressed_frames() {
             max_total_bytes: 0,
             compress: false,
             zstd_level: 3,
+            retention_anchor: logreel_file::RetentionAnchor::Clock,
+            on_warning: None,
         };
         let mut store = logreel_file::FileStore::with_clock(config, Arc::clone(&clock))
             .expect("open plain store");
@@ -197,6 +199,8 @@ fn an_uncompressed_file_refuses_compressed_frames() {
         max_total_bytes: 0,
         compress: true,
         zstd_level: 1,
+        retention_anchor: logreel_file::RetentionAnchor::Clock,
+        on_warning: None,
     };
     let mut store =
         logreel_file::FileStore::with_clock(config, clock).expect("open compressed store");
@@ -220,6 +224,8 @@ fn an_out_of_range_zstd_level_is_refused_at_open() {
         max_total_bytes: 0,
         compress: false,
         zstd_level: 0,
+        retention_anchor: logreel_file::RetentionAnchor::Clock,
+        on_warning: None,
     };
     let error = logreel_file::FileStore::open(config).expect_err("level 0 is refused");
     assert_eq!(error.kind(), logreel_store::ErrorKind::Refused);
@@ -238,6 +244,8 @@ fn the_compression_level_is_taken_from_the_config() {
         max_total_bytes: 0,
         compress: true,
         zstd_level: 1,
+        retention_anchor: logreel_file::RetentionAnchor::Clock,
+        on_warning: None,
     };
     let mut store = logreel_file::FileStore::with_clock(config, clock).expect("open");
     store.append(&sample_batch(1_000)).expect("append");
@@ -266,6 +274,8 @@ fn prime_creates_the_day_file_and_takes_its_lock() {
         max_total_bytes: 0,
         compress: false,
         zstd_level: 3,
+        retention_anchor: logreel_file::RetentionAnchor::Clock,
+        on_warning: None,
     };
     let mut first =
         logreel_file::FileStore::with_clock(config.clone(), Arc::clone(&clock)).expect("open");

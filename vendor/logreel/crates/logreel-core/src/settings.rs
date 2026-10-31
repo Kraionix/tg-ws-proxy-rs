@@ -4,26 +4,7 @@ use std::time::Duration;
 
 use logreel_store::Durability;
 
-use crate::RingSettings;
 use crate::level::Level;
-
-/// Where the text projection is written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TextTarget {
-    /// Standard error.
-    Stderr,
-    /// Standard output.
-    Stdout,
-}
-
-/// Text projection settings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TextSettings {
-    /// Minimum level rendered, for all categories.
-    pub floor: Level,
-    /// Destination stream.
-    pub target: TextTarget,
-}
 
 /// A failure inside the library, not a record.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,8 +20,6 @@ pub struct InternalError {
 pub enum InternalErrorKind {
     /// The sink rejected a batch.
     Sink,
-    /// A text line could not be written.
-    Text,
     /// A configuration problem detected at runtime.
     Config,
 }
@@ -49,7 +28,7 @@ pub enum InternalErrorKind {
 ///
 /// Build it with [Settings::builder]. The defaults are deliberately boring:
 /// Info floor, 4096 channel slots, 256 records per batch, one second flush,
-/// no text, no ring, eventual durability.
+/// eventual durability.
 pub struct Settings {
     /// Minimum level for every category: the producer gate.
     pub min_level: Level,
@@ -72,10 +51,6 @@ pub struct Settings {
     pub durability: Durability,
     /// Opaque domain bytes written into every batch.
     pub domain: Box<[u8]>,
-    /// Text projection, when enabled.
-    pub text: Option<TextSettings>,
-    /// Ring buffer, when enabled.
-    pub ring: Option<RingSettings>,
     pub(crate) filter_overrides: Vec<(u8, Option<Level>)>,
     pub(crate) sink_filter_overrides: Vec<(u8, Option<Level>)>,
     pub(crate) on_internal: Option<Arc<dyn Fn(InternalError) + Send + Sync>>,
@@ -92,8 +67,6 @@ impl Default for Settings {
             flush_on_warn: true,
             durability: Durability::Eventual,
             domain: Box::new([]),
-            text: None,
-            ring: None,
             filter_overrides: Vec::new(),
             sink_filter_overrides: Vec::new(),
             on_internal: None,
@@ -113,8 +86,6 @@ impl fmt::Debug for Settings {
             .field("flush_on_warn", &self.flush_on_warn)
             .field("durability", &self.durability)
             .field("domain", &self.domain)
-            .field("text", &self.text)
-            .field("ring", &self.ring)
             .field("filter_overrides", &self.filter_overrides)
             .field("sink_filter_overrides", &self.sink_filter_overrides)
             .field("on_internal", &self.on_internal.is_some())
@@ -214,20 +185,6 @@ impl SettingsBuilder {
         self
     }
 
-    /// Enable the text projection.
-    #[must_use]
-    pub fn text(mut self, floor: Level, target: TextTarget) -> Self {
-        self.settings.text = Some(TextSettings { floor, target });
-        self
-    }
-
-    /// Enable the ring buffer.
-    #[must_use]
-    pub fn ring(mut self, ring: RingSettings) -> Self {
-        self.settings.ring = Some(ring);
-        self
-    }
-
     /// Override one category, or disable it with None.
     #[must_use]
     pub fn filter(mut self, category: u8, level: Option<Level>) -> Self {
@@ -251,8 +208,8 @@ impl SettingsBuilder {
 
 #[cfg(test)]
 mod tests {
-    use super::{Settings, TextTarget};
-    use crate::{Level, RingSettings};
+    use super::Settings;
+    use crate::Level;
     use logreel_store::Durability;
     use std::time::Duration;
 
@@ -265,8 +222,6 @@ mod tests {
         assert_eq!(settings.batch_max, 256);
         assert_eq!(settings.flush_interval, Duration::from_secs(1));
         assert_eq!(settings.durability, Durability::Eventual);
-        assert!(settings.text.is_none());
-        assert!(settings.ring.is_none());
     }
 
     #[test]
@@ -281,8 +236,6 @@ mod tests {
             .flush_on_warn(false)
             .durability(Durability::Immediate)
             .domain(b"dc=2".to_vec())
-            .text(Level::Warn, TextTarget::Stdout)
-            .ring(RingSettings::default())
             .filter(3, None)
             .build();
         assert_eq!(settings.min_level, Level::Debug);
@@ -293,8 +246,6 @@ mod tests {
         assert!(!settings.flush_on_warn);
         assert_eq!(settings.durability, Durability::Immediate);
         assert_eq!(&*settings.domain, b"dc=2");
-        assert!(settings.text.is_some());
-        assert!(settings.ring.is_some());
         assert_eq!(settings.filter_overrides, vec![(3, None)]);
     }
 }

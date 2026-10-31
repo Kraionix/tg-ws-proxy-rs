@@ -175,6 +175,8 @@ pub(crate) fn store(
         max_total_bytes,
         compress,
         zstd_level: 3,
+        retention_anchor: logreel_file::RetentionAnchor::Clock,
+        on_warning: None,
     };
     FileStore::with_clock(config, clock).expect("open store")
 }

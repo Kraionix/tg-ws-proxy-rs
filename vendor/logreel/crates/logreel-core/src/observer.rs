@@ -1,12 +1,11 @@
 //! The second consumer the pipeline can carry.
 //!
-//! The text projection and the ring are built in because they are what a
-//! standalone user wants. An application that already owns a view of its
-//! records -- a text renderer with state, a ring of its own, a protocol line a
-//! deployment depends on -- supplies one of these instead of asking the
-//! library to grow a hook per use. The writer thread is the only caller, so
-//! the methods take `&mut self`: an observer needs no lock to keep state
-//! between records.
+//! Every application that shows its records -- a text line with state, a
+//! ring kept for a post-mortem dump, a protocol line a deployment depends on
+//! -- owns exactly one of these. The library keeps no view of its own: what a
+//! record means as text is the consumer's business. The writer thread is the
+//! only caller, so the methods take `&mut self`: an observer needs no lock to
+//! keep state between records.
 //!
 //! Ordering is the contract:
 //!
@@ -14,14 +13,14 @@
 //!   channel, before the sink filter decides whether the segment keeps it.
 //!   A view therefore sees records the disk may drop.
 //! * [Observer::flush] runs once after the batch it belongs to was handed to
-//!   the sink (or dropped by the sink filter), so a buffered text sink writes
+//!   the sink (or dropped by the sink filter), so a buffered consumer writes
 //!   once per batch rather than once per record.
 //! * [Observer::dump] runs after the channel was drained and the batch
 //!   flushed, which is what makes a dump from a signal show the records that
 //!   were queued when the signal arrived.
 //! * [Observer::overflow] runs with the number of records dropped since the
-//!   last report; the record it returns is rendered and written like any
-//!   other, which is how the log says its own channel was full.
+//!   last report; the record it returns joins the batch like any other,
+//!   which is how the log says its own channel was full.
 
 use crate::{Event, Record};
 

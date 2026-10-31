@@ -511,7 +511,6 @@ pub fn init(settings: Settings, disk: Option<Disk>) -> Result<Arc<LogHandle>, Lo
 
     let logger = logreel::init_with(
         logreel_settings(&settings, durability),
-        None,
         Some(Box::new(view)),
         sink,
     )
@@ -545,7 +544,6 @@ fn start_with_sink<S: logreel::BatchSink + 'static>(
     })?;
     let logger = logreel::init_with(
         logreel_settings(&settings, logreel::Durability::Eventual),
-        None,
         Some(Box::new(view)),
         Box::new(sink),
     )

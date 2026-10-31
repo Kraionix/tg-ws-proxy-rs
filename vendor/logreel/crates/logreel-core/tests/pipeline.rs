@@ -1,4 +1,4 @@
-//! Pipeline behaviour: filtering, drop counting, batching, shutdown, ring.
+//! Pipeline behaviour: filtering, drop counting, batching, shutdown.
 
 mod support;
 
@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use logreel_core::{Level, RingSettings, Settings, SharedSink, init};
-use support::{BlockingSink, TestEvent, render};
+use logreel_core::{Level, Settings, SharedSink, init};
+use support::{BlockingSink, TestEvent};
 
 fn base() -> logreel_core::SettingsBuilder {
     Settings::builder()
@@ -25,7 +25,6 @@ fn filtered_records_are_not_emitted() {
             .min_level(Level::Warn)
             .batch_max(64)
             .build(),
-        Some(render),
         Box::new(sink),
     )
     .expect("init");
@@ -48,7 +47,6 @@ fn full_channel_drops_and_counts() {
     let entered = Arc::clone(&sink.entered);
     let logger = init::<TestEvent>(
         base().channel_capacity(1).batch_max(1).build(),
-        Some(render),
         Box::new(sink),
     )
     .expect("init");
@@ -80,7 +78,6 @@ fn shutdown_drains_and_flushes() {
     let batches = sink.batches();
     let logger = init::<TestEvent>(
         base().channel_capacity(256).batch_max(1000).build(),
-        Some(render),
         Box::new(sink),
     )
     .expect("init");
@@ -102,7 +99,6 @@ fn batches_split_at_batch_max() {
     let batches = sink.batches();
     let logger = init::<TestEvent>(
         base().channel_capacity(64).batch_max(2).build(),
-        Some(render),
         Box::new(sink),
     )
     .expect("init");
@@ -122,7 +118,6 @@ fn sequence_is_monotonic_and_filtered_calls_do_not_consume_it() {
     let sink = SharedSink::new();
     let logger = init::<TestEvent>(
         base().min_level(Level::Warn).batch_max(64).build(),
-        Some(render),
         Box::new(sink),
     )
     .expect("init");
@@ -140,45 +135,11 @@ fn sequence_is_monotonic_and_filtered_calls_do_not_consume_it() {
 #[test]
 fn live_filter_changes_apply_to_the_handle() {
     let sink = SharedSink::new();
-    let logger = init::<TestEvent>(base().batch_max(64).build(), Some(render), Box::new(sink))
-        .expect("init");
+    let logger = init::<TestEvent>(base().batch_max(64).build(), Box::new(sink)).expect("init");
     let handle = Arc::clone(logger.handle());
     assert!(handle.emit(Level::Info, 0, 0, TestEvent::Empty));
     handle.filters().set(0, None);
     assert!(!handle.emit(Level::Info, 0, 0, TestEvent::Empty));
     assert!(handle.emit(Level::Info, 1, 0, TestEvent::Empty));
-    let _ = logger.shutdown();
-}
-
-#[test]
-fn ring_retains_rendered_lines() {
-    let sink = SharedSink::new();
-    let logger = init::<TestEvent>(
-        base()
-            .batch_max(1)
-            .flush_interval(Duration::from_millis(5))
-            .ring(RingSettings {
-                capacity: 8,
-                max_bytes: 4096,
-                floor: Level::Trace,
-            })
-            .build(),
-        Some(render),
-        Box::new(sink),
-    )
-    .expect("init");
-    let handle = Arc::clone(logger.handle());
-    assert!(handle.emit(Level::Info, 0, 42, TestEvent::Ping(7)));
-    assert!(handle.emit(Level::Info, 0, 0, TestEvent::Empty));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while handle.dump_ring().len() < 2 {
-        assert!(Instant::now() < deadline, "ring did not receive lines");
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    let lines = handle.dump_ring();
-    assert_eq!(lines.len(), 2);
-    assert!(lines[0].contains("ping 7"));
-    assert!(lines[0].contains("[conn=42]"));
-    assert!(lines[1].contains("empty"));
     let _ = logger.shutdown();
 }

@@ -55,6 +55,8 @@ fn main() {
         max_total_bytes: 0,
         compress: false,
         zstd_level: 3,
+        retention_anchor: logreel_file::RetentionAnchor::Clock,
+        on_warning: None,
     })
     .expect("open");
     let batch = batch();

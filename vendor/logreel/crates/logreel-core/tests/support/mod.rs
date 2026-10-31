@@ -45,17 +45,6 @@ impl Event for TestEvent {
     }
 }
 
-/// Render function for TestEvent.
-pub(crate) fn render(event: &TestEvent, out: &mut String) {
-    match event {
-        TestEvent::Ping(value) => {
-            out.push_str("ping ");
-            out.push_str(&value.to_string());
-        }
-        TestEvent::Empty => out.push_str("empty"),
-    }
-}
-
 /// A sink that blocks inside every write until released.
 #[derive(Clone)]
 pub(crate) struct BlockingSink {

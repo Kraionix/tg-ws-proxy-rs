@@ -16,7 +16,7 @@ set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 src=${1:-$repo/../logreel}
 dest=$repo/vendor/logreel
-crates=(logreel logreel-core logreel-derive logreel-store logreel-file)
+crates=(logreel logreel-core logreel-store logreel-file)
 
 if [ ! -f "$src/Cargo.toml" ] || [ ! -d "$src/crates/logreel-core" ]; then
     echo "sync-logreel: $src does not look like the logreel workspace" >&2
@@ -44,7 +44,19 @@ sed -i '/^logreel-store-redb = { workspace = true, optional = true }$/d' "$dest/
 sed -i '/^\/\/\/ Optional redb backend\.$/d' "$dest/crates/logreel/src/lib.rs"
 sed -i '/^#\[cfg(feature = "redb")\]$/d' "$dest/crates/logreel/src/lib.rs"
 sed -i '/^pub use logreel_store_redb as redb;$/d' "$dest/crates/logreel/src/lib.rs"
-sed -i 's/Enable text, ring, file, zstd or redb/Enable text, ring, file or zstd/' "$dest/crates/logreel/src/lib.rs"
+sed -i 's/Enable file, zstd or redb/Enable file or zstd/' "$dest/crates/logreel/src/lib.rs"
+# Patch 2: no derive macro.
+#
+# The proxy implements `logreel::Event` by hand over its prost schema: the
+# enum is a prost oneof whose tags are the event numbers, and the derive would
+# need every one of the 22 artifact messages to carry a second derive and its
+# own kind attribute, duplicating the numbers the schema already fixes.
+# Vendoring the macro would only put syn, quote and proc-macro2 in the build.
+sed -i '/^logreel-derive\.workspace = true$/d' "$dest/crates/logreel/Cargo.toml"
+sed -i '/^logreel-derive = { workspace = true }$/d' "$dest/crates/logreel/Cargo.toml"
+sed -i '/^pub use logreel_derive::Event;$/d' "$dest/crates/logreel/src/lib.rs"
+sed -i 's/logreel-core, the derive macro, and the optional segment file backend/logreel-core and the optional segment file backend/' "$dest/crates/logreel/src/lib.rs"
+
 # The three deleted lines left the file ending in a blank line, which rustfmt
 # --check rejects; strip it so the vendored tree formats exactly as upstream.
 sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$dest/crates/logreel/src/lib.rs"
@@ -57,7 +69,6 @@ resolver = "3"
 members = [
     "crates/logreel",
     "crates/logreel-core",
-    "crates/logreel-derive",
     "crates/logreel-store",
     "crates/logreel-file",
 ]
@@ -72,16 +83,12 @@ authors = ["logreel contributors"]
 
 [workspace.dependencies]
 logreel-core = { path = "crates/logreel-core", version = "=$version" }
-logreel-derive = { path = "crates/logreel-derive", version = "=$version" }
 logreel-store = { path = "crates/logreel-store", version = "=$version" }
 logreel-file = { path = "crates/logreel-file", version = "=$version" }
 logreel = { path = "crates/logreel", version = "=$version" }
 
 tokio = { version = "1.53", default-features = false, features = ["rt"] }
 zstd = "0.14"
-syn = { version = "2.0", features = ["full"] }
-quote = "1.0"
-proc-macro2 = "1.0"
 serde_json = "1.0.154"
 
 [workspace.lints.rust]
@@ -119,7 +126,7 @@ tools/sync-logreel.sh ../logreel
 | source commit | `@COMMIT@` |
 | source tree | `@TREE@` |
 | version | `@VERSION@` |
-| crates | `logreel`, `logreel-core`, `logreel-derive`, `logreel-store`, `logreel-file` |
+| crates | `logreel`, `logreel-core`, `logreel-store`, `logreel-file` |
 | fixtures | `fixtures/` (the file crate's conformance corpus) |
 
 ## Patches
@@ -129,6 +136,12 @@ tools/sync-logreel.sh ../logreel
    The proxy writes segments and has no use for a second storage engine, and a
    dependency the build can resolve but never use is one a rebuild may
    accidentally link.
+2. **No derive macro.** `logreel-derive` and its `logreel` re-export are
+   not vendored. The proxy implements `logreel::Event` by hand for its prost
+   oneof: the derive would require a second derive and a kind attribute on each
+   of the 22 schema messages, duplicating the tags the schema fixes. Vendoring
+   it would put `syn`, `quote` and `proc-macro2` in every build for a macro
+   this tree never expands.
 
 Nothing else differs from the source tree; `git diff` against the upstream
 commit is the check.
