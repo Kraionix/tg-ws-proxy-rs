@@ -253,3 +253,63 @@ fn the_compression_level_is_taken_from_the_config() {
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].5, b"opened");
 }
+
+#[test]
+fn prime_creates_the_day_file_and_takes_its_lock() {
+    let dir = TempDir::new("prime");
+    let clock: Arc<dyn logreel_file::Clock> = Arc::new(ManualClock::at(2026, 10, 31));
+    let config = logreel_file::FileStoreConfig {
+        directory: dir.path().to_path_buf(),
+        producer_id: 1,
+        session_nonce: 0,
+        keep_days: 7,
+        max_total_bytes: 0,
+        compress: false,
+        zstd_level: 3,
+    };
+    let mut first =
+        logreel_file::FileStore::with_clock(config.clone(), Arc::clone(&clock)).expect("open");
+    let path = first
+        .prime(1, 22, [0x42; 16])
+        .expect("the day file is created");
+    assert_eq!(path.file_name().unwrap(), "2026-10-31.seg");
+    assert_eq!(std::fs::metadata(&path).expect("exists").len(), 56);
+    assert_eq!(first.active_path(), Some(path.as_path()));
+
+    let mut second =
+        logreel_file::FileStore::with_clock(config, clock).expect("the second store opens");
+    let error = second.prime(1, 22, [0x42; 16]).expect_err("locked");
+    assert_eq!(error.kind(), logreel_store::ErrorKind::Locked);
+}
+
+#[test]
+fn a_batch_reads_back_with_its_records() {
+    let dir = TempDir::new("decoded");
+    let clock = Arc::new(ManualClock::at(2026, 10, 31));
+    {
+        let mut store = support::store(dir.path(), Arc::clone(&clock), 7, 0, false);
+        store.append(&sample_batch(1_000)).expect("append 1");
+        store.append(&sample_batch(2_000)).expect("append 2");
+        store.sync(Durability::Immediate).expect("sync");
+    }
+
+    let files = segments(dir.path()).expect("segments");
+    let mut reader = logreel_file::SegmentReader::open(&files[0]).expect("reader");
+    let first = reader
+        .next_decoded_batch()
+        .expect("first batch")
+        .expect("valid");
+    assert_eq!(first.batch.record_count, 2);
+    assert_eq!(first.records.len(), 2);
+    assert_eq!(first.records[0].seq, 1);
+    assert_eq!(first.records[0].kind, 0);
+    assert_eq!(first.records[0].payload, b"opened");
+    assert_eq!(first.records[1].conn_id, 42);
+
+    let second = reader
+        .next_decoded_batch()
+        .expect("second batch")
+        .expect("valid");
+    assert_eq!(second.batch.first_ts_ns, 2_000);
+    assert!(reader.next_decoded_batch().is_none(), "end of file");
+}

@@ -241,6 +241,25 @@ impl SegmentReader {
         }
     }
 
+    /// Read the next batch and decode its records.
+    ///
+    /// [SegmentReader::next_batch] hands back the payload opaque because a
+    /// backend only moves bytes. A reader that wants the records as well -- the
+    /// proxy's dump verb, which prints one JSON object per record inside the
+    /// batch that carried it -- would otherwise have to parse the envelope
+    /// itself, duplicating the one format this crate exists to own. Payloads are
+    /// copied out of the frame; the scan above stays the zero-copy path.
+    pub fn next_decoded_batch(&mut self) -> Option<Result<DecodedBatch, StoreError>> {
+        let batch = match self.next_batch()? {
+            Ok(batch) => batch,
+            Err(error) => return Some(Err(error)),
+        };
+        match decode_records(&batch.payload, batch.record_count) {
+            Ok(records) => Some(Ok(DecodedBatch { batch, records })),
+            Err(error) => Some(Err(error)),
+        }
+    }
+
     /// Turn the reader into a record stream.
     #[must_use]
     pub fn into_scan(self) -> Scan {
@@ -263,6 +282,53 @@ impl std::fmt::Debug for SegmentReader {
             .field("offset", &self.reader.offset)
             .finish()
     }
+}
+
+/// One record copied out of a frame, with its payload owned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedRecord {
+    /// Level byte, 0..=4.
+    pub level: u8,
+    /// Category index.
+    pub category: u8,
+    /// Absolute kind.
+    pub kind: u16,
+    /// Unix nanoseconds.
+    pub ts_ns: u64,
+    /// Per-process sequence.
+    pub seq: u32,
+    /// Connection id, 0 for none.
+    pub conn_id: u64,
+    /// Opaque payload bytes.
+    pub payload: Vec<u8>,
+}
+
+/// A validated batch together with its records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedBatch {
+    /// The batch as the file stores it.
+    pub batch: EncodedBatch,
+    /// Its records, in file order.
+    pub records: Vec<OwnedRecord>,
+}
+
+fn decode_records(payload: &[u8], count: u32) -> Result<Vec<OwnedRecord>, StoreError> {
+    let info = parse_batch(payload, 0)?;
+    let mut position = info.header_len;
+    let mut records = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let record = parse_record(payload, &mut position, 0)?;
+        records.push(OwnedRecord {
+            level: record.level,
+            category: record.category,
+            kind: record.kind,
+            ts_ns: record.ts_ns,
+            seq: record.seq,
+            conn_id: record.conn_id,
+            payload: record.payload.to_vec(),
+        });
+    }
+    Ok(records)
 }
 
 /// Zero-copy record stream over one segment.

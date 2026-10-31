@@ -914,15 +914,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "redb"
-version = "4.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb338a6c67830a61bed824b78c2bb034ab1ff401a20616bd7957524f4fdc2f22"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "regex-automata"
 version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1220,7 +1211,6 @@ dependencies = [
  "prost",
  "rand 0.9.5",
  "rcgen",
- "redb",
  "rustls",
  "rustls-pki-types",
  "serde_json",
@@ -1234,7 +1224,6 @@ dependencies = [
  "tungstenite",
  "url",
  "webpki-roots 0.26.11",
- "zstd",
 ]
 
 [[package]]

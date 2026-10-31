@@ -95,17 +95,17 @@ fn write_segment(dir: &Path) -> String {
     day_of(dir)
 }
 
-/// The one `<date>.redb` in `dir`, as its date.
+/// The one `<date>.seg` in `dir`, as its date.
 fn day_of(dir: &Path) -> String {
     let mut names: Vec<String> = fs::read_dir(dir)
         .expect("the directory exists")
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.ends_with(".redb"))
+        .filter(|name| name.ends_with(".seg"))
         .collect();
     names.sort();
     assert_eq!(names.len(), 1, "expected one segment, found {names:?}");
-    names.remove(0).trim_end_matches(".redb").to_string()
+    names.remove(0).trim_end_matches(".seg").to_string()
 }
 
 /// The binary under test, built by cargo for this test run.
@@ -132,7 +132,7 @@ fn objects(text: &str) -> Vec<serde_json::Value> {
 fn dump_segment_prints_the_documented_json_lines_and_changes_nothing() {
     let dir = TempDir::new("dump");
     let date = write_segment(dir.path());
-    let path = dir.path().join(format!("{date}.redb"));
+    let path = dir.path().join(format!("{date}.seg"));
     let before = fs::read(&path).expect("the segment exists");
 
     let (code, stdout, stderr) = run(&["dump-segment", dir.path().to_str().unwrap()]);
@@ -165,7 +165,7 @@ fn dump_segment_prints_the_documented_json_lines_and_changes_nothing() {
     // The point of the verb: the archive is exactly as it was.
     let after = fs::read(&path).expect("the segment still exists");
     assert!(before == after, "dump-segment changed the segment");
-    assert_eq!(dir.entries(), vec![format!("{date}.redb")]);
+    assert_eq!(dir.entries(), vec![format!("{date}.seg")]);
 }
 
 #[test]
@@ -180,7 +180,7 @@ fn probe_segment_summarises_a_directory_and_names_the_file_hash() {
     assert_eq!(printed.len(), 1, "printed: {stdout}");
     assert_eq!(printed[0]["type"], "segment");
     assert_eq!(printed[0]["date"], date.as_str());
-    assert_eq!(printed[0]["file"], format!("{date}.redb").as_str());
+    assert_eq!(printed[0]["file"], format!("{date}.seg").as_str());
     assert_eq!(printed[0]["batches"], 1);
     assert_eq!(printed[0]["records"], 3);
     assert_eq!(printed[0]["conns"], 3);
@@ -230,12 +230,12 @@ fn a_directory_without_segments_is_an_error_and_not_an_empty_answer() {
     let (code, stdout, stderr) = run(&["probe-segment", dir.path().to_str().unwrap()]);
     assert_ne!(code, 0);
     assert!(stdout.is_empty(), "stdout: {stdout}");
-    assert!(stderr.contains("no *.redb segments"), "stderr: {stderr}");
+    assert!(stderr.contains("no *.seg segments"), "stderr: {stderr}");
 
     let (code, stdout, stderr) = run(&["dump-segment", dir.path().to_str().unwrap()]);
     assert_ne!(code, 0);
     assert!(stdout.is_empty(), "stdout: {stdout}");
-    assert!(stderr.contains("no *.redb segments"), "stderr: {stderr}");
+    assert!(stderr.contains("no *.seg segments"), "stderr: {stderr}");
 }
 
 #[test]
@@ -250,5 +250,5 @@ fn a_date_without_a_segment_names_the_file_it_looked_for() {
         "2001-01-01",
     ]);
     assert_ne!(code, 0);
-    assert!(stderr.contains("no 2001-01-01.redb"), "stderr: {stderr}");
+    assert!(stderr.contains("no 2001-01-01.seg"), "stderr: {stderr}");
 }

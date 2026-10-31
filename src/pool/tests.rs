@@ -113,7 +113,7 @@ async fn a_miss_is_recorded_against_the_pool_rather_than_the_caller() {
         .expect("the segment directory")
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .find_map(|name| name.strip_suffix(".redb").map(str::to_string))
+        .find_map(|name| name.strip_suffix(".seg").map(str::to_string))
         .expect("one segment for today");
 
     let records: Vec<_> = crate::log::storage::iter_batches(&dir, &day)
@@ -254,7 +254,7 @@ async fn discards_warmup_and_refills_are_recorded() {
         .expect("the segment directory")
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .find_map(|name| name.strip_suffix(".redb").map(str::to_string))
+        .find_map(|name| name.strip_suffix(".seg").map(str::to_string))
         .expect("one segment for today");
 
     let records: Vec<_> = crate::log::storage::iter_batches(&dir, &day)

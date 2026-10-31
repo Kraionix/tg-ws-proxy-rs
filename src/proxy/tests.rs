@@ -379,7 +379,7 @@ async fn a_ladder_walk_lands_in_the_segment_as_attempts_and_fallbacks() {
         .expect("the segment directory")
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .find_map(|name| name.strip_suffix(".redb").map(str::to_string))
+        .find_map(|name| name.strip_suffix(".seg").map(str::to_string))
         .expect("one segment for today");
 
     let records: Vec<_> = crate::log::storage::iter_batches(&dir, &day)
@@ -553,7 +553,7 @@ async fn the_aligned_levels_land_in_the_segment() {
         .expect("the segment directory")
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .find_map(|name| name.strip_suffix(".redb").map(str::to_string))
+        .find_map(|name| name.strip_suffix(".seg").map(str::to_string))
         .expect("one segment for today");
 
     let records: Vec<_> = crate::log::storage::iter_batches(&dir, &day)
@@ -730,7 +730,7 @@ async fn a_session_with_nowhere_to_route_closes_as_no_route() {
         .expect("the segment directory")
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .find_map(|name| name.strip_suffix(".redb").map(str::to_string))
+        .find_map(|name| name.strip_suffix(".seg").map(str::to_string))
         .expect("one segment for today");
 
     let records: Vec<_> = crate::log::storage::iter_batches(&dir, &day)

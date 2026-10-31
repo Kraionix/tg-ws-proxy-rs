@@ -1538,9 +1538,7 @@ impl Drop for TempDir {
     }
 }
 
-/// `(ts_first_ns, seq)` is the `STOR:main` key, so every synthetic batch needs
-/// its own: a fixture that reused one would silently overwrite batches and make
-/// half these tests pass for the wrong reason.
+/// A fresh `(ts_ns, seq)` pair, so two synthetic batches never look alike.
 #[cfg(feature = "log-disk")]
 fn next_stamp() -> (u64, u32) {
     static NEXT: AtomicUsize = AtomicUsize::new(1);
@@ -1639,43 +1637,73 @@ fn open_sink(dir: &Path, options: Options) -> FileSink {
     FileSink::open(dir, options).expect("the sink opens")
 }
 
+/// A clock the tests move by hand, so a rotation is one assignment away.
+#[cfg(feature = "log-disk")]
+struct ManualClock(std::sync::Mutex<u64>);
+
+#[cfg(feature = "log-disk")]
+impl ManualClock {
+    fn at(day: i64) -> Self {
+        Self(std::sync::Mutex::new(day as u64 * 86_400_000_000_000))
+    }
+
+    fn set(&self, day: i64) {
+        *self.0.lock().expect("clock lock") = day as u64 * 86_400_000_000_000;
+    }
+}
+
+#[cfg(feature = "log-disk")]
+impl logreel::file::Clock for ManualClock {
+    fn now_ns(&self) -> u64 {
+        *self.0.lock().expect("clock lock")
+    }
+}
+
 #[cfg(feature = "log-disk")]
 #[test]
 fn a_segment_from_another_schema_is_refused_rather_than_appended_to() {
-    use redb::{Database, TableDefinition};
-
-    const META: TableDefinition<&str, &[u8]> = TableDefinition::new("STOR:meta");
-
     let dir = TempDir::new("schema-guard");
-    let path = dir
-        .path()
-        .join(format!("{}.redb", storage::day_name(storage::today())));
-
-    // A segment this build wrote and then left is the ordinary restart: the
-    // same day's file is reopened and appended to.
-    drop(open_sink(dir.path(), Options::default()));
-    open_sink(dir.path(), Options::default());
-
-    // Rewrite its fingerprint into one no build of this source ever wrote, which
-    // is what a segment from an older schema looks like from here.
-    let db = Database::open(&path).expect("the segment reopens for the edit");
-    let write = db.begin_write().expect("a write transaction");
-    {
-        let mut table = write.open_table(META).expect("the meta table");
-        table
-            .insert("schema_hash", 0u64.to_le_bytes().as_slice())
-            .expect("the fingerprint is written");
-    }
-    write.commit().expect("the edit commits");
-    drop(db);
-
-    let error = match FileSink::open(dir.path(), Options::default()) {
-        Ok(_) => panic!("a segment from another schema must not be appended to"),
-        Err(error) => error,
+    // The same compression mode the sink will ask for: a mode mismatch is its
+    // own refusal, and this test is about the fingerprint.
+    let compress = {
+        #[cfg(feature = "log-zstd")]
+        {
+            true
+        }
+        #[cfg(not(feature = "log-zstd"))]
+        {
+            false
+        }
     };
-    let message = error.to_string();
-    assert!(message.contains("different log schema"), "{message}");
-    assert!(message.contains("move it out"), "{message}");
+    let foreign = logreel::file::FileStoreConfig {
+        directory: dir.path().to_path_buf(),
+        producer_id: 1,
+        session_nonce: 0,
+        keep_days: 0,
+        max_total_bytes: 0,
+        compress,
+        zstd_level: 3,
+    };
+    let mut store = logreel::file::FileStore::open(foreign).expect("the foreign store opens");
+    store
+        .prime(<Event as logreel::Event>::CODEC_ID, 22, [0xEE; 16])
+        .expect("today's file is created with a foreign fingerprint");
+    drop(store);
+
+    // A segment this build wrote is the ordinary restart: the same day's file
+    // is reopened and appended to.
+    let ours = TempDir::new("schema-guard-ok");
+    drop(open_sink(ours.path(), Options::default()));
+    open_sink(ours.path(), Options::default());
+
+    match FileSink::open(dir.path(), Options::default()) {
+        Ok(_) => panic!("a segment from another schema must not be appended to"),
+        Err(LogError::Segment(message)) => {
+            assert!(message.contains("schema hash"), "{message}");
+            assert!(message.contains("differs"), "{message}");
+        }
+        Err(other) => panic!("expected a refused segment, got {other}"),
+    }
 }
 
 #[cfg(feature = "log-disk")]
@@ -1697,42 +1725,6 @@ fn a_segment_round_trips_every_batch() {
 
 #[cfg(feature = "log-disk")]
 #[test]
-fn the_by_conn_index_returns_exactly_one_session() {
-    let dir = TempDir::new("byconn");
-    let day = storage::today();
-    let mut sink = open_sink(dir.path(), Options::default());
-
-    let mine = batch_of(&[7]);
-    sink.write(&mine).expect("written");
-    sink.write(&batch_of(&[8, 9])).expect("written");
-    sink.write(&batch_of(&[7, 10])).expect("written");
-    drop(sink);
-
-    let date = storage::day_name(day);
-    let mine_back = storage::iter_conn_batches(dir.path(), &date, 7).expect("readable");
-    assert_eq!(mine_back.len(), 2, "two batches mention connection 7");
-    assert_eq!(mine_back[0], mine);
-    assert!(
-        mine_back
-            .iter()
-            .all(|batch| batch.header.as_ref().expect("header").conn_ids.contains(&7))
-    );
-
-    assert_eq!(
-        storage::iter_conn_batches(dir.path(), &date, 8)
-            .expect("readable")
-            .len(),
-        1
-    );
-    assert!(
-        storage::iter_conn_batches(dir.path(), &date, 99)
-            .expect("readable")
-            .is_empty()
-    );
-}
-
-#[cfg(feature = "log-disk")]
-#[test]
 fn a_restart_inside_the_same_day_appends_to_the_same_segment() {
     let dir = TempDir::new("restart");
     let day = storage::today();
@@ -1749,7 +1741,7 @@ fn a_restart_inside_the_same_day_appends_to_the_same_segment() {
 
     assert_eq!(
         dir.entries(),
-        vec![format!("{}.redb", storage::day_name(day))],
+        vec![format!("{}.seg", storage::day_name(day))],
         "one segment for the day, not one per run"
     );
     assert_eq!(
@@ -1812,42 +1804,51 @@ fn a_record_emitted_while_the_writer_is_stopping_still_reaches_the_sink() {
 }
 
 #[cfg(feature = "log-disk")]
-#[cfg(not(feature = "log-zstd"))]
-#[test]
-fn a_build_without_zstd_names_the_build_that_could_read_a_compressed_batch() {
-    // The framing byte is part of the on-disk format whatever this build can
-    // do, so a compressed batch is recognised and explained: reporting it as
-    // corruption would send the operator looking for damage that is not there.
-    let error = storage::decode(&[1, 0x28, 0xb5, 0x2f, 0xfd, 0x00]).expect_err("no zstd here");
-    let message = error.to_string();
-    assert!(message.contains("log-zstd"), "{message}");
-}
-
-#[cfg(feature = "log-disk")]
 #[cfg(feature = "log-zstd")]
 #[test]
 fn zstd_shrinks_a_rich_batch_and_round_trips_it() {
     let batch = rich_batch();
+    let day = storage::day_name(storage::today());
 
-    let raw = storage::encode(&batch, Compression::None).expect("encoded");
-    let compressed = storage::encode(&batch, Compression::ZstdL1).expect("encoded");
-
-    assert_eq!(storage::decode(&raw).expect("decoded"), batch);
-    assert_eq!(storage::decode(&compressed).expect("decoded"), batch);
-    assert_eq!(raw[0], 0, "the framing byte says raw");
-    assert_eq!(compressed[0], 1, "the framing byte says zstd");
-    assert!(
-        compressed.len() < raw.len(),
-        "zstd grew the batch: {} vs {} bytes",
-        compressed.len(),
-        raw.len()
+    let plain_dir = TempDir::new("zstd-plain");
+    let mut plain = open_sink(
+        plain_dir.path(),
+        Options {
+            compress: Compression::None,
+            ..Options::default()
+        },
     );
+    plain.write(&batch).expect("written");
+    drop(plain);
 
+    let packed_dir = TempDir::new("zstd-packed");
+    let mut packed = open_sink(
+        packed_dir.path(),
+        Options {
+            compress: Compression::ZstdL1,
+            ..Options::default()
+        },
+    );
+    packed.write(&batch).expect("written");
+    drop(packed);
+
+    let raw = fs::metadata(plain_dir.path().join(format!("{day}.seg")))
+        .expect("the plain segment")
+        .len();
+    let compressed = fs::metadata(packed_dir.path().join(format!("{day}.seg")))
+        .expect("the compressed segment")
+        .len();
+    assert!(
+        compressed < raw,
+        "zstd grew the segment: {compressed} vs {raw} bytes"
+    );
+    assert_eq!(
+        storage::iter_batches(packed_dir.path(), &day).expect("readable"),
+        vec![batch]
+    );
     println!(
-        "batch: {} B raw, {} B zstd ({}%)",
-        raw.len(),
-        compressed.len(),
-        compressed.len() * 100 / raw.len()
+        "segment: {raw} B plain, {compressed} B zstd ({}%)",
+        compressed * 100 / raw
     );
 }
 
@@ -1931,7 +1932,7 @@ fn a_second_sink_on_the_same_directory_is_refused() {
     let second = FileSink::open(dir.path(), Options::default());
     match second {
         Err(LogError::WriterConflict(path)) => {
-            assert!(path.ends_with(format!("{}.redb", storage::day_name(storage::today()))));
+            assert!(path.ends_with(format!("{}.seg", storage::day_name(storage::today()))));
         }
         Err(other) => panic!("expected a writer conflict, got {other}"),
         Ok(_) => panic!("a second writer took the segment"),
@@ -1943,29 +1944,34 @@ fn a_second_sink_on_the_same_directory_is_refused() {
 fn the_segment_records_its_provenance() {
     let dir = TempDir::new("meta");
     let date = storage::day_name(storage::today());
-    drop(open_sink(dir.path(), Options::default()));
+    let mut sink = open_sink(dir.path(), Options::default());
+    sink.write(&batch_of(&[1])).expect("written");
+    drop(sink);
 
-    let version = storage::meta(dir.path(), &date, "app_version")
-        .expect("readable")
-        .expect("app_version is written");
-    assert_eq!(version, env!("CARGO_PKG_VERSION").as_bytes());
+    let path = dir.path().join(format!("{date}.seg"));
+    let mut reader = logreel::file::SegmentReader::open(&path).expect("readable");
+    let header = reader.header();
+    assert_eq!(header.codec_id, <Event as logreel::Event>::CODEC_ID);
+    assert_eq!(header.kind_count, <Event as logreel::Event>::KINDS);
+    assert_eq!(header.schema_hash, <Event as logreel::Event>::SCHEMA_HASH);
 
-    assert_eq!(
-        storage::meta(dir.path(), &date, "writer_protocol")
-            .expect("readable")
-            .expect("writer_protocol is written"),
-        storage::WRITER_PROTOCOL.to_le_bytes()
-    );
-    assert_eq!(
-        storage::meta(dir.path(), &date, "schema_hash")
-            .expect("readable")
-            .expect("schema_hash is written"),
-        fingerprint().to_le_bytes()
+    let batch = reader
+        .next_decoded_batch()
+        .expect("a batch")
+        .expect("valid")
+        .batch;
+    let domain = String::from_utf8_lossy(&batch.domain);
+    assert!(
+        domain.contains(env!("CARGO_PKG_VERSION")),
+        "the domain names the app version: {domain}"
     );
     assert!(
-        storage::meta(dir.path(), &date, "created_ns")
-            .expect("readable")
-            .is_some()
+        domain.contains(&format!("schema={}", schema::SCHEMA_VERSION)),
+        "{domain}"
+    );
+    assert!(
+        domain.contains(&format!("protocol={}", storage::WRITER_PROTOCOL)),
+        "{domain}"
     );
 }
 
@@ -1988,8 +1994,11 @@ fn retention_deletes_expired_segments_and_nothing_else() {
     let today = storage::today();
     let mut expected = Vec::new();
 
-    for age in 0..12 {
-        let name = format!("{}.redb", storage::day_name(today - age));
+    // Placeholders older than today. The sweep only reads names, so an empty
+    // file stands in for a day this run did not write; today's file has to be
+    // a real segment, because the sink opens it.
+    for age in 1..12 {
+        let name = format!("{}.seg", storage::day_name(today - age));
         fs::write(dir.path().join(&name), b"").expect("a placeholder segment");
         if age < 7 {
             expected.push(name);
@@ -2005,6 +2014,7 @@ fn retention_deletes_expired_segments_and_nothing_else() {
         },
     ));
 
+    expected.push(format!("{}.seg", storage::day_name(today)));
     expected.push("notes.txt".to_string());
     expected.sort();
     assert_eq!(dir.entries(), expected, "seven days kept, the rest swept");
@@ -2015,7 +2025,7 @@ fn retention_deletes_expired_segments_and_nothing_else() {
 fn retention_zero_keeps_everything() {
     let dir = TempDir::new("keepall");
     let today = storage::today();
-    let ancient = format!("{}.redb", storage::day_name(today - 400));
+    let ancient = format!("{}.seg", storage::day_name(today - 400));
     fs::write(dir.path().join(&ancient), b"").expect("a placeholder segment");
 
     drop(open_sink(
@@ -2059,7 +2069,7 @@ fn a_clock_in_the_future_does_not_sweep_the_archive() {
     for age in [1, 5, 40] {
         fs::write(
             dir.path()
-                .join(format!("{}.redb", storage::day_name(today - age))),
+                .join(format!("{}.seg", storage::day_name(today - age))),
             b"",
         )
         .expect("a placeholder segment");
@@ -2069,15 +2079,15 @@ fn a_clock_in_the_future_does_not_sweep_the_archive() {
 
     let kept = dir.entries();
     assert!(
-        kept.contains(&format!("{}.redb", storage::day_name(today - 1))),
+        kept.contains(&format!("{}.seg", storage::day_name(today - 1))),
         "a clock from the future swept the newest segment: {kept:?}"
     );
     assert!(
-        kept.contains(&format!("{}.redb", storage::day_name(today - 5))),
+        kept.contains(&format!("{}.seg", storage::day_name(today - 5))),
         "a segment inside the window was swept: {kept:?}"
     );
     assert!(
-        !kept.contains(&format!("{}.redb", storage::day_name(today - 40))),
+        !kept.contains(&format!("{}.seg", storage::day_name(today - 40))),
         "a segment outside the window was kept: {kept:?}"
     );
 }
@@ -2094,14 +2104,14 @@ fn a_clock_that_boots_in_the_past_does_not_delete_this_runs_segment() {
     let today = storage::today();
     let ours = today - 5_000;
     fs::write(
-        dir.path().join(format!("{}.redb", storage::day_name(ours))),
+        dir.path().join(format!("{}.seg", storage::day_name(ours))),
         b"",
     )
     .expect("the segment this run would have written");
     for age in [1, 30] {
         fs::write(
             dir.path()
-                .join(format!("{}.redb", storage::day_name(today - age))),
+                .join(format!("{}.seg", storage::day_name(today - age))),
             b"",
         )
         .expect("a placeholder segment");
@@ -2111,12 +2121,12 @@ fn a_clock_that_boots_in_the_past_does_not_delete_this_runs_segment() {
 
     let kept = dir.entries();
     assert!(
-        kept.contains(&format!("{}.redb", storage::day_name(ours))),
+        kept.contains(&format!("{}.seg", storage::day_name(ours))),
         "the sweep deleted the segment this run wrote: {kept:?}"
     );
-    assert!(kept.contains(&format!("{}.redb", storage::day_name(today - 1))));
+    assert!(kept.contains(&format!("{}.seg", storage::day_name(today - 1))));
     assert!(
-        !kept.contains(&format!("{}.redb", storage::day_name(today - 30))),
+        !kept.contains(&format!("{}.seg", storage::day_name(today - 30))),
         "a segment outside the window was kept: {kept:?}"
     );
 }
@@ -2126,11 +2136,13 @@ fn a_clock_that_boots_in_the_past_does_not_delete_this_runs_segment() {
 fn rotation_moves_to_the_next_day_without_losing_the_previous_one() {
     let dir = TempDir::new("rotation");
     let today = storage::today();
-    let mut sink = open_sink(dir.path(), Options::default());
+    let clock = std::sync::Arc::new(ManualClock::at(today));
+    let mut sink = FileSink::open_with_clock(dir.path(), Options::default(), clock.clone())
+        .expect("the sink opens");
 
     let first = batch_of(&[1]);
     sink.write(&first).expect("written");
-    sink.rotate(today + 1).expect("rotation opens the next day");
+    clock.set(today + 1);
     let second = batch_of(&[2]);
     sink.write(&second).expect("written");
     drop(sink);
@@ -2138,8 +2150,8 @@ fn rotation_moves_to_the_next_day_without_losing_the_previous_one() {
     assert_eq!(
         dir.entries(),
         vec![
-            format!("{}.redb", storage::day_name(today)),
-            format!("{}.redb", storage::day_name(today + 1)),
+            format!("{}.seg", storage::day_name(today)),
+            format!("{}.seg", storage::day_name(today + 1)),
         ]
     );
     assert_eq!(
@@ -2162,7 +2174,7 @@ fn a_segment_is_owner_only() {
     let date = storage::day_name(storage::today());
     drop(open_sink(dir.path(), Options::default()));
 
-    let mode = fs::metadata(dir.path().join(format!("{date}.redb")))
+    let mode = fs::metadata(dir.path().join(format!("{date}.seg")))
         .expect("the segment exists")
         .permissions()
         .mode()
@@ -2199,21 +2211,16 @@ fn records_written_through_the_pipeline_are_readable_back() {
 #[cfg(feature = "log-disk")]
 #[test]
 fn an_empty_segment_reads_back_as_an_empty_day() {
-    // redb creates a table on its first write, so a segment that never took a
-    // record has no `STOR:main` at all. Refusing to read it would turn "nothing
-    // happened today" into a corrupt-file error — and `--log-level error` over
-    // a healthy proxy is exactly a day with nothing in it.
+    // The sink creates today's file at startup, header and lock and nothing
+    // else. Refusing to read it would turn "nothing happened today" into a
+    // corrupt-file error — and `--log-level error` over a healthy proxy is
+    // exactly a day with nothing in it.
     let dir = TempDir::new("empty");
     let date = storage::day_name(storage::today());
     drop(open_sink(dir.path(), Options::default()));
 
     assert!(
         storage::iter_batches(dir.path(), &date)
-            .expect("an empty day is readable")
-            .is_empty()
-    );
-    assert!(
-        storage::iter_conn_batches(dir.path(), &date, 1)
             .expect("an empty day is readable")
             .is_empty()
     );
@@ -2303,7 +2310,7 @@ async fn the_text_floor_is_the_text_views_own_policy() {
 
 #[cfg(feature = "log-disk")]
 #[test]
-fn a_truncated_segment_is_refused_rather_than_half_read() {
+fn a_segment_with_a_torn_tail_reads_its_valid_prefix() {
     let dir = TempDir::new("truncated");
     let date = storage::day_name(storage::today());
     let mut sink = open_sink(dir.path(), Options::default());
@@ -2312,7 +2319,7 @@ fn a_truncated_segment_is_refused_rather_than_half_read() {
     }
     drop(sink);
 
-    let path = dir.path().join(format!("{date}.redb"));
+    let path = dir.path().join(format!("{date}.seg"));
     let segment = fs::read(&path).expect("the segment exists");
     assert_eq!(
         storage::iter_batches(dir.path(), &date)
@@ -2321,19 +2328,43 @@ fn a_truncated_segment_is_refused_rather_than_half_read() {
         4
     );
 
-    // redb keeps its commit slots at the head of the file and the pages they
-    // point at after them, so cutting the tail off does not leave the earlier
-    // commits readable: the file stops being a database at all. That is the
-    // behaviour worth pinning — the alternative is a repair that accepts the
-    // damage and silently drops whatever it cannot reach.
-    for divisor in [2, 4, 8, 16] {
-        fs::write(&path, &segment[..segment.len() / divisor]).expect("truncated");
-        let outcome = storage::iter_batches(dir.path(), &date);
-        assert!(
-            matches!(outcome, Err(LogError::Segment(_))),
-            "a segment truncated to 1/{divisor} read back as {outcome:?}"
-        );
-    }
+    // A tail cut inside the last frame is the shape a power cut leaves: the
+    // frames before it are still exactly what was written, and the reader stops
+    // at the last whole one rather than calling the file corrupt.
+    fs::write(&path, &segment[..segment.len() - 8]).expect("a torn tail");
+    let batches = storage::iter_batches(dir.path(), &date).expect("the prefix reads");
+    assert!(batches.len() < 4, "a torn frame was read as a batch");
+    assert!(!batches.is_empty(), "the valid prefix was thrown away");
+
+    // A file shorter than the header is not a segment at all.
+    fs::write(&path, &segment[..20]).expect("a stub");
+    assert!(matches!(
+        storage::iter_batches(dir.path(), &date),
+        Err(LogError::Segment(_))
+    ));
+}
+
+#[cfg(feature = "log-disk")]
+#[test]
+fn a_corrupt_frame_is_refused_rather_than_half_read() {
+    let dir = TempDir::new("corrupt");
+    let date = storage::day_name(storage::today());
+    let mut sink = open_sink(dir.path(), Options::default());
+    sink.write(&batch_of(&[1])).expect("written");
+    drop(sink);
+
+    let path = dir.path().join(format!("{date}.seg"));
+    let mut segment = fs::read(&path).expect("the segment exists");
+    // The payload starts after the header and the 8-byte frame header; flipping
+    // a byte there keeps the lengths intact and breaks the checksum.
+    let last = segment.len() - 1;
+    segment[last] ^= 0xFF;
+    fs::write(&path, &segment).expect("corrupted");
+
+    assert!(matches!(
+        storage::iter_batches(dir.path(), &date),
+        Err(LogError::Segment(_))
+    ));
 }
 
 #[cfg(feature = "log-disk")]
@@ -2366,7 +2397,7 @@ fn reading_a_segment_leaves_its_bytes_alone() {
     handle.emit(1, Category::Session, Level::Info, pool_hit(2));
     runtime.block_on(handle.shutdown());
 
-    let path = dir.path().join(format!("{date}.redb"));
+    let path = dir.path().join(format!("{date}.seg"));
     let before = fs::read(&path).expect("the segment exists");
 
     let batches = storage::iter_batches(dir.path(), &date).expect("readable");
@@ -2389,9 +2420,9 @@ fn reading_a_segment_leaves_its_bytes_alone() {
         after.len()
     );
 
-    // And the copy the read is made from goes with the read: the directory
-    // holds the segment and nothing else.
-    assert_eq!(dir.entries(), vec![format!("{date}.redb")]);
+    // And the copy the old reader made of the file is gone with it: the
+    // directory holds the segment and nothing else.
+    assert_eq!(dir.entries(), vec![format!("{date}.seg")]);
 }
 
 /// The connection counter is 32 bits wide, because the MIPS release targets

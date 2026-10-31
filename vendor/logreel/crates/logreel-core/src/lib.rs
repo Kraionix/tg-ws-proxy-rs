@@ -44,7 +44,9 @@ pub use settings::{
 };
 pub use time::{format_utc, now_ns};
 
-pub use logreel_store::{BatchSink, Durability, EncodedBatch, SharedSink, Store, StoreError};
+pub use logreel_store::{
+    BatchSink, Durability, EncodedBatch, ErrorKind, SharedSink, Store, StoreError,
+};
 
 /// Emit an event through the task-local scope.
 ///

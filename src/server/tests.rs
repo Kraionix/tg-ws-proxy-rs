@@ -62,7 +62,7 @@ async fn the_domain_list_records_where_it_came_from() {
         .expect("the segment directory")
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .find_map(|name| name.strip_suffix(".redb").map(str::to_string))
+        .find_map(|name| name.strip_suffix(".seg").map(str::to_string))
         .expect("one segment for today");
 
     let records: Vec<_> = crate::log::storage::iter_batches(&dir, &day)

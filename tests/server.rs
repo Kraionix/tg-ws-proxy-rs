@@ -226,7 +226,7 @@ async fn a_log_dir_gets_todays_segment() {
         .collect();
     segments.sort();
     assert_eq!(segments.len(), 1, "one segment per day: {segments:?}");
-    assert!(segments[0].ends_with(".redb"), "{segments:?}");
+    assert!(segments[0].ends_with(".seg"), "{segments:?}");
 
     std::fs::remove_dir_all(&dir).expect("the temp dir is ours");
 }

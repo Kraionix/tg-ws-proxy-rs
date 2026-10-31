@@ -847,6 +847,11 @@ fn structured_log_defaults_are_the_documented_ones() {
     assert_eq!(settings.batch_max, 256);
     assert_eq!(settings.flush_interval, Duration::from_secs(2));
     assert!(!settings.flush_on_warn);
+    // The default follows the build: a binary that links the codec compresses
+    // unless the operator says otherwise.
+    #[cfg(feature = "log-zstd")]
+    assert_eq!(options.compress, Compression::ZstdL1);
+    #[cfg(not(feature = "log-zstd"))]
     assert_eq!(options.compress, Compression::None);
     assert_eq!(options.durability, DurabilityMode::Eventual);
     assert_eq!(options.retention_days, 7);
@@ -955,6 +960,9 @@ fn durability_and_retention_reach_the_storage_options() {
     ]);
 
     let options = cfg.log_options();
+    #[cfg(feature = "log-zstd")]
+    assert_eq!(options.compress, Compression::ZstdL1, "the default mode");
+    #[cfg(not(feature = "log-zstd"))]
     assert_eq!(options.compress, Compression::None, "the default mode");
     assert_eq!(options.durability, DurabilityMode::Immediate);
     assert_eq!(options.retention_days, 0, "0 keeps every segment");

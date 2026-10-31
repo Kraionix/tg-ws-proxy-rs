@@ -1,96 +1,53 @@
-//! Day-segment storage: one redb file per UTC day, behind the `BatchSink` seam.
+//! Day-segment storage: one append-only `.seg` file per UTC day, behind the
+//! writer's sink seam.
 //!
 //! # Why a file per day
 //!
 //! A day is the unit an operator reasons in ("what happened yesterday"), it is
 //! what retention counts, and it is the cheapest thing to delete. Rotation is
 //! then a file boundary rather than a compaction pass, and the file name
-//! (`2026-10-11.redb`) is the index over the whole directory — both for the
+//! (`2026-10-11.seg`) is the index over the whole directory — both for the
 //! reader and for the sweep that removes old ones.
 //!
-//! # Why redb
+//! # What a file is
 //!
-//! It is pure Rust, which matters more than anything else here: the same crate
-//! has to cross-build for `aarch64-unknown-linux-musl`, `armv7`, `mipsel` and
-//! the macOS targets, and a C storage engine would drag a cross toolchain into
-//! every one of them on top of the one `ring` and `zstd` already need. It also
-//! gives typed keys (so `(conn_id, ts)` is a key, not a hand-rolled big-endian
-//! byte layout) and per-transaction durability, which is what `--log-durability`
-//! is.
-//!
-//! # What a value is
-//!
-//! One byte of framing followed by an encoded `LogBatch`. The framing byte says
-//! whether the rest is raw or a zstd frame, which is worth a byte per batch: it
-//! lets `--log-compress` change between runs without making the previous
-//! segment unreadable, and it means the reader never has to guess from the
-//! first byte of a protobuf message.
+//! logreel's segment format v1: a 56-byte header, then frames of
+//! `u32 length`, `u32 crc32c` and payload. A payload is a batch of records,
+//! each with a 17–19 byte envelope around the event's `prost` encoding; a frame
+//! may be zstd-compressed and the header says whether the file may carry any.
+//! None of that is written here: [`logreel_file::FileStore`] owns the file,
+//! while this module converts a [`LogBatch`] into the records the library
+//! encodes and appends. The point of the split is that the proxy no longer has
+//! a storage engine to reason about, only a sink to configure.
 //!
 //! # Durability, honestly
 //!
-//! redb has two levels, `Immediate` (fsync before commit returns) and `None` (a
-//! commit that lives in this process's memory). A `None` commit becomes
-//! persistent when a later `Immediate` commit follows it — so `eventual` here
-//! is not "never fsync", it is "fsync every [`EVENTUAL_SYNC_INTERVAL`] instead
-//! of on every flush", and a clean close always syncs. The loss window under
-//! sudden power loss is therefore the sync interval, not a flush.
+//! `eventual` is an fsync at most every 30 seconds; `immediate` fsyncs before
+//! the batch returns. A clean stop always syncs, so the loss window under a
+//! power cut is the sync interval, not a flush.
 
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::ErrorKind;
+use std::fs::{self, DirBuilder};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use logreel::file::{FileStore, FileStoreConfig, SegmentReader};
+use logreel::{BatchEncoder, Durability, ErrorKind, Event as _, Record, Store as _};
 
 use super::LogError;
-use super::schema::{LogBatch, fingerprint};
+use super::schema::{self, BatchHeader, Event, LogBatch, LogRecord};
 use super::writer::{BatchSink, WriterError};
 
-/// All batches of the segment, ordered by time.
-///
-/// `(ts_first_ns, seq)` — the batch's earliest timestamp, with the sequence
-/// number of its first record as the tie-break, so lexicographic order is
-/// temporal order and no two batches ever share a key.
-const MAIN: TableDefinition<(u64, u32), &[u8]> = TableDefinition::new("STOR:main");
-
-/// Per-session index: `(conn_id, ts_first_ns)` → the `STOR:main` key. A prefix
-/// scan on `conn_id` answers "everything that happened to this connection"
-/// without decoding the segment.
-const BY_CONN: TableDefinition<(u64, u64), (u64, u32)> = TableDefinition::new("STOR:by_conn");
-
-/// Segment metadata, written once at open and never updated.
-const META: TableDefinition<&str, &[u8]> = TableDefinition::new("STOR:meta");
-
-const META_SCHEMA_HASH: &str = "schema_hash";
-const META_APP_VERSION: &str = "app_version";
-const META_CREATED_NS: &str = "created_ns";
-const META_WRITER_PROTOCOL: &str = "writer_protocol";
-
-/// Value framing: the payload is a `LogBatch` as encoded, or a zstd frame of one.
-const VALUE_RAW: u8 = 0;
-const VALUE_ZSTD: u8 = 1;
-
-/// Container version: the value framing, the table names and the key layout.
+/// Container version: the file format, the domain fields and the envelope.
 /// Independent of `schema::SCHEMA_VERSION`, which is about the records inside.
 pub const WRITER_PROTOCOL: u32 = 1;
 
 /// Segments kept by default, counting today.
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
 
-/// zstd level 1 — the artifact's `CONST:ZSTD_LEVEL_L1`, chosen for a router's
-/// CPU rather than for the last few percent of ratio.
-#[cfg(feature = "log-zstd")]
+/// zstd level 1 — chosen for a router's CPU rather than for the last few
+/// percent of ratio.
 const ZSTD_LEVEL: i32 = 1;
-
-/// redb defaults to a 1 GiB cache. This ships on devices with 64 MB of RAM.
-const CACHE_SIZE: usize = 4 * 1024 * 1024;
-
-/// How often `eventual` durability turns its in-memory commits into a real
-/// fsync. The trade is the loss window under power loss against flash wear:
-/// 2 880 fsyncs a day here, against 43 200 for `immediate` at the default flush
-/// interval.
-const EVENTUAL_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Backoff after a failed write, capped: 1, 2, 4, 8, 16, 60, 60, … seconds.
 const BACKOFF_STEPS: [Duration; 6] = [
@@ -102,26 +59,43 @@ const BACKOFF_STEPS: [Duration; 6] = [
     Duration::from_secs(60),
 ];
 
-const SEGMENT_SUFFIX: &str = ".redb";
+const SEGMENT_SUFFIX: &str = ".seg";
 const NANOS_PER_DAY: u64 = 86_400_000_000_000;
 
 /// Whether a batch is compressed before it is stored.
 ///
-/// Applied per batch, so a segment can hold both; see the module docs. `ZstdL1`
-/// exists only in a build with the `log-zstd` feature: without it the mode is
-/// not offered at all rather than offered and silently ignored.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// `ZstdL1` exists only in a build with the `log-zstd` feature: without it the
+/// mode is not offered at all rather than offered and silently ignored. The
+/// default follows the build, because the flag's own default is "whatever this
+/// binary can do" — a build with the codec defaults to `zstd-l1`, one without
+/// it to `none`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Compression {
-    #[default]
     None,
     #[cfg(feature = "log-zstd")]
     ZstdL1,
 }
 
+// `#[default]` on a variant cannot be made conditional on a feature, and the
+// default is the point: a build with the codec compresses.
+#[allow(clippy::derivable_impls)]
+impl Default for Compression {
+    fn default() -> Self {
+        #[cfg(feature = "log-zstd")]
+        {
+            Self::ZstdL1
+        }
+        #[cfg(not(feature = "log-zstd"))]
+        {
+            Self::None
+        }
+    }
+}
+
 /// How much a commit is worth.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DurabilityMode {
-    /// fsync every [`EVENTUAL_SYNC_INTERVAL`] rather than every flush.
+    /// fsync every 30 seconds rather than every flush.
     #[default]
     Eventual,
     /// fsync before every commit returns.
@@ -140,82 +114,137 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            compress: Compression::None,
+            compress: Compression::default(),
             durability: DurabilityMode::Eventual,
             retention_days: DEFAULT_RETENTION_DAYS,
         }
     }
 }
 
-/// Writes batches into `<dir>/<today>.redb`, rotating at the UTC date change.
+/// Writes batches into `<dir>/<today>.seg`, rotating at the UTC date change.
 pub(crate) struct FileSink {
     dir: PathBuf,
     options: Options,
-    segment: Option<Segment>,
-    day: Option<i64>,
-    /// The days this run has written a segment for. The retention sweep never
-    /// deletes one of them: see [`sweep_retention`].
+    store: Option<FileStore>,
+    /// Days this run has written a segment for; the sweep never deletes one.
     written: Vec<i64>,
+    /// Day of the file currently open, so a rotation is noticed once.
+    observed_day: Option<i64>,
     backoff: usize,
     retry_at: Option<Instant>,
+    encoder: BatchEncoder,
+    domain: Box<[u8]>,
+    /// Set only by the tests, which move the day the store writes to.
+    clock: Option<std::sync::Arc<dyn logreel::file::Clock>>,
 }
 
 impl FileSink {
     /// Opens (or creates) today's segment. Startup failures are fatal and
     /// reported to the operator; once running, the sink degrades instead.
     pub(crate) fn open(dir: &Path, options: Options) -> Result<Self, LogError> {
+        Self::open_inner(dir, options, None)
+    }
+
+    /// [`FileSink::open`] with the clock the tests move.
+    #[cfg(test)]
+    pub(crate) fn open_with_clock(
+        dir: &Path,
+        options: Options,
+        clock: std::sync::Arc<dyn logreel::file::Clock>,
+    ) -> Result<Self, LogError> {
+        Self::open_inner(dir, options, Some(clock))
+    }
+
+    fn open_inner(
+        dir: &Path,
+        options: Options,
+        clock: Option<std::sync::Arc<dyn logreel::file::Clock>>,
+    ) -> Result<Self, LogError> {
         check_filesystem(dir)?;
         create_dir(dir)?;
 
         let mut sink = Self {
             dir: dir.to_path_buf(),
             options,
-            segment: None,
-            day: None,
+            store: None,
             written: Vec::new(),
+            observed_day: None,
             backoff: 0,
             retry_at: None,
+            encoder: BatchEncoder::new(),
+            domain: domain_bytes(),
+            clock,
         };
 
-        let day = today();
-        let path = sink.segment_path(day);
-        sink.segment = Some(Segment::open(&path).map_err(|error| start_error(error, &path))?);
-        sink.day = Some(day);
+        let day = sink.today();
+        let store = sink.connect().map_err(|error| {
+            start_error(
+                error,
+                &dir.join(format!("{}{SEGMENT_SUFFIX}", day_name(day))),
+            )
+        })?;
+        sink.store = Some(store);
         sink.written.push(day);
+        sink.observed_day = sink.active_day();
         sink.sweep_retention(day);
         Ok(sink)
     }
 
-    fn segment_path(&self, day: i64) -> PathBuf {
-        self.dir.join(format!("{}{SEGMENT_SUFFIX}", day_name(day)))
-    }
+    /// Builds and opens the store, creating (or validating) today's file.
+    fn connect(&self) -> Result<FileStore, WriterError> {
+        let mut config = FileStoreConfig::new(&self.dir);
+        // The proxy sweeps with its own window, which counts from the archive
+        // rather than from the clock; two windows would disagree.
+        config.keep_days = 0;
+        config.max_total_bytes = 0;
+        config.compress = compressed(self.options.compress);
+        config.zstd_level = ZSTD_LEVEL;
 
-    /// Closes the current segment and opens the one for `day`.
-    pub(super) fn rotate(&mut self, day: i64) -> Result<(), WriterError> {
-        // Dropping the old segment commits and fsyncs it.
-        drop(self.segment.take());
-        let path = self.segment_path(day);
-        self.segment = Some(Segment::open(&path)?);
-        self.day = Some(day);
-        if !self.written.contains(&day) {
-            self.written.push(day);
+        let mut store = match &self.clock {
+            Some(clock) => FileStore::with_clock(config, std::sync::Arc::clone(clock)),
+            None => FileStore::open(config),
         }
-        self.sweep_retention(day);
-        Ok(())
+        .map_err(store_error)?;
+        store
+            .prime(
+                <Event as logreel::Event>::CODEC_ID,
+                <Event as logreel::Event>::KINDS,
+                <Event as logreel::Event>::SCHEMA_HASH,
+            )
+            .map_err(store_error)?;
+
+        // The file holds every session's metadata, so it keeps the owner-only
+        // mode the redb sink used to set before opening: the library creates it
+        // with the umask, and this is the one place that knows it should not.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if let Some(path) = store.active_path() {
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+            }
+        }
+
+        Ok(store)
     }
 
-    /// Deletes the segments that have fallen out of the retention window.
-    fn sweep_retention(&self, day: i64) {
-        sweep_retention(&self.dir, self.options.retention_days, day, &self.written);
+    fn today(&self) -> i64 {
+        today()
+    }
+
+    /// The day of the file the store has open, when it has one.
+    fn active_day(&self) -> Option<i64> {
+        let path = self.store.as_ref()?.active_path()?;
+        let stem = path.file_stem()?.to_str()?;
+        day_of_name(stem)
     }
 
     fn on_failure(&mut self, error: WriterError) -> WriterError {
-        // A segment that cannot be written to is not necessarily a segment that
-        // cannot be reopened: a removed USB stick becomes writable again when it
-        // is plugged back in. Dropping the handle makes the next attempt go
-        // through `Segment::open`, which is what that recovery needs.
+        // A file that cannot be written to is not necessarily one that cannot be
+        // reopened: a removed USB stick becomes writable again when it is
+        // plugged back in. Dropping the handle makes the next attempt go through
+        // the full open, which is what that recovery needs.
         if matches!(error, WriterError::Io(_)) {
-            self.segment = None;
+            self.store = None;
         }
         let delay = BACKOFF_STEPS[self.backoff.min(BACKOFF_STEPS.len() - 1)];
         self.backoff = (self.backoff + 1).min(BACKOFF_STEPS.len() - 1);
@@ -226,6 +255,47 @@ impl FileSink {
     fn on_success(&mut self) {
         self.backoff = 0;
         self.retry_at = None;
+    }
+
+    /// Notices a rotation and sweeps once per day, not once per batch.
+    fn after_write(&mut self) {
+        let day = match self.active_day() {
+            Some(day) => day,
+            None => return,
+        };
+        if self.observed_day == Some(day) {
+            return;
+        }
+        self.observed_day = Some(day);
+        if !self.written.contains(&day) {
+            self.written.push(day);
+        }
+        self.sweep_retention(day);
+    }
+
+    /// Deletes the segments that have fallen out of the retention window.
+    fn sweep_retention(&self, day: i64) {
+        sweep_retention(&self.dir, self.options.retention_days, day, &self.written);
+    }
+
+    /// The records of one batch as the library's envelope wants them.
+    fn records_of(&self, batch: &LogBatch) -> Vec<Record<Event>> {
+        batch
+            .records
+            .iter()
+            .filter_map(|record| {
+                let event = record.event.clone()?;
+                Some(Record::new(
+                    level_of(record.level),
+                    u8::try_from(record.category).unwrap_or(u8::MAX),
+                    event.kind(),
+                    record.ts_ns,
+                    record.seq,
+                    record.conn_id,
+                    event,
+                ))
+            })
+            .collect()
     }
 }
 
@@ -246,473 +316,129 @@ impl BatchSink for FileSink {
             return Ok(());
         }
 
-        // A segment is rotated forward when the date moves, and never back: a
-        // clock correction that lands in the previous day must not split the
-        // file, and a segment lost to a failure is reopened for the day it was
-        // on rather than for whatever the clock says now.
-        let today = today();
-        let day = match self.day {
-            Some(open) if open >= today => open,
-            _ => today,
-        };
-        if (self.segment.is_none() || self.day != Some(day))
-            && let Err(error) = self.rotate(day)
-        {
-            return Err(self.on_failure(error));
+        if self.store.is_none() {
+            match self.connect() {
+                Ok(store) => self.store = Some(store),
+                Err(error) => return Err(self.on_failure(error)),
+            }
         }
 
+        let records = self.records_of(batch);
+        if records.is_empty() {
+            return Ok(());
+        }
+        let encoded = self.encoder.encode(&records, &self.domain);
         let durability = durability_of(self.options.durability);
-        let result = self
-            .segment
-            .as_mut()
-            .expect("a segment was opened above")
-            .write(batch, self.options.compress, durability);
+        let store = self.store.as_mut().expect("a store was opened above");
+        let mut result = store.append(&encoded);
+        if result.is_ok() {
+            result = store.sync(durability);
+        }
 
         match result {
             Ok(()) => {
                 self.on_success();
+                self.after_write();
                 Ok(())
             }
-            Err(error) => Err(self.on_failure(error)),
+            Err(error) => Err(self.on_failure(store_error(error))),
         }
     }
 }
 
-/// One open day-segment.
-struct Segment {
-    db: Database,
-    unsynced: bool,
-    last_sync: Instant,
-}
-
-impl Segment {
-    fn open(path: &Path) -> Result<Self, WriterError> {
-        pre_create(path)?;
-
-        let db = Database::builder()
-            .set_cache_size(CACHE_SIZE)
-            // `create` opens an existing segment as it is: a restart inside the
-            // same UTC day appends to the day's file instead of starting a new
-            // one.
-            .create(path)
-            .map_err(|error| match error {
-                redb::DatabaseError::DatabaseAlreadyOpen => WriterError::Conflict,
-                other => WriterError::Segment(other.to_string()),
-            })?;
-
-        let mut segment = Self {
-            db,
-            unsynced: false,
-            last_sync: Instant::now(),
-        };
-        segment.write_meta()?;
-        Ok(segment)
-    }
-
-    /// Writes the segment's provenance, once, at creation.
-    ///
-    /// A segment that already carries a fingerprint was opened before: by this
-    /// build, appending to the file it left earlier the same UTC day, or by one
-    /// whose records are encoded under different rules. The second is refused
-    /// rather than appended to, and the reason is the metadata itself —
-    /// `schema_hash` is written once and never corrected, so a v2 build writing
-    /// into a v1 file would produce a day of records that no reader can trust
-    /// and no later build can fix. The operator's half of the fix is to move the
-    /// file out of the directory, which is what the message says.
-    fn write_meta(&mut self) -> Result<(), WriterError> {
-        let mut transaction = self.db.begin_write().map_err(segment_error)?;
-        let ours = fingerprint().to_le_bytes();
-        let existing = {
-            let table = transaction.open_table(META).map_err(segment_error)?;
-            table
-                .get(META_SCHEMA_HASH)
-                .map_err(segment_error)?
-                .map(|value| value.value().to_vec())
-        };
-
-        let fresh = match existing {
-            None => true,
-            Some(existing) if existing == ours => false,
-            Some(existing) => {
-                return Err(WriterError::Segment(format!(
-                    "the segment was written under a different log schema \
-                     (schema_hash {}, this build writes {}); move it out of the \
-                     log directory instead of appending to it",
-                    hex::encode(&existing),
-                    hex::encode(ours),
-                )));
-            }
-        };
-
-        if fresh {
-            let created_ns = super::now_ns();
-            let mut table = transaction.open_table(META).map_err(segment_error)?;
-            table
-                .insert(META_SCHEMA_HASH, ours.as_slice())
-                .map_err(segment_error)?;
-            table
-                .insert(META_APP_VERSION, env!("CARGO_PKG_VERSION").as_bytes())
-                .map_err(segment_error)?;
-            table
-                .insert(META_CREATED_NS, created_ns.to_le_bytes().as_slice())
-                .map_err(segment_error)?;
-            table
-                .insert(
-                    META_WRITER_PROTOCOL,
-                    WRITER_PROTOCOL.to_le_bytes().as_slice(),
-                )
-                .map_err(segment_error)?;
-        }
-
-        // Metadata is the one thing that has to be on disk immediately: every
-        // other commit can be re-derived from the segments around it, but a
-        // segment without its provenance is one a reader has to guess about.
-        // redb refuses to lower durability after a persistent change, and this
-        // transaction has none, so this is the "keep the default" branch too.
-        if fresh {
-            let _ = transaction.set_durability(Durability::Immediate);
-        }
-        transaction.commit().map_err(|error| {
-            WriterError::Segment(format!("cannot write segment metadata: {error}"))
-        })?;
-        self.unsynced = false;
-        self.last_sync = Instant::now();
-        Ok(())
-    }
-
-    fn write(
-        &mut self,
-        batch: &LogBatch,
-        compress: Compression,
-        durability: Durability,
-    ) -> Result<(), WriterError> {
-        let header = batch
-            .header
-            .as_ref()
-            .ok_or_else(|| WriterError::Segment("a batch without a header".to_string()))?;
-        let key = (header.ts_first_ns, batch.records[0].seq);
-        let value = encode(batch, compress)?;
-
-        let mut transaction = self.db.begin_write().map_err(segment_error)?;
-        // Unreachable in practice: it fails only for a transaction that created
-        // or deleted a persistent savepoint, and this writer uses none.
-        let _ = transaction.set_durability(durability);
-
-        {
-            let mut main = transaction.open_table(MAIN).map_err(segment_error)?;
-            main.insert(key, value.as_slice()).map_err(segment_error)?;
-
-            let mut by_conn = transaction.open_table(BY_CONN).map_err(segment_error)?;
-            for conn_id in &header.conn_ids {
-                by_conn
-                    .insert((*conn_id, header.ts_first_ns), key)
-                    .map_err(segment_error)?;
-            }
-        }
-
-        transaction
-            .commit()
-            .map_err(|error| WriterError::Segment(format!("commit failed: {error}")))?;
-
-        self.unsynced = matches!(durability, Durability::None);
-        if !self.unsynced {
-            self.last_sync = Instant::now();
-        } else if self.last_sync.elapsed() >= EVENTUAL_SYNC_INTERVAL {
-            self.sync()?;
-        }
-        Ok(())
-    }
-
-    /// Turns the commits held in memory into a durable state: an empty
-    /// `Immediate` commit persists everything before it.
-    fn sync(&mut self) -> Result<(), WriterError> {
-        if !self.unsynced {
-            return Ok(());
-        }
-        let mut transaction = self.db.begin_write().map_err(segment_error)?;
-        let _ = transaction.set_durability(Durability::Immediate);
-        transaction
-            .commit()
-            .map_err(|error| WriterError::Segment(format!("sync failed: {error}")))?;
-        self.unsynced = false;
-        self.last_sync = Instant::now();
-        Ok(())
-    }
-}
-
-impl Drop for Segment {
-    /// Last chance to persist: rotation, a dropped sink and the end of the
-    /// process all arrive here, and a clean stop is supposed to lose nothing.
-    fn drop(&mut self) {
-        if let Err(error) = self.sync() {
-            crate::direct!("could not flush the log segment on close: {error}");
-        }
-    }
-}
-
-// ── Reading back ───────────────────────────────────────────────────────────
-//
-// What `tg-ws-proxy probe-segment` and `tg-ws-proxy dump-segment` print, and
-// what the schema check reads. A segment is read from a private copy rather
-// than from the archive itself — see [`ReadCopy`] — and the rest of this file
-// stays crate-private: anything unused in here is still a warning.
-
-/// Reads a whole day back, in time order.
+/// Reads one day's segment back as the batches the dump verb prints.
 ///
-/// Loads the day into memory, which is the right shape for a post-mortem of one
-/// segment and the wrong one for a reader that scans a month — the reading
-/// iteration is where that gets fixed. The file this reads is a copy; the
-/// segment itself is not opened at all.
+/// The records are decoded into the proxy's own [`LogRecord`] and the batch
+/// header is rebuilt with [`schema::build_batch`], so `dump-segment` prints the
+/// same bytes for a `.seg` as it did for the redb file it replaced — including
+/// the `kind_mask`, `dc_mask` and connection list, which are derived from the
+/// records rather than stored.
 pub fn iter_batches(dir: &Path, date: &str) -> Result<Vec<LogBatch>, LogError> {
-    let (db, transaction, copy) = open_for_read(dir, date)?;
-    let table = match transaction.open_table(MAIN) {
-        Ok(table) => table,
-        // redb creates a table on its first write, so a segment that recorded
-        // nothing has no `STOR:main` at all — a run whose every event was
-        // filtered out, which is what `--log-level error` over a healthy proxy
-        // leaves behind. An empty day, not a corrupt file.
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(error) => return Err(LogError::Segment(error.to_string())),
-    };
-
-    let mut batches = Vec::new();
-    for entry in table
-        .iter()
-        .map_err(|error| LogError::Segment(error.to_string()))?
-    {
-        let (_, value) = entry.map_err(|error| LogError::Segment(error.to_string()))?;
-        batches.push(decode(value.value())?);
-    }
-    // In this order, so the copy is the last thing holding the file: on Windows
-    // an open file cannot be deleted, and a read that left its copy behind
-    // would be a reader that writes after all.
-    drop(transaction);
-    drop(db);
-    drop(copy);
-    Ok(batches)
-}
-
-/// Reads back the batches that mention one connection, via `STOR:by_conn`.
-#[allow(dead_code)]
-pub(crate) fn iter_conn_batches(
-    dir: &Path,
-    date: &str,
-    conn_id: u64,
-) -> Result<Vec<LogBatch>, LogError> {
-    let (db, transaction, copy) = open_for_read(dir, date)?;
-    let index = match transaction.open_table(BY_CONN) {
-        Ok(index) => index,
-        // No index means no batch was ever indexed, which means no records
-        // (see `iter_batches` for why the table can be absent at all).
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(error) => return Err(LogError::Segment(error.to_string())),
-    };
-
-    let mut keys = Vec::new();
-    for entry in index
-        .range((conn_id, 0)..=(conn_id, u64::MAX))
-        .map_err(|error| LogError::Segment(error.to_string()))?
-    {
-        let (_, value) = entry.map_err(|error| LogError::Segment(error.to_string()))?;
-        keys.push(value.value());
-    }
-
-    let table = transaction
-        .open_table(MAIN)
-        .map_err(|error| LogError::Segment(error.to_string()))?;
-    let mut batches = Vec::new();
-    for key in keys {
-        if let Some(value) = table
-            .get(key)
-            .map_err(|error| LogError::Segment(error.to_string()))?
-        {
-            batches.push(decode(value.value())?);
-        }
-    }
-    drop(transaction);
-    drop(db);
-    drop(copy);
-    Ok(batches)
-}
-
-/// One `STOR:meta` slot. The reader stage compares `schema_hash` against its
-/// own before trusting anything else in the file.
-#[allow(dead_code)]
-pub(super) fn meta(dir: &Path, date: &str, key: &str) -> Result<Option<Vec<u8>>, LogError> {
-    let (db, transaction, copy) = open_for_read(dir, date)?;
-    let table = transaction
-        .open_table(META)
-        .map_err(|error| LogError::Segment(error.to_string()))?;
-    let value = table
-        .get(key)
-        .map_err(|error| LogError::Segment(error.to_string()))?
-        .map(|guard| guard.value().to_vec());
-    drop(transaction);
-    drop(db);
-    drop(copy);
-    Ok(value)
-}
-
-/// A private copy of a segment, deleted when the read that made it is over.
-///
-/// # Why a copy
-///
-/// `redb` has no read-only mode: opening a database opens the file for writing,
-/// and the recovery pass that runs on the way in writes the commit slots it
-/// examined. Reading a segment therefore used to change it. Measured on the
-/// router's stick on 2026-10-13: `probe` of the same segment returned identical
-/// sizes and identical records every time, and a different SHA-256 every time.
-/// An archive that changes when it is read is not an archive — a hash taken
-/// before the read no longer describes the file, and a segment on a flash stick
-/// takes writes nobody asked for.
-///
-/// So the reader copies the file first and gives `redb` the copy. Whatever
-/// recovery writes lands in a file that is deleted on the way out. That is also
-/// the *better* recovery: a segment copied while its writer was mid-commit — the
-/// live day's file, which is exactly what an operator reads first — can be
-/// repaired, where a strictly read-only open could only refuse to read it.
-///
-/// # What it costs
-///
-/// The copy is the size of the segment, placed beside it so the read stays on
-/// the filesystem the operator pointed at (on the devices this ships to
-/// `TMPDIR` is RAM). A directory that cannot be written to falls back to
-/// `TMPDIR`, and one where neither works is an error rather than a read that
-/// quietly changed the file.
-struct ReadCopy {
-    path: PathBuf,
-}
-
-impl ReadCopy {
-    fn of(source: &Path, dir: &Path, date: &str) -> Result<Self, LogError> {
-        let pid = std::process::id();
-        // Both names keep the `.redb` out of the extension: the retention sweep
-        // and the readers that scan a directory for segments match on the file
-        // name, and a copy must not look like one.
-        let beside = dir.join(format!(".{date}{SEGMENT_SUFFIX}.read-{pid}"));
-        match fs::copy(source, &beside) {
-            Ok(_) => Ok(Self { path: beside }),
-            Err(beside_error) => {
-                // A segment that is not there at all is the common case, and the
-                // interesting one to report; the copy destination is not.
-                if beside_error.kind() == ErrorKind::NotFound {
-                    return Err(LogError::Segment(format!(
-                        "{}: no such segment",
-                        source.display()
-                    )));
-                }
-                let elsewhere = std::env::temp_dir().join(format!(
-                    "{}.{date}{SEGMENT_SUFFIX}.read-{pid}",
-                    env!("CARGO_PKG_NAME")
-                ));
-                match fs::copy(source, &elsewhere) {
-                    Ok(_) => Ok(Self { path: elsewhere }),
-                    Err(temp_error) => Err(LogError::Segment(format!(
-                        "cannot copy {} to read it: beside it: {beside_error}; in {}: \
-                         {temp_error} — a segment is read from a copy, because reading \
-                         it in place writes to it",
-                        source.display(),
-                        elsewhere.display()
-                    ))),
-                }
-            }
-        }
-    }
-}
-
-impl Drop for ReadCopy {
-    fn drop(&mut self) {
-        if let Err(error) = fs::remove_file(&self.path) {
-            crate::direct!(
-                "cannot remove the read copy {}: {error}",
-                self.path.display()
-            );
-        }
-    }
-}
-
-/// Opens a segment for reading, through a copy of it ([`ReadCopy`]).
-#[allow(dead_code)]
-fn open_for_read(
-    dir: &Path,
-    date: &str,
-) -> Result<(Database, redb::ReadTransaction, ReadCopy), LogError> {
     let path = dir.join(format!("{date}{SEGMENT_SUFFIX}"));
-    let copy = ReadCopy::of(&path, dir, date)?;
-    let db = Database::builder()
-        .set_cache_size(CACHE_SIZE)
-        .open(&copy.path)
+    if !path.exists() {
+        return Err(LogError::Segment(format!(
+            "no such segment: {}",
+            path.display()
+        )));
+    }
+    let mut reader = SegmentReader::open(&path)
         .map_err(|error| LogError::Segment(format!("{}: {error}", path.display())))?;
-    let transaction = db
-        .begin_read()
-        .map_err(|error| LogError::Segment(error.to_string()))?;
-    Ok((db, transaction, copy))
-}
-
-pub(super) fn encode(batch: &LogBatch, compress: Compression) -> Result<Vec<u8>, WriterError> {
-    use prost::Message as _;
-
-    let mut encoded = batch.encode_to_vec();
-    match compress {
-        Compression::None => encoded.insert(0, VALUE_RAW),
-        #[cfg(feature = "log-zstd")]
-        Compression::ZstdL1 => {
-            let compressed = zstd::encode_all(encoded.as_slice(), ZSTD_LEVEL)
-                .map_err(|error| WriterError::Segment(format!("cannot compress: {error}")))?;
-            encoded.clear();
-            encoded.push(VALUE_ZSTD);
-            encoded.extend_from_slice(&compressed);
+    let mut batches = Vec::new();
+    while let Some(decoded) = reader.next_decoded_batch() {
+        let decoded =
+            decoded.map_err(|error| LogError::Segment(format!("{}: {error}", path.display())))?;
+        let mut records = Vec::with_capacity(decoded.records.len());
+        for owned in &decoded.records {
+            let event = <Event as logreel::Event>::decode(owned.kind, &owned.payload)
+                .map_err(|error| LogError::Segment(format!("{}: {error}", path.display())))?;
+            records.push(LogRecord {
+                ts_ns: owned.ts_ns,
+                conn_id: owned.conn_id,
+                seq: owned.seq,
+                level: i32::from(owned.level),
+                category: i32::from(owned.category),
+                event: Some(event),
+            });
+        }
+        let built = schema::build_batch(&records);
+        match built.into_iter().next() {
+            Some(batch) => batches.push(batch),
+            // Only an empty batch can produce nothing to build; it still counts
+            // as a batch in the dump, with a header naming no records.
+            None => batches.push(LogBatch {
+                header: Some(BatchHeader::default()),
+                records,
+            }),
         }
     }
-    Ok(encoded)
+    Ok(batches)
 }
 
-#[allow(dead_code)]
-pub(super) fn decode(value: &[u8]) -> Result<LogBatch, LogError> {
-    use prost::Message as _;
+fn compressed(mode: Compression) -> bool {
+    #[cfg(feature = "log-zstd")]
+    {
+        matches!(mode, Compression::ZstdL1)
+    }
+    #[cfg(not(feature = "log-zstd"))]
+    {
+        let _ = mode;
+        false
+    }
+}
 
-    let (framing, payload) = value
-        .split_first()
-        .ok_or_else(|| LogError::Segment("an empty segment value".to_string()))?;
+fn level_of(raw: i32) -> logreel::Level {
+    u8::try_from(raw)
+        .ok()
+        .and_then(logreel::Level::from_u8)
+        .unwrap_or(logreel::Level::Error)
+}
 
-    let encoded = match *framing {
-        VALUE_RAW => payload.to_vec(),
-        #[cfg(feature = "log-zstd")]
-        VALUE_ZSTD => zstd::decode_all(payload)
-            .map_err(|error| LogError::Segment(format!("cannot decompress: {error}")))?,
-        // A compressed batch and a framing byte from the future are different
-        // problems with different answers: one needs a different build, the
-        // other a newer one.
-        #[cfg(not(feature = "log-zstd"))]
-        VALUE_ZSTD => {
-            return Err(LogError::Segment(format!(
-                "this segment holds compressed batches; rebuild with --features log-zstd \
-                 to read it ({} was built without zstd)",
-                env!("CARGO_PKG_NAME")
-            )));
-        }
-        other => {
-            return Err(LogError::Segment(format!(
-                "unknown value framing {other}; this segment was written by a newer {}",
-                env!("CARGO_PKG_NAME")
-            )));
-        }
-    };
-
-    LogBatch::decode(encoded.as_slice()).map_err(|error| LogError::Segment(error.to_string()))
+fn domain_bytes() -> Box<[u8]> {
+    format!(
+        "app={};schema={};protocol={}",
+        env!("CARGO_PKG_VERSION"),
+        schema::SCHEMA_VERSION,
+        WRITER_PROTOCOL
+    )
+    .into_bytes()
+    .into_boxed_slice()
 }
 
 fn durability_of(mode: DurabilityMode) -> Durability {
     match mode {
-        DurabilityMode::Eventual => Durability::None,
+        DurabilityMode::Eventual => Durability::Eventual,
         DurabilityMode::Immediate => Durability::Immediate,
     }
 }
 
-/// `redb::DatabaseError` and friends, flattened: the write path reports them as
-/// a `tg-ws-proxy:` line and backs off, and nothing above matches on them.
-fn segment_error(error: impl std::fmt::Display) -> WriterError {
-    WriterError::Segment(error.to_string())
+/// The library's error, flattened for the write path: it becomes a
+/// `tg-ws-proxy:` line and a backoff, and nothing above matches on it.
+fn store_error(error: logreel::StoreError) -> WriterError {
+    match error.kind() {
+        ErrorKind::Locked => WriterError::Conflict,
+        ErrorKind::Io => WriterError::Io(std::io::Error::other(error.to_string())),
+        _ => WriterError::Segment(error.to_string()),
+    }
 }
 
 /// The startup path reports to the operator, so the sink's own error type is
@@ -722,36 +448,6 @@ fn start_error(error: WriterError, path: &Path) -> LogError {
         WriterError::Io(error) => LogError::Io(error),
         WriterError::Conflict => LogError::WriterConflict(path.to_path_buf()),
         WriterError::Segment(reason) => LogError::Segment(reason),
-    }
-}
-
-/// Creates the segment file with the owner-only mode it will keep.
-///
-/// redb opens the file itself, so the mode has to be set before it gets there —
-/// otherwise the file exists, briefly, with whatever the umask allows for a
-/// database that holds every session's metadata.
-fn pre_create(path: &Path) -> Result<(), WriterError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-        {
-            Ok(_) => Ok(()),
-            // An existing segment for today: the restart case, by design.
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(()),
-            Err(error) => Err(WriterError::Io(error)),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows has no umask to race with; the inherited ACL is the policy.
-        let _ = path;
-        Ok(())
     }
 }
 
@@ -771,7 +467,7 @@ fn create_dir(dir: &Path) -> Result<(), LogError> {
 /// Refuses a log directory on a filesystem this build does not support.
 ///
 /// The list is a support decision, not a claim about what the kernel can do.
-/// redb takes `fcntl` open-file-description locks, and Linux implements those in
+/// the segment takes `fcntl` open-file-description locks, and Linux implements those in
 /// the VFS for every local filesystem — a `vfat` stick would very probably
 /// work. It is refused anyway, because "very probably" is not a promise to make
 /// about the one file that holds every session's metadata, and because the fix
@@ -809,7 +505,7 @@ pub(crate) fn check_filesystem(dir: &Path) -> Result<(), LogError> {
     }
 }
 
-/// Whether a filesystem can hold a redb segment.
+/// Whether a filesystem can hold a the segment segment.
 pub(super) fn carries_locks(fstype: &str) -> bool {
     !matches!(
         fstype,
@@ -887,7 +583,7 @@ fn filesystem_of(path: &Path) -> Option<String> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn filesystem_of(_path: &Path) -> Option<String> {
-    // Windows: NTFS and exFAT both carry the file locks redb needs, so there is
+    // Windows: NTFS and exFAT both carry the file locks the segment needs, so there is
     // nothing to gate on.
     None
 }
@@ -1015,7 +711,7 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 ///
 /// Names, not modification times: the date in the file name is the date the
 /// records belong to, and an `mtime` moves whenever a file is copied or a clock
-/// is wrong. Anything whose name is not a `YYYY-MM-DD.redb` date is left alone —
+/// is wrong. Anything whose name is not a `YYYY-MM-DD.seg` date is left alone —
 /// this directory may not be ours exclusively.
 pub(super) fn sweep_retention(dir: &Path, retention_days: u32, clock_day: i64, written: &[i64]) {
     if retention_days == 0 {

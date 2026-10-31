@@ -173,6 +173,37 @@ impl FileStore {
         })
     }
 
+    /// Create or validate today's file and take its lock, without a frame.
+    ///
+    /// [FileStore::open] touches nothing: the day file is created by the first
+    /// append, which is too late for a startup that has to refuse a directory
+    /// another writer holds. Priming performs the same rotation the first
+    /// append would -- header, lock, retention sweep -- and leaves the file
+    /// empty, so a second writer fails where the operator is still listening.
+    pub fn prime(
+        &mut self,
+        codec_id: u16,
+        kind_count: u16,
+        schema_hash: [u8; 16],
+    ) -> Result<PathBuf, StoreError> {
+        let day = day_from_ns(self.clock.now_ns());
+        let empty = EncodedBatch::new(
+            codec_id,
+            schema_hash,
+            kind_count,
+            0,
+            0,
+            0,
+            Box::new([]),
+            Box::new([]),
+        );
+        self.ensure_active(day, &empty)?;
+        Ok(self
+            .active_path()
+            .expect("ensure_active left a file open")
+            .to_path_buf())
+    }
+
     /// Currently written segment, if any.
     #[must_use]
     pub fn active_path(&self) -> Option<&Path> {

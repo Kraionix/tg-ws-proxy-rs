@@ -65,6 +65,7 @@ use tokio::task::JoinHandle;
 use schema::{Category, Event, Level, LogRecord};
 use view::{TEXT_RING_DEFAULT, TextTarget};
 
+pub mod event;
 pub mod render;
 pub mod schema;
 #[cfg(feature = "log-disk")]
@@ -476,7 +477,7 @@ fn start<S: writer::BatchSink + 'static>(
 #[cfg(feature = "log-disk")]
 #[derive(Clone, Debug)]
 pub struct Disk {
-    /// Directory holding one `<date>.redb` per UTC day.
+    /// Directory holding one `<date>.seg` per UTC day.
     pub dir: PathBuf,
     /// Compression, durability and retention for those segments.
     pub options: storage::Options,

@@ -1,6 +1,6 @@
 //! Reading a segment back: the `probe-segment` and `dump-segment` verbs.
 //!
-//! `--log-dir` writes one redb file per UTC day; these two verbs read one back.
+//! `--log-dir` writes one `.seg` file per UTC day; these two verbs read one back.
 //! They live in the binary rather than in a separate tool because the program
 //! that knows the record types, the value framing and the schema hash is this
 //! one — and because the machine an operator wants to read a segment *on* is a
@@ -42,7 +42,7 @@ use crate::log::render::peer_text;
 use crate::log::schema::{self, Event, LogBatch, LogRecord, Peer};
 use crate::log::storage::iter_batches;
 
-/// One `<date>.redb` file, with the day its name spells.
+/// One `<date>.seg` file, with the day its name spells.
 struct Segment {
     path: PathBuf,
     date: String,
@@ -66,9 +66,9 @@ fn segments(dir: &Path) -> io::Result<Vec<Segment>> {
     let mut found = Vec::new();
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        // The extension, not the stem: a read copy (`.<date>.redb.read-<pid>`)
+        // The extension, not the stem: a read copy (`.<date>.seg.read-<pid>`)
         // is not a segment, and neither is anything else an operator left here.
-        if path.extension().is_none_or(|extension| extension != "redb") {
+        if path.extension().is_none_or(|extension| extension != "seg") {
             continue;
         }
         // Owned before the path moves into the struct below: the stem borrows
@@ -90,7 +90,7 @@ fn probe(dir: &Path) -> ExitCode {
     let segments = match segments(dir) {
         Ok(segments) if !segments.is_empty() => segments,
         Ok(_) => {
-            crate::direct!("no *.redb segments in {}", dir.display());
+            crate::direct!("no *.seg segments in {}", dir.display());
             return ExitCode::FAILURE;
         }
         Err(error) => {
@@ -198,8 +198,8 @@ fn dump(dir: &Path, date: Option<&str>, out: Option<&Path>, records_only: bool) 
         .collect();
     if selected.is_empty() {
         match date {
-            Some(date) => crate::direct!("no {date}.redb in {}", dir.display()),
-            None => crate::direct!("no *.redb segments in {}", dir.display()),
+            Some(date) => crate::direct!("no {date}.seg in {}", dir.display()),
+            None => crate::direct!("no *.seg segments in {}", dir.display()),
         }
         return ExitCode::FAILURE;
     }

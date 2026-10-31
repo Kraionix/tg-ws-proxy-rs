@@ -229,6 +229,26 @@ pub enum LogCompress {
 }
 
 #[cfg(feature = "log-disk")]
+impl Default for LogCompress {
+    /// What a build with the codec stores by default.
+    ///
+    /// The owner's call: on the stick this ships to, fewer bytes and fewer
+    /// fsyncs beat CPU, and the codec is a build feature — a binary that links
+    /// zstd should use it unless the operator says otherwise. `none` stays one
+    /// flag away, and a build without the feature has nothing but `none`.
+    fn default() -> Self {
+        #[cfg(feature = "log-zstd")]
+        {
+            Self::ZstdL1
+        }
+        #[cfg(not(feature = "log-zstd"))]
+        {
+            Self::None
+        }
+    }
+}
+
+#[cfg(feature = "log-disk")]
 impl LogCompress {
     fn to_storage(self) -> log::storage::Compression {
         match self {
@@ -605,10 +625,13 @@ pub struct Config {
     #[arg(long = "log-flush-on-warn", env = "TG_LOG_FLUSH_ON_WARN")]
     pub log_flush_on_warn: bool,
 
-    /// Compress each written batch with zstd level 1.
+    /// Compress each written frame with zstd level 1.
     ///
-    /// Measured at 2.2× smaller segments on a mixed batch. Off by default: the
-    /// CPU is a router's, and the storage is the operator's choice.
+    /// The default is `zstd-l1` in a build that has the codec and `none` in one
+    /// that does not: the mode offered is what the binary can do. Measured at
+    /// 2.2× smaller segments on a mixed batch, which is bytes and fsyncs the
+    /// stick does not have to take; `none` is a flag away for a CPU-bound
+    /// deployment.
     ///
     /// `zstd-l1` is compiled in only with the `log-zstd` feature — the codec is
     /// half a megabyte of the binary, so a build for a flash-constrained device
@@ -618,7 +641,7 @@ pub struct Config {
     #[arg(
         long = "log-compress",
         value_name = "MODE",
-        default_value = "none",
+        default_value_t = LogCompress::default(),
         env = "TG_LOG_COMPRESS"
     )]
     pub log_compress: LogCompress,
@@ -1072,12 +1095,12 @@ pub struct Config {
 pub enum Command {
     /// Report what each segment in a directory holds, without printing records.
     ///
-    /// One JSON object per `<date>.redb`: its size, SHA-256, batch and record
+    /// One JSON object per `<date>.seg`: its size, SHA-256, batch and record
     /// counts, the connections it mentions, the time span it covers and how
     /// many of each event it holds. This is the cheap answer to "what is on the
     /// stick", and the one that runs on a router.
     ProbeSegment {
-        /// Directory holding `<date>.redb` segments, e.g. `/mnt/usb/tgws-logs`.
+        /// Directory holding `<date>.seg` segments, e.g. `/mnt/usb/tgws-logs`.
         dir: PathBuf,
     },
     /// Print one JSON object per record, and one per batch above them.
@@ -1087,7 +1110,7 @@ pub enum Command {
     /// timestamp, connection, sequence number, level, category and the event
     /// with the schema's own field names.
     DumpSegment {
-        /// Directory holding `<date>.redb` segments.
+        /// Directory holding `<date>.seg` segments.
         dir: PathBuf,
         /// Only this day, spelled as the segment's file stem (`2026-10-13`).
         /// Omitted, every segment in the directory is dumped in date order.
