@@ -3,8 +3,8 @@
 # The vendored library keeps its own target and lock: the proxy's lock pins
 # the crates, and a second lock here would be a second answer to pin.
 vendor/logreel/target/
-# The tools' workspace has its own target too.
-tools/log-tools/target/
+# The migration tool is local-only: never committed, never published.
+tools/log-tools/
 vendor/logreel/Cargo.lock
 /openwrt/files/tg-ws-proxy
 .DS_Store
