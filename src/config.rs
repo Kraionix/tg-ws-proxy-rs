@@ -508,7 +508,7 @@ pub struct Config {
     /// the ring still see every one of them, and nothing is written to disk.
     ///
     /// The directory is created when it is missing. It has to be on a
-    /// filesystem that can hold a lock-protected database — ext4, xfs, btrfs,
+    /// filesystem that can keep an append-only segment — ext4, xfs, btrfs,
     /// f2fs, tmpfs or overlayfs — so a FAT-family mount is refused at startup
     /// rather than allowed to corrupt a segment later.
     #[cfg(feature = "log-disk")]

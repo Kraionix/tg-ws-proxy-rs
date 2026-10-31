@@ -786,9 +786,10 @@ async fn wait_until(mut condition: impl FnMut() -> bool) {
     panic!("condition never became true");
 }
 
-/// A runtime that never polls the writer task, so that everything the producers
-/// do is observable without a race.
-fn unpolled_runtime() -> tokio::runtime::Runtime {
+/// A current-thread runtime for the async entry points the tests drive from the
+/// test thread. The writer is the library's own std thread, not a task on this
+/// runtime, so nothing here depends on the runtime being polled.
+fn current_thread_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -916,7 +917,7 @@ fn dropped_records_are_reported_at_the_next_flush() {
     // The writer is a std thread now, so it has to be *kept* from draining: a
     // sink that sleeps in its write is what a full channel needs. Emitting then
     // fills the channel, and the next flush has to turn the count into a record.
-    let runtime = unpolled_runtime();
+    let runtime = current_thread_runtime();
     let shared = Arc::new(Recording::default());
     let sink = RecordingSink {
         shared: Arc::clone(&shared),
@@ -984,7 +985,7 @@ fn a_filter_keeps_its_floor_and_everything_above_it() {
 
 #[test]
 fn the_gate_is_the_union_of_the_consumers_policies() {
-    let runtime = unpolled_runtime();
+    let runtime = current_thread_runtime();
 
     // Text at info, ring off: the union is info, so an info payload is built
     // for the text view. With the on-disk sink in the build its floor sits at
@@ -1061,7 +1062,7 @@ async fn a_record_the_segment_does_not_keep_never_reaches_it() {
 
 #[test]
 fn session_ids_start_at_one_and_never_repeat_zero() {
-    let runtime = unpolled_runtime();
+    let runtime = current_thread_runtime();
     let (sink, _shared, _batches) = recording();
     let handle = runtime.block_on(async { start(sink, Settings::default()) });
 
@@ -1090,13 +1091,12 @@ fn the_channel_fits_the_router_ram_budget() {
 
 #[test]
 fn emit_does_not_wait_for_the_writer() {
-    // The writer task is never polled, so the channel has room for exactly its
-    // capacity and every send succeeds: this measures the emit path itself —
-    // filter, timestamp, sequence number, non-blocking send — with no sink
-    // work behind it to hide behind. A fresh handle per round keeps the
-    // channel from filling up.
+    // The writer thread drains the channel, but the emit path never waits for
+    // it: this measures filter, timestamp, sequence number and the non-blocking
+    // send, with the sink work happening behind the channel. A fresh handle per
+    // round keeps the channel from filling up.
     const ROUNDS: u32 = 8;
-    let runtime = unpolled_runtime();
+    let runtime = current_thread_runtime();
     let mut elapsed = Duration::ZERO;
     let mut dropped = 0;
 
@@ -1123,17 +1123,17 @@ fn emit_does_not_wait_for_the_writer() {
     );
 }
 
-/// The view lives in the writer task and `LogHandle` holds no reference to it,
-/// so a text sink that blocks — a terminal nobody reads, a volume that has gone
-/// away — cannot reach the connection path. The cost below is measured with the
-/// writer task never polled, so it is the emit path itself: a view that had
-/// crept onto it would show up as a file write per record.
+/// The view lives on the writer thread and `LogHandle` holds no reference to
+/// it, so a text sink that blocks — a terminal nobody reads, a volume that has
+/// gone away — cannot reach the connection path. The cost below is the emit
+/// path itself: a view that had crept onto it would show up as a file write per
+/// record.
 #[test]
 fn emit_does_not_wait_for_the_text_view() {
     const ROUNDS: u32 = 4;
     let dir = TempDir::new("emit-view");
     let path = dir.path().join("text.log");
-    let runtime = unpolled_runtime();
+    let runtime = current_thread_runtime();
 
     let mut costs = Vec::new();
     for target in [TextTarget::Off, TextTarget::File(path.clone())] {
@@ -1697,7 +1697,7 @@ fn a_record_emitted_while_the_writer_is_stopping_still_reaches_the_sink() {
     // moment between "stop" and "the writer exits" is exactly when the last
     // session's close record is produced. Dropping it would make the end of a
     // session the one thing a clean stop is allowed to lose.
-    let runtime = unpolled_runtime();
+    let runtime = current_thread_runtime();
     let (sink, _shared, mut batches) = recording();
     let handle = Arc::new(runtime.block_on(async { start(sink, quiet(DEFAULT_BATCH_MAX)) }));
     let late = Arc::clone(&handle);
@@ -2106,7 +2106,7 @@ fn a_segment_is_owner_only() {
 #[cfg(feature = "log-disk")]
 #[test]
 fn records_written_through_the_pipeline_are_readable_back() {
-    let runtime = unpolled_runtime();
+    let runtime = current_thread_runtime();
     let dir = TempDir::new("pipeline");
     let day = logreel::file::today();
     let sink = open_sink(dir.path(), Options::default());
@@ -2154,7 +2154,7 @@ fn init_starts_a_writable_segment_from_the_public_entry_point() {
     // What the startup path calls, with none of the test's own plumbing in
     // between: `init` opens the directory, spawns the writer, and the record
     // comes back out of the file on the other side.
-    let runtime = unpolled_runtime();
+    let runtime = current_thread_runtime();
     let dir = TempDir::new("init");
     let day = logreel::file::today();
 
@@ -2179,7 +2179,7 @@ fn init_starts_a_writable_segment_from_the_public_entry_point() {
 fn without_a_directory_the_records_still_reach_the_text() {
     // What an unset `--log-dir` means: the pipeline runs, the sink keeps
     // nothing, and the text view is the whole of what the records are for.
-    let runtime = unpolled_runtime();
+    let runtime = current_thread_runtime();
     let dir = TempDir::new("memory-sink");
     let path = dir.path().join("text.log");
     let settings = text_into(&path, Filter::at(Level::Info), Filter::off());
@@ -2310,7 +2310,7 @@ fn reading_a_segment_leaves_its_bytes_alone() {
     // different SHA-256 after every `probe`. A segment that changes when it is
     // read is not an archive: a hash taken before the read stops describing the
     // file, and a stick in a router takes writes nobody asked for.
-    let runtime = unpolled_runtime();
+    let runtime = current_thread_runtime();
     let dir = TempDir::new("read-only");
     let date = logreel::file::day_name(logreel::file::today());
 

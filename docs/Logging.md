@@ -285,8 +285,9 @@ Three facts about a router that the log cannot fix, only record:
   previous day's file — the file a batch goes to is the day the clock says, not the day the records
   are from, and a rotation forward is never undone.
 
-  Measured case, reference router, boot at 01:31:15 UTC on 2026-10-13: the clock came up reading
-  2026-10-12 15:00:47, the sink opened `2026-10-12.redb`, the first seven records (`domain_list_fetched`
+  Measured case, reference router, boot at 01:31:15 UTC on 2026-10-13 (the sink then wrote redb,
+  before the segment format): the clock came up reading 2026-10-12 15:00:47, the sink opened
+  `2026-10-12.redb`, the first seven records (`domain_list_fetched`
   failing with `tcp_connect`, `startup_summary`, four `pool_refill`s, `warmup_complete` — the boot had
   no network yet) were written there, and at 01:31:51 `ntpd` stepped the clock forward 630 minutes
   (`crond` logged `time disparity of 630 minutes detected`). The next batch rotated to `2026-10-13.redb`,
@@ -311,14 +312,14 @@ Three facts about a router that the log cannot fix, only record:
 
 ## Where to put the directory
 
-The sink needs a filesystem it can trust with a lock-protected database, and it says so at startup
-rather than corrupting a segment later: `--log-dir` on a FAT-family mount is refused with
+The sink needs a filesystem it can trust with an append-only segment, and it says so at startup
+rather than corrupting one later: `--log-dir` on a FAT-family mount is refused with
 `ErrorCode::FsUnsupported` before anything is opened.
 
 | Filesystem | Verdict | Why |
 |---|---|---|
 | `ext4`, `xfs`, `btrfs`, `f2fs`, `tmpfs`, `overlayfs`, `ubifs` | accepted | journalled or log-structured; POSIX locks and `fsync` behave |
-| `vfat`, `msdos`, `umsdos`, `exfat`, `ntfs`, `ntfs3`, `fuseblk`, `hpfs` | **refused at startup** | a support decision, not a kernel limitation: the database's locking and durability on those mounts is untested here, and "very probably" is not a promise to make about the one file that holds every session's metadata. The message names the fix — `mkfs.f2fs` on the stick, or `--log-dir` on `tmpfs` |
+| `vfat`, `msdos`, `umsdos`, `exfat`, `ntfs`, `ntfs3`, `fuseblk`, `hpfs` | **refused at startup** | a support decision, not a kernel limitation: segment locking and append durability on those mounts are untested here, and "very probably" is not a promise to make about the one file that holds every session's record. The message names the fix — `mkfs.f2fs` on the stick, or `--log-dir` on `tmpfs` |
 | anything unrecognised | accepted, with a warning | a filesystem this code has never heard of is more likely a new Linux one than a FAT variant |
 
 Practical choices, from cheap to durable:

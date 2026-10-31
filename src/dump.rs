@@ -25,9 +25,9 @@
 //! is kept as that number rather than dropped or left to fail the read.
 //!
 //! Neither verb writes to the segment: both go through
-//! [`crate::log::storage::iter_batches`], which reads a private copy. A dump is
-//! therefore safe on the live day's file, and a hash taken of a segment before
-//! and after a read still describes the same bytes.
+//! [`crate::log::storage::iter_batches`], which opens the file read-only and
+//! streams it. A dump is therefore safe on the live day's file, and a hash taken
+//! of a segment before and after a read still describes the same bytes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};

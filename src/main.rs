@@ -108,7 +108,7 @@ async fn shutdown_signal() -> ShutdownSignal {
         //
         // Printed rather than recorded, unlike every other line about a stop:
         // the process is about to exit, and a record that has not reached the
-        // writer task yet would be lost with it — which is the one thing this
+        // writer thread yet would be lost with it — which is the one thing this
         // line exists to avoid.
         tokio::spawn(async move {
             tokio::select! {

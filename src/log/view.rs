@@ -2,7 +2,7 @@
 //! lines go to.
 //!
 //! The view is not a second consumer with a task of its own. It is a struct
-//! owned by the writer task, and it is fed the record the writer has just taken
+//! owned by the writer thread, and it is fed the record the writer has just taken
 //! off the channel, before the segment's own filter decides what to do with it.
 //! Three things follow, and they are the reasons it is built this way:
 //!
@@ -92,7 +92,7 @@ pub fn clamp_ring(capacity: usize) -> usize {
 ///
 /// Part of [`Settings`] rather than a sink, because the sink holds an open file
 /// and `Settings` is cloned: the target is what the operator chose, and the
-/// writer task opens it once.
+/// writer thread opens it once.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TextTarget {
     /// The text view is not written anywhere. The ring still fills.

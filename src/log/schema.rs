@@ -39,7 +39,8 @@ pub const SCHEMA_VERSION: u32 = 2;
 /// batches by connection any more -- the library's `batch_max` decides where a
 /// batch ends, and a converted day can hold far more sessions than this -- but
 /// the number is still hashed into [`fingerprint`], and removing it would move
-/// the hash and refuse every `.redb` file written before the segment backend.
+/// the hash and make the writer refuse every segment already written in this
+/// format.
 pub const BATCH_MAX_UNIQUE_CONNS: usize = 16;
 
 // ── Envelope ───────────────────────────────────────────────────────────────
