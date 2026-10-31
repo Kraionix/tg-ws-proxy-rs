@@ -9,16 +9,18 @@ tools/sync-logreel.sh ../logreel
 
 | item | value |
 |---|---|
-| source commit | `5b5ffc445f376168540e28bbdfc5809055288c3b` |
-| source tree | `721382bfd5dd4097587d2f3c135e01803a85350d` |
+| source commit | `e2051baede31ee03a84857d474a197a1e3b03b1a` |
+| source tree | `16b5b3acf49840623cc376462d0a76e07e829aca` |
 | version | `0.3.0` |
 | crates | `logreel`, `logreel-core`, `logreel-store`, `logreel-file` |
 | fixtures | `fixtures/` (the file crate's conformance corpus) |
+| specification | `docs/SPEC.md` and `docs/FORMAT.md` are not copied; the format documents stay in the logreel repository |
 
 ## Patches
 
 1. **No redb backend.** `logreel-store-redb` is not vendored: its optional
-   dependency, its `redb` feature and the facade's re-export of it are removed.
+   dependency, its `redb` feature and the facade's re-export of it are removed,
+   and so is the facade test that opens that backend.
    The proxy writes segments and has no use for a second storage engine, and a
    dependency the build can resolve but never use is one a rebuild may
    accidentally link.

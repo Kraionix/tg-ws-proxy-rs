@@ -40,7 +40,7 @@
 //! payload to [`emit`](LogHandle::emit). The library stamps the wall clock and
 //! the process-wide sequence number and pushes onto a bounded channel with
 //! `try_send` — never a lock, never an `await`, because this runs on the routing
-//! path in the middle of connection setup. The writer task at the far end
+//! path in the middle of connection setup. The writer thread at the far end
 //! batches records and hands them to whatever sink the caller chose; the
 //! channel, the filters and the batching are the library's, so this module owns
 //! the settings and the view and not a second pipeline.
@@ -497,7 +497,7 @@ pub fn init(settings: Settings, disk: Option<Disk>) -> Result<Arc<LogHandle>, Lo
             )
         }
         None => (
-            Box::new(logreel::SharedSink::new()),
+            Box::new(logreel::NullSink::new()),
             logreel::Durability::Eventual,
         ),
     };
@@ -507,7 +507,7 @@ pub fn init(settings: Settings, disk: Option<Disk>) -> Result<Arc<LogHandle>, Lo
         // which is the point: without the feature there is no sink to hand over.
         let _ = disk;
         (
-            Box::new(logreel::SharedSink::new()),
+            Box::new(logreel::NullSink::new()),
             logreel::Durability::Eventual,
         )
     };

@@ -1,6 +1,6 @@
 [package]
 name = "logreel-core"
-description = "Typed event pipeline for logreel: envelope, filters, scopes, text projection"
+description = "Typed event pipeline for logreel: envelope, filters, scopes, observer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

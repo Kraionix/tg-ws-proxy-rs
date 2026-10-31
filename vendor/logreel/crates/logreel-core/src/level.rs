@@ -43,7 +43,7 @@ impl Level {
         self as u8
     }
 
-    /// Upper case name used by the text projection.
+    /// Upper case name for a consumer that prints a level.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

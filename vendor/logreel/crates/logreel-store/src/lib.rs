@@ -374,9 +374,35 @@ impl BatchSink for SharedSink {
     }
 }
 
+/// A sink that accepts every batch and keeps none.
+///
+/// The pipeline always has a sink, including in a process that writes no
+/// segment: batching, the flush timer and the overflow report must take the
+/// same path whether or not a file is behind them. This sink is that path's
+/// destination -- it keeps nothing, so a run without storage does not grow a
+/// buffer it can never read.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NullSink;
+
+impl NullSink {
+    /// Create the sink.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl BatchSink for NullSink {
+    fn write_batch(&mut self, _batch: &EncodedBatch) -> Result<(), StoreError> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BatchSink, Durability, EncodedBatch, ErrorKind, MemoryStore, Store, StoreError};
+    use super::{
+        BatchSink, Durability, EncodedBatch, ErrorKind, MemoryStore, NullSink, Store, StoreError,
+    };
 
     fn batch(count: u32) -> EncodedBatch {
         EncodedBatch::new(
@@ -426,6 +452,14 @@ mod tests {
         assert!(!error.is_recoverable());
         let truncated = StoreError::new(ErrorKind::Truncated, "eof").at(9);
         assert!(truncated.is_recoverable());
+    }
+
+    #[test]
+    fn null_sink_takes_a_batch_through_a_trait_object() {
+        let mut sink: Box<dyn BatchSink> = Box::new(NullSink::new());
+        sink.write_batch(&batch(3)).expect("write");
+        sink.sync(Durability::OnWarn).expect("sync");
+        sink.flush().expect("flush");
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use logreel_core::{Level, Settings, SharedSink, init};
+use logreel_core::{Level, NullSink, Settings, SharedSink, init};
 use support::{BlockingSink, TestEvent};
 
 fn base() -> logreel_core::SettingsBuilder {
@@ -38,6 +38,24 @@ fn filtered_records_are_not_emitted() {
     let batches = batches.lock().expect("batches");
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].record_count, 1);
+}
+
+#[test]
+fn a_null_sink_takes_the_batches_and_the_report_still_counts() {
+    let logger = init::<TestEvent>(
+        Settings::builder()
+            .min_level(Level::Trace)
+            .batch_max(8)
+            .build(),
+        Box::new(NullSink),
+    )
+    .expect("init");
+    let handle = Arc::clone(logger.handle());
+    for value in 0..5 {
+        assert!(handle.emit(Level::Info, 0, value, TestEvent::Ping(value)));
+    }
+    let report = logger.shutdown();
+    assert_eq!(report.records, 5);
 }
 
 #[test]

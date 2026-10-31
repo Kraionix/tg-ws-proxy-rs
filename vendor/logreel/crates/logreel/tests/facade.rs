@@ -1,6 +1,6 @@
 //! Facade wiring: each backend and feature reaches the same pipeline.
 
-#![cfg(any(feature = "file", feature = "redb"))]
+#![cfg(feature = "file")]
 
 use logreel::{DecodeError, Event, Level, Settings, init};
 
@@ -55,31 +55,4 @@ fn file_backend_through_the_facade() {
     let value = probe(&files[0]).expect("probe");
     assert_eq!(value.records, 5);
     let _ = std::fs::remove_dir_all(&directory);
-}
-
-#[cfg(feature = "redb")]
-#[test]
-fn redb_backend_through_the_facade() {
-    use logreel::Store;
-    use logreel::redb::RedbStore;
-
-    let path = temp("redb");
-    let store = RedbStore::open(&path).expect("store");
-    let logger =
-        init::<Ping>(Settings::builder().batch_max(2).build(), Box::new(store)).expect("init");
-    for value in 0..4 {
-        assert!(logger.handle().emit(Level::Info, 0, value, Ping(value)));
-    }
-    let _ = logger.shutdown();
-    let store = RedbStore::open(&path).expect("reopen");
-    let batches: Vec<_> = store
-        .scan()
-        .expect("scan")
-        .collect::<Result<_, _>>()
-        .expect("batches");
-    assert_eq!(
-        batches.iter().map(|batch| batch.record_count).sum::<u32>(),
-        4
-    );
-    let _ = std::fs::remove_file(&path);
 }

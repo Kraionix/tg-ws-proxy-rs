@@ -8,9 +8,10 @@
 #
 # Usage: tools/sync-logreel.sh [path-to-logreel-repo]
 #
-# One patch is applied to the upstream tree, recorded in VENDORED.md: the
-# facade's optional redb backend is removed, because it is not vendored and the
-# proxy must not be able to resolve a storage engine it no longer uses.
+# Two patches are applied to the upstream tree, recorded in VENDORED.md: the
+# facade's optional redb backend and the derive macro are removed, because
+# neither is vendored and the proxy must not be able to resolve code it never
+# links.
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -45,6 +46,12 @@ sed -i '/^\/\/\/ Optional redb backend\.$/d' "$dest/crates/logreel/src/lib.rs"
 sed -i '/^#\[cfg(feature = "redb")\]$/d' "$dest/crates/logreel/src/lib.rs"
 sed -i '/^pub use logreel_store_redb as redb;$/d' "$dest/crates/logreel/src/lib.rs"
 sed -i 's/Enable file, zstd or redb/Enable file or zstd/' "$dest/crates/logreel/src/lib.rs"
+# The facade has a conformance test for each backend, guarded by that backend's
+# feature. Removing the feature leaves a test that never compiles and a rustc
+# warning about an undeclared `redb` feature, so the test goes with it.
+sed -i 's/^#!\[cfg(any(feature = "file", feature = "redb"))\]$/#![cfg(feature = "file")]/' "$dest/crates/logreel/tests/facade.rs"
+sed -i '/^#\[cfg(feature = "redb")\]$/,/^}$/d' "$dest/crates/logreel/tests/facade.rs"
+sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$dest/crates/logreel/tests/facade.rs"
 # Patch 2: no derive macro.
 #
 # The proxy implements `logreel::Event` by hand over its prost schema: the
@@ -128,11 +135,13 @@ tools/sync-logreel.sh ../logreel
 | version | `@VERSION@` |
 | crates | `logreel`, `logreel-core`, `logreel-store`, `logreel-file` |
 | fixtures | `fixtures/` (the file crate's conformance corpus) |
+| specification | `docs/SPEC.md` and `docs/FORMAT.md` are not copied; the format documents stay in the logreel repository |
 
 ## Patches
 
 1. **No redb backend.** `logreel-store-redb` is not vendored: its optional
-   dependency, its `redb` feature and the facade's re-export of it are removed.
+   dependency, its `redb` feature and the facade's re-export of it are removed,
+   and so is the facade test that opens that backend.
    The proxy writes segments and has no use for a second storage engine, and a
    dependency the build can resolve but never use is one a rebuild may
    accidentally link.

@@ -40,7 +40,7 @@ pub use settings::{InternalError, InternalErrorKind, Settings, SettingsBuilder};
 pub use time::{format_utc, now_ns};
 
 pub use logreel_store::{
-    BatchSink, Durability, EncodedBatch, ErrorKind, SharedSink, Store, StoreError,
+    BatchSink, Durability, EncodedBatch, ErrorKind, NullSink, SharedSink, Store, StoreError,
 };
 
 /// Emit an event through the task-local scope.
