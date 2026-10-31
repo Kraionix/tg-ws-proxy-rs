@@ -31,7 +31,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
-use logreel::file::{FileStore, FileStoreConfig, SegmentReader};
+use logreel::file::{
+    FileStore, FileStoreConfig, RetentionAnchor, SEGMENT_SUFFIX, SegmentReader, day_name, today,
+};
 use logreel::{Durability, ErrorKind, Store as _};
 
 use super::LogError;
@@ -53,9 +55,6 @@ const BACKOFF_STEPS: [Duration; 6] = [
     Duration::from_secs(16),
     Duration::from_secs(60),
 ];
-
-const SEGMENT_SUFFIX: &str = ".seg";
-const NANOS_PER_DAY: u64 = 86_400_000_000_000;
 
 /// Whether a batch is compressed before it is stored.
 ///
@@ -121,10 +120,6 @@ pub(crate) struct FileSink {
     dir: PathBuf,
     options: Options,
     store: Option<FileStore>,
-    /// Days this run has written a segment for; the sweep never deletes one.
-    written: Vec<i64>,
-    /// Day of the file currently open, so a rotation is noticed once.
-    observed_day: Option<i64>,
     backoff: usize,
     retry_at: Option<Instant>,
     /// Set only by the tests, which move the day the store writes to.
@@ -160,31 +155,29 @@ impl FileSink {
             dir: dir.to_path_buf(),
             options,
             store: None,
-            written: Vec::new(),
-            observed_day: None,
             backoff: 0,
             retry_at: None,
             clock,
         };
 
-        let day = sink.today();
         let store = sink
             .connect()
-            .map_err(|error| start_error(error, dir, day))?;
+            .map_err(|error| start_error(error, dir, today()))?;
         sink.store = Some(store);
-        sink.written.push(day);
-        sink.observed_day = sink.active_day();
-        sink.sweep_retention(day);
         Ok(sink)
     }
 
     /// Builds and opens the store, creating (or validating) today's file.
     fn connect(&self) -> Result<FileStore, logreel::StoreError> {
         let mut config = FileStoreConfig::new(&self.dir);
-        // The proxy sweeps with its own window, which counts from the archive
-        // rather than from the clock; two windows would disagree.
-        config.keep_days = 0;
+        // A router has no RTC: count the window from the archive, not from a
+        // clock that may boot at 1970 or next year. The store itself never
+        // deletes a day this run wrote, so a wrong clock costs an old segment
+        // one run longer, never the records of the boot that is running.
+        config.keep_days = self.options.retention_days as usize;
         config.max_total_bytes = 0;
+        config.retention_anchor = RetentionAnchor::NewestSegment;
+        config.on_warning = Some(std::sync::Arc::new(|line: &str| crate::direct!("{line}")));
         config.compress = compressed(self.options.compress);
         config.zstd_level = ZSTD_LEVEL;
 
@@ -212,17 +205,6 @@ impl FileSink {
         Ok(store)
     }
 
-    fn today(&self) -> i64 {
-        today()
-    }
-
-    /// The day of the file the store has open, when it has one.
-    fn active_day(&self) -> Option<i64> {
-        let path = self.store.as_ref()?.active_path()?;
-        let stem = path.file_stem()?.to_str()?;
-        day_of_name(stem)
-    }
-
     fn on_failure(&mut self, error: logreel::StoreError) -> logreel::StoreError {
         // A file that cannot be written to is not necessarily one that cannot be
         // reopened: a removed USB stick becomes writable again when it is
@@ -240,27 +222,6 @@ impl FileSink {
     fn on_success(&mut self) {
         self.backoff = 0;
         self.retry_at = None;
-    }
-
-    /// Notices a rotation and sweeps once per day, not once per batch.
-    fn after_write(&mut self) {
-        let day = match self.active_day() {
-            Some(day) => day,
-            None => return,
-        };
-        if self.observed_day == Some(day) {
-            return;
-        }
-        self.observed_day = Some(day);
-        if !self.written.contains(&day) {
-            self.written.push(day);
-        }
-        self.sweep_retention(day);
-    }
-
-    /// Deletes the segments that have fallen out of the retention window.
-    fn sweep_retention(&self, day: i64) {
-        sweep_retention(&self.dir, self.options.retention_days, day, &self.written);
     }
 }
 
@@ -293,7 +254,6 @@ impl logreel::BatchSink for FileSink {
         match result {
             Ok(()) => {
                 self.on_success();
-                self.after_write();
                 Ok(())
             }
             Err(error) => Err(self.on_failure(error)),
@@ -315,7 +275,7 @@ impl logreel::BatchSink for FileSink {
 /// Reads one day's segment back as the batches the dump verb prints.
 ///
 /// The records are decoded into the proxy's own [`LogRecord`] and the batch
-/// header is rebuilt with [`schema::build_batch`], so `dump-segment` prints the
+/// header is rebuilt with [`schema::header_for`], so `dump-segment` prints the
 /// same bytes for a `.seg` as it did for the redb file it replaced — including
 /// the `kind_mask`, `dc_mask` and connection list, which are derived from the
 /// records rather than stored.
@@ -522,12 +482,6 @@ fn filesystem_of(_path: &Path) -> Option<String> {
     None
 }
 
-// ── Calendar ───────────────────────────────────────────────────────────────
-
-pub(super) fn today() -> i64 {
-    (super::now_ns() / NANOS_PER_DAY) as i64
-}
-
 /// The filesystem `dir` lands on, as the kernel names it, or `None` when it
 /// cannot be determined.
 ///
@@ -543,165 +497,4 @@ pub(crate) fn filesystem_name(dir: &Path) -> Option<String> {
     }
 
     filesystem_of(probe)
-}
-
-/// `YYYY-MM-DD` for a day number since the unix epoch — Howard Hinnant's
-/// `civil_from_days`, shifted to the 1970 epoch.
-pub(super) fn day_name(day: i64) -> String {
-    let shifted = day + 719_468;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted.rem_euclid(146_097);
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_position = (5 * day_of_year + 2) / 153;
-    let day_of_month = day_of_year - (153 * month_position + 2) / 5 + 1;
-    let month = if month_position < 10 {
-        month_position + 3
-    } else {
-        month_position - 9
-    };
-    let year = if month <= 2 { year + 1 } else { year };
-
-    format!("{year:04}-{month:02}-{day_of_month:02}")
-}
-
-/// The date part of a segment file name, if it has one.
-fn segment_day(name: &str) -> Option<&str> {
-    let stem = name.strip_suffix(SEGMENT_SUFFIX)?;
-    let bytes = stem.as_bytes();
-    if bytes.len() != 10 {
-        return None;
-    }
-    let shaped = bytes.iter().enumerate().all(|(i, byte)| {
-        if i == 4 || i == 7 {
-            *byte == b'-'
-        } else {
-            byte.is_ascii_digit()
-        }
-    });
-    shaped.then_some(stem)
-}
-
-/// The day number a `YYYY-MM-DD` name spells, or `None` when it is not one.
-///
-/// The inverse of [`day_name`], needed where retention does arithmetic on what
-/// a file is called: the cutoff is a name, and it is a number of days behind the
-/// newest segment in the directory.
-pub(super) fn day_of_name(name: &str) -> Option<i64> {
-    let bytes = name.as_bytes();
-    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
-        return None;
-    }
-    let number = |range: std::ops::Range<usize>| -> Option<i64> {
-        let mut value = 0i64;
-        for byte in &bytes[range] {
-            if !byte.is_ascii_digit() {
-                return None;
-            }
-            value = value * 10 + i64::from(byte - b'0');
-        }
-        Some(value)
-    };
-    let year = number(0..4)?;
-    let month = number(5..7)?;
-    let day = number(8..10)?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    Some(days_from_civil(year, month, day))
-}
-
-/// `YYYY-MM-DD` to days since the unix epoch — Howard Hinnant's
-/// `days_from_civil`, the arithmetic [`day_name`] undoes.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = if month <= 2 { year - 1 } else { year };
-    let era = year.div_euclid(400);
-    let year_of_era = year - era * 400;
-    let month_position = if month > 2 { month - 3 } else { month + 9 };
-    let day_of_year = (153 * month_position + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
-}
-
-/// Deletes the segments that have fallen out of the retention window.
-///
-/// The window is counted from whichever is earlier: the day the clock says, or
-/// the day after the newest segment in `dir` that this run did not write. And
-/// nothing this run wrote is deleted, whatever its name says.
-///
-/// Both rules are there because the clock is the least reliable thing on the
-/// devices this ships to. A router has no RTC: `sysfixtime` sets the time from
-/// the newest file in `/etc` and `ntpd` corrects it later, measured on the
-/// reference router at +4 h 55 m, +8 h 18 m and +10 h 30 m. Counted from the
-/// clock alone, a run that boots reading 1970 deletes the segment it just wrote
-/// on the first rotation — the records of that very boot — and a run that boots
-/// reading next year sweeps the whole directory at startup, before it has
-/// recorded anything. Counted this way, the worst a wrong clock can do is keep
-/// an old segment one run longer. The other half of the same reasoning is that
-/// a *correct* clock after a long outage does not delete the archive either: the
-/// window moves with the data, one run behind.
-///
-/// Names, not modification times: the date in the file name is the date the
-/// records belong to, and an `mtime` moves whenever a file is copied or a clock
-/// is wrong. Anything whose name is not a `YYYY-MM-DD.seg` date is left alone —
-/// this directory may not be ours exclusively.
-pub(super) fn sweep_retention(dir: &Path, retention_days: u32, clock_day: i64, written: &[i64]) {
-    if retention_days == 0 {
-        return;
-    }
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(error) => {
-            crate::direct!("cannot sweep log retention in {}: {error}", dir.display());
-            return;
-        }
-    };
-
-    // One pass over the directory: the segments this run did not write, and the
-    // newest day among them — the archive's own idea of "now".
-    let mut foreign: Vec<(String, i64)> = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str().map(str::to_string) else {
-            continue;
-        };
-        let Some(segment) = segment_day(&name) else {
-            continue;
-        };
-        if written.iter().any(|day| day_name(*day) == segment) {
-            continue;
-        }
-        if let Some(day) = day_of_name(segment) {
-            foreign.push((name, day));
-        }
-    }
-    let Some(newest) = foreign.iter().map(|(_, day)| *day).max() else {
-        // Nothing here that this run did not write, so there is nothing older
-        // than it to delete either.
-        return;
-    };
-
-    // A segment dated `d` means the log knows about day `d`, and the day after
-    // it is where "now" is as far as the archive is concerned; the window ends
-    // on whichever of that and the clock's day comes first.
-    let base = (newest + 1).min(clock_day);
-    if (clock_day - newest).abs() > i64::from(retention_days) {
-        crate::direct!(
-            "log retention: the clock says {} but the newest segment is {}; \
-             counting the window from the segment",
-            day_name(clock_day),
-            day_name(newest)
-        );
-    }
-
-    let cutoff = base - i64::from(retention_days) + 1;
-    for (name, day) in foreign {
-        if day < cutoff
-            && let Err(error) = fs::remove_file(dir.join(&name))
-        {
-            crate::direct!("cannot delete the expired segment {name}: {error}");
-        }
-    }
 }

@@ -1609,7 +1609,7 @@ fn a_segment_from_another_schema_is_refused_rather_than_appended_to() {
 #[test]
 fn a_segment_round_trips_every_batch() {
     let dir = TempDir::new("roundtrip");
-    let day = storage::today();
+    let day = logreel::file::today();
     let mut sink = open_sink(dir.path(), Options::default());
 
     let first = batch_of(&[1, 2, 3]);
@@ -1618,7 +1618,8 @@ fn a_segment_round_trips_every_batch() {
     sink.write(&second).expect("the batch is written");
     drop(sink);
 
-    let read_back = storage::iter_batches(dir.path(), &storage::day_name(day)).expect("readable");
+    let read_back =
+        storage::iter_batches(dir.path(), &logreel::file::day_name(day)).expect("readable");
     assert_eq!(read_back, vec![first, second]);
 }
 
@@ -1626,7 +1627,7 @@ fn a_segment_round_trips_every_batch() {
 #[test]
 fn a_restart_inside_the_same_day_appends_to_the_same_segment() {
     let dir = TempDir::new("restart");
-    let day = storage::today();
+    let day = logreel::file::today();
 
     let first = batch_of(&[1]);
     let mut sink = open_sink(dir.path(), Options::default());
@@ -1640,11 +1641,11 @@ fn a_restart_inside_the_same_day_appends_to_the_same_segment() {
 
     assert_eq!(
         dir.entries(),
-        vec![format!("{}.seg", storage::day_name(day))],
+        vec![format!("{}.seg", logreel::file::day_name(day))],
         "one segment for the day, not one per run"
     );
     assert_eq!(
-        storage::iter_batches(dir.path(), &storage::day_name(day)).expect("readable"),
+        storage::iter_batches(dir.path(), &logreel::file::day_name(day)).expect("readable"),
         vec![first, second]
     );
 }
@@ -1654,7 +1655,7 @@ fn a_restart_inside_the_same_day_appends_to_the_same_segment() {
 fn both_durability_modes_survive_a_clean_close() {
     for mode in [DurabilityMode::Eventual, DurabilityMode::Immediate] {
         let dir = TempDir::new("durability");
-        let day = storage::today();
+        let day = logreel::file::today();
         let batch = batch_of(&[1]);
 
         let mut sink = open_sink(
@@ -1668,7 +1669,7 @@ fn both_durability_modes_survive_a_clean_close() {
         drop(sink);
 
         assert_eq!(
-            storage::iter_batches(dir.path(), &storage::day_name(day)).expect("readable"),
+            storage::iter_batches(dir.path(), &logreel::file::day_name(day)).expect("readable"),
             vec![batch],
             "{mode:?} lost a batch on a clean close"
         );
@@ -1707,7 +1708,7 @@ fn a_record_emitted_while_the_writer_is_stopping_still_reaches_the_sink() {
 #[test]
 fn zstd_shrinks_a_rich_batch_and_round_trips_it() {
     let batch = rich_batch();
-    let day = storage::day_name(storage::today());
+    let day = logreel::file::day_name(logreel::file::today());
 
     let plain_dir = TempDir::new("zstd-plain");
     let mut plain = open_sink(
@@ -1756,7 +1757,7 @@ fn zstd_shrinks_a_rich_batch_and_round_trips_it() {
 #[test]
 fn a_compressed_segment_reads_back_as_written() {
     let dir = TempDir::new("compressed");
-    let day = storage::today();
+    let day = logreel::file::today();
     let batch = rich_batch();
 
     let mut sink = open_sink(
@@ -1770,7 +1771,7 @@ fn a_compressed_segment_reads_back_as_written() {
     drop(sink);
 
     assert_eq!(
-        storage::iter_batches(dir.path(), &storage::day_name(day)).expect("readable"),
+        storage::iter_batches(dir.path(), &logreel::file::day_name(day)).expect("readable"),
         vec![batch]
     );
 }
@@ -1831,7 +1832,10 @@ fn a_second_sink_on_the_same_directory_is_refused() {
     let second = FileSink::open(dir.path(), Options::default());
     match second {
         Err(LogError::WriterConflict(path)) => {
-            assert!(path.ends_with(format!("{}.seg", storage::day_name(storage::today()))));
+            assert!(path.ends_with(format!(
+                "{}.seg",
+                logreel::file::day_name(logreel::file::today())
+            )));
         }
         Err(other) => panic!("expected a writer conflict, got {other}"),
         Ok(_) => panic!("a second writer took the segment"),
@@ -1842,7 +1846,7 @@ fn a_second_sink_on_the_same_directory_is_refused() {
 #[test]
 fn the_segment_records_its_provenance() {
     let dir = TempDir::new("meta");
-    let date = storage::day_name(storage::today());
+    let date = logreel::file::day_name(logreel::file::today());
     let mut sink = open_sink(dir.path(), Options::default());
     sink.write(&batch_of(&[1])).expect("written");
     drop(sink);
@@ -1889,14 +1893,14 @@ fn the_fingerprint_follows_the_schema() {
 #[test]
 fn retention_deletes_expired_segments_and_nothing_else() {
     let dir = TempDir::new("retention");
-    let today = storage::today();
+    let today = logreel::file::today();
     let mut expected = Vec::new();
 
     // Placeholders older than today. The sweep only reads names, so an empty
     // file stands in for a day this run did not write; today's file has to be
     // a real segment, because the sink opens it.
     for age in 1..12 {
-        let name = format!("{}.seg", storage::day_name(today - age));
+        let name = format!("{}.seg", logreel::file::day_name(today - age));
         fs::write(dir.path().join(&name), b"").expect("a placeholder segment");
         if age < 7 {
             expected.push(name);
@@ -1912,7 +1916,7 @@ fn retention_deletes_expired_segments_and_nothing_else() {
         },
     ));
 
-    expected.push(format!("{}.seg", storage::day_name(today)));
+    expected.push(format!("{}.seg", logreel::file::day_name(today)));
     expected.push("notes.txt".to_string());
     expected.sort();
     assert_eq!(dir.entries(), expected, "seven days kept, the rest swept");
@@ -1922,8 +1926,8 @@ fn retention_deletes_expired_segments_and_nothing_else() {
 #[test]
 fn retention_zero_keeps_everything() {
     let dir = TempDir::new("keepall");
-    let today = storage::today();
-    let ancient = format!("{}.seg", storage::day_name(today - 400));
+    let today = logreel::file::today();
+    let ancient = format!("{}.seg", logreel::file::day_name(today - 400));
     fs::write(dir.path().join(&ancient), b"").expect("a placeholder segment");
 
     drop(open_sink(
@@ -1939,23 +1943,6 @@ fn retention_zero_keeps_everything() {
 
 #[cfg(feature = "log-disk")]
 #[test]
-fn a_segment_name_round_trips_through_its_day_number() {
-    // Retention does arithmetic on what a file is called, so the name parser has
-    // to agree with the name writer exactly: a day of disagreement is a segment
-    // deleted a day early, or one that never expires.
-    for day in [0, 1, 19_000, 20_451, -1, storage::today()] {
-        let name = storage::day_name(day);
-        assert_eq!(storage::day_of_name(&name), Some(day), "{name}");
-    }
-    assert_eq!(storage::day_name(0), "1970-01-01");
-    assert_eq!(storage::day_of_name("1970-01-01"), Some(0));
-    assert_eq!(storage::day_of_name("2026-13-01"), None);
-    assert_eq!(storage::day_of_name("2026-10-32"), None);
-    assert_eq!(storage::day_of_name("not-a-date"), None);
-}
-
-#[cfg(feature = "log-disk")]
-#[test]
 fn a_clock_in_the_future_does_not_sweep_the_archive() {
     // A router with no RTC can come up reading next year: the clock is set from
     // the newest file in /etc, which is a date, not a promise. Counted from the
@@ -1963,29 +1950,43 @@ fn a_clock_in_the_future_does_not_sweep_the_archive() {
     // record is written; counted from the archive, the newest segment is what
     // the window hangs on.
     let dir = TempDir::new("future-clock");
-    let today = storage::today();
+    let today = logreel::file::today();
     for age in [1, 5, 40] {
         fs::write(
             dir.path()
-                .join(format!("{}.seg", storage::day_name(today - age))),
+                .join(format!("{}.seg", logreel::file::day_name(today - age))),
             b"",
         )
         .expect("a placeholder segment");
     }
 
-    storage::sweep_retention(dir.path(), 7, today + 4_000, &[]);
+    let clock: std::sync::Arc<dyn logreel::file::Clock> =
+        std::sync::Arc::new(ManualClock::at(today + 4_000));
+    let _sink = FileSink::open_with_clock(
+        dir.path(),
+        Options {
+            retention_days: 7,
+            ..Options::default()
+        },
+        clock,
+    )
+    .expect("the sink opens");
 
     let kept = dir.entries();
     assert!(
-        kept.contains(&format!("{}.seg", storage::day_name(today - 1))),
+        kept.contains(&format!("{}.seg", logreel::file::day_name(today + 4_000))),
+        "the run's own segment is missing: {kept:?}"
+    );
+    assert!(
+        kept.contains(&format!("{}.seg", logreel::file::day_name(today - 1))),
         "a clock from the future swept the newest segment: {kept:?}"
     );
     assert!(
-        kept.contains(&format!("{}.seg", storage::day_name(today - 5))),
+        kept.contains(&format!("{}.seg", logreel::file::day_name(today - 5))),
         "a segment inside the window was swept: {kept:?}"
     );
     assert!(
-        !kept.contains(&format!("{}.seg", storage::day_name(today - 40))),
+        !kept.contains(&format!("{}.seg", logreel::file::day_name(today - 40))),
         "a segment outside the window was kept: {kept:?}"
     );
 }
@@ -1999,32 +2000,43 @@ fn a_clock_that_boots_in_the_past_does_not_delete_this_runs_segment() {
     // corrected the clock. The file this run is writing is not expired, whatever
     // its name says — deleting it would delete the records of that very boot.
     let dir = TempDir::new("past-clock");
-    let today = storage::today();
+    let today = logreel::file::today();
     let ours = today - 5_000;
-    fs::write(
-        dir.path().join(format!("{}.seg", storage::day_name(ours))),
-        b"",
-    )
-    .expect("the segment this run would have written");
     for age in [1, 30] {
         fs::write(
             dir.path()
-                .join(format!("{}.seg", storage::day_name(today - age))),
+                .join(format!("{}.seg", logreel::file::day_name(today - age))),
             b"",
         )
         .expect("a placeholder segment");
     }
 
-    storage::sweep_retention(dir.path(), 7, today, &[ours]);
+    // The boot starts years off and writes its segment; ntpd corrects the
+    // clock and the next write rotates into today. Both days are this run's.
+    let clock = std::sync::Arc::new(ManualClock::at(ours));
+    let sink_clock: std::sync::Arc<dyn logreel::file::Clock> = clock.clone();
+    let mut sink = FileSink::open_with_clock(
+        dir.path(),
+        Options {
+            retention_days: 7,
+            ..Options::default()
+        },
+        sink_clock,
+    )
+    .expect("the sink opens");
+    sink.write(&batch_of(&[1])).expect("written");
+    clock.set(today);
+    sink.write(&batch_of(&[2])).expect("written");
+    drop(sink);
 
     let kept = dir.entries();
     assert!(
-        kept.contains(&format!("{}.seg", storage::day_name(ours))),
+        kept.contains(&format!("{}.seg", logreel::file::day_name(ours))),
         "the sweep deleted the segment this run wrote: {kept:?}"
     );
-    assert!(kept.contains(&format!("{}.seg", storage::day_name(today - 1))));
+    assert!(kept.contains(&format!("{}.seg", logreel::file::day_name(today - 1))));
     assert!(
-        !kept.contains(&format!("{}.seg", storage::day_name(today - 30))),
+        !kept.contains(&format!("{}.seg", logreel::file::day_name(today - 30))),
         "a segment outside the window was kept: {kept:?}"
     );
 }
@@ -2033,7 +2045,7 @@ fn a_clock_that_boots_in_the_past_does_not_delete_this_runs_segment() {
 #[test]
 fn rotation_moves_to_the_next_day_without_losing_the_previous_one() {
     let dir = TempDir::new("rotation");
-    let today = storage::today();
+    let today = logreel::file::today();
     let clock = std::sync::Arc::new(ManualClock::at(today));
     let mut sink = FileSink::open_with_clock(dir.path(), Options::default(), clock.clone())
         .expect("the sink opens");
@@ -2048,16 +2060,16 @@ fn rotation_moves_to_the_next_day_without_losing_the_previous_one() {
     assert_eq!(
         dir.entries(),
         vec![
-            format!("{}.seg", storage::day_name(today)),
-            format!("{}.seg", storage::day_name(today + 1)),
+            format!("{}.seg", logreel::file::day_name(today)),
+            format!("{}.seg", logreel::file::day_name(today + 1)),
         ]
     );
     assert_eq!(
-        storage::iter_batches(dir.path(), &storage::day_name(today)).expect("readable"),
+        storage::iter_batches(dir.path(), &logreel::file::day_name(today)).expect("readable"),
         vec![first]
     );
     assert_eq!(
-        storage::iter_batches(dir.path(), &storage::day_name(today + 1)).expect("readable"),
+        storage::iter_batches(dir.path(), &logreel::file::day_name(today + 1)).expect("readable"),
         vec![second]
     );
 }
@@ -2069,7 +2081,7 @@ fn a_segment_is_owner_only() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let dir = TempDir::new("mode");
-    let date = storage::day_name(storage::today());
+    let date = logreel::file::day_name(logreel::file::today());
     drop(open_sink(dir.path(), Options::default()));
 
     let mode = fs::metadata(dir.path().join(format!("{date}.seg")))
@@ -2085,7 +2097,7 @@ fn a_segment_is_owner_only() {
 fn records_written_through_the_pipeline_are_readable_back() {
     let runtime = unpolled_runtime();
     let dir = TempDir::new("pipeline");
-    let day = storage::today();
+    let day = logreel::file::today();
     let sink = open_sink(dir.path(), Options::default());
     let handle = runtime.block_on(async { start(sink, Settings::default()) });
 
@@ -2096,7 +2108,8 @@ fn records_written_through_the_pipeline_are_readable_back() {
     }
     runtime.block_on(handle.shutdown());
 
-    let batches = storage::iter_batches(dir.path(), &storage::day_name(day)).expect("readable");
+    let batches =
+        storage::iter_batches(dir.path(), &logreel::file::day_name(day)).expect("readable");
     let records: usize = batches.iter().map(|batch| batch.records.len()).sum();
     assert_eq!(records, 3 * (DEFAULT_BATCH_MAX / 3));
     let conns: Vec<u64> = batches
@@ -2114,7 +2127,7 @@ fn an_empty_segment_reads_back_as_an_empty_day() {
     // corrupt-file error — and `--log-level error` over a healthy proxy is
     // exactly a day with nothing in it.
     let dir = TempDir::new("empty");
-    let date = storage::day_name(storage::today());
+    let date = logreel::file::day_name(logreel::file::today());
     drop(open_sink(dir.path(), Options::default()));
 
     assert!(
@@ -2132,7 +2145,7 @@ fn init_starts_a_writable_segment_from_the_public_entry_point() {
     // comes back out of the file on the other side.
     let runtime = unpolled_runtime();
     let dir = TempDir::new("init");
-    let day = storage::today();
+    let day = logreel::file::today();
 
     let handle = runtime
         .block_on(async { init_with_dir(Settings::default(), Some(dir.path())) })
@@ -2140,7 +2153,8 @@ fn init_starts_a_writable_segment_from_the_public_entry_point() {
     handle.emit(1, Category::Accept, Level::Info, pool_hit(2));
     runtime.block_on(handle.shutdown());
 
-    let batches = storage::iter_batches(dir.path(), &storage::day_name(day)).expect("readable");
+    let batches =
+        storage::iter_batches(dir.path(), &logreel::file::day_name(day)).expect("readable");
     assert_eq!(
         batches
             .iter()
@@ -2210,7 +2224,7 @@ async fn the_text_floor_is_the_text_views_own_policy() {
 #[test]
 fn a_segment_with_a_torn_tail_reads_its_valid_prefix() {
     let dir = TempDir::new("truncated");
-    let date = storage::day_name(storage::today());
+    let date = logreel::file::day_name(logreel::file::today());
     let mut sink = open_sink(dir.path(), Options::default());
     for conn in 1..=4 {
         sink.write(&batch_of(&[conn])).expect("written");
@@ -2246,7 +2260,7 @@ fn a_segment_with_a_torn_tail_reads_its_valid_prefix() {
 #[test]
 fn a_corrupt_frame_is_refused_rather_than_half_read() {
     let dir = TempDir::new("corrupt");
-    let date = storage::day_name(storage::today());
+    let date = logreel::file::day_name(logreel::file::today());
     let mut sink = open_sink(dir.path(), Options::default());
     sink.write(&batch_of(&[1])).expect("written");
     drop(sink);
@@ -2287,7 +2301,7 @@ fn reading_a_segment_leaves_its_bytes_alone() {
     // file, and a stick in a router takes writes nobody asked for.
     let runtime = unpolled_runtime();
     let dir = TempDir::new("read-only");
-    let date = storage::day_name(storage::today());
+    let date = logreel::file::day_name(logreel::file::today());
 
     let handle = runtime
         .block_on(async { init_with_dir(Settings::default(), Some(dir.path())) })
