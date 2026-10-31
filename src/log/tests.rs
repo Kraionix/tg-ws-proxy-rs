@@ -1756,10 +1756,7 @@ fn zstd_shrinks_a_rich_batch_and_round_trips_it() {
         compressed < raw,
         "zstd grew the segment: {compressed} vs {raw} bytes"
     );
-    assert_eq!(
-        storage::iter_batches(packed_dir.path(), &day).expect("readable"),
-        vec![batch]
-    );
+    assert_eq!(records_of(packed_dir.path(), &day), vec![batch.records]);
     println!(
         "segment: {raw} B plain, {compressed} B zstd ({}%)",
         compressed * 100 / raw
@@ -1785,8 +1782,8 @@ fn a_compressed_segment_reads_back_as_written() {
     drop(sink);
 
     assert_eq!(
-        storage::iter_batches(dir.path(), &logreel::file::day_name(day)).expect("readable"),
-        vec![batch]
+        records_of(dir.path(), &logreel::file::day_name(day)),
+        vec![batch.records]
     );
 }
 
