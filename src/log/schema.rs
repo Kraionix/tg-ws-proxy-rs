@@ -1191,6 +1191,51 @@ pub fn build_batch(records: &[LogRecord]) -> Vec<LogBatch> {
     batches
 }
 
+/// The header for one batch of records, without the connection-count split.
+///
+/// [`build_batch`] is the writer's rule: a batch holds at most
+/// [`BATCH_MAX_UNIQUE_CONNS`] sessions, so a batch is cut when the next record
+/// would add a seventeenth. A reader rebuilding a header for a batch that is
+/// already in a file must not apply that rule: the frame is the boundary, and a
+/// converted day can hold far more sessions than the writer would ever have put
+/// in one batch.
+pub fn header_for(records: &[LogRecord]) -> BatchHeader {
+    let mut header = BatchHeader {
+        ts_first_ns: u64::MAX,
+        ts_last_ns: 0,
+        record_count: records.len() as u32,
+        kind_mask: 0,
+        dc_mask: 0,
+        dc_media_mask: 0,
+        conn_ids: Vec::new(),
+    };
+    let mut conns: Vec<u64> = Vec::new();
+    for record in records {
+        let (tag, dc, is_media) = shape(record);
+        if tag != 0 {
+            header.kind_mask |= 1u64 << (tag - 16);
+        }
+        if let Some(bit) = dc.and_then(dc_bit) {
+            let mask = 1u32 << bit;
+            header.dc_mask |= mask;
+            if is_media {
+                header.dc_media_mask |= mask;
+            }
+        }
+        if !conns.contains(&record.conn_id) {
+            conns.push(record.conn_id);
+        }
+        header.ts_first_ns = header.ts_first_ns.min(record.ts_ns);
+        header.ts_last_ns = header.ts_last_ns.max(record.ts_ns);
+    }
+    if header.ts_first_ns == u64::MAX {
+        header.ts_first_ns = 0;
+    }
+    conns.sort_unstable();
+    header.conn_ids = conns;
+    header
+}
+
 fn batch_of(records: &[LogRecord], mut conns: Vec<u64>) -> LogBatch {
     let mut header = BatchHeader {
         ts_first_ns: u64::MAX,

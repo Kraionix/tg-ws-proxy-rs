@@ -35,7 +35,7 @@ use logreel::file::{FileStore, FileStoreConfig, SegmentReader};
 use logreel::{Durability, ErrorKind, Store as _};
 
 use super::LogError;
-use super::schema::{self, BatchHeader, Event, LogBatch, LogRecord};
+use super::schema::{self, Event, LogBatch, LogRecord};
 
 /// Segments kept by default, counting today.
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
@@ -346,16 +346,10 @@ pub fn iter_batches(dir: &Path, date: &str) -> Result<Vec<LogBatch>, LogError> {
                 event: Some(event),
             });
         }
-        let built = schema::build_batch(&records);
-        match built.into_iter().next() {
-            Some(batch) => batches.push(batch),
-            // Only an empty batch can produce nothing to build; it still counts
-            // as a batch in the dump, with a header naming no records.
-            None => batches.push(LogBatch {
-                header: Some(BatchHeader::default()),
-                records,
-            }),
-        }
+        batches.push(LogBatch {
+            header: Some(schema::header_for(&records)),
+            records,
+        });
     }
     Ok(batches)
 }
